@@ -1,0 +1,8 @@
+{
+  "name": "KriMoon",
+  "description": "A private, beautiful cycle companion and period tracker that lives only on your phone.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

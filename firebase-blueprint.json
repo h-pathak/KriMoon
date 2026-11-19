@@ -1,0 +1,143 @@
+{
+  "entities": {
+    "CoupleCloudRoom": {
+      "title": "CoupleCloudRoom",
+      "description": "Real-time bonded room connecting at most two authenticated partners via a 6-digit couple code. Stores only routing metadata; all game moves are stored as AES-256-GCM encrypted blockchain envelopes in the blocks subcollection.",
+      "type": "object",
+      "properties": {
+        "coupleCode": {
+          "type": "string",
+          "description": "6-digit unique numeric room code matching the document ID."
+        },
+        "creatorUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the partner who created the room (immutable)."
+        },
+        "creatorName": {
+          "type": "string",
+          "description": "Display name of the room creator (1-32 characters)."
+        },
+        "partnerUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the joining partner (empty string until joined, immutable once set)."
+        },
+        "partnerName": {
+          "type": "string",
+          "description": "Display name of the joining partner (0-32 characters)."
+        },
+        "memberUids": {
+          "type": "array",
+          "description": "Bounded list of 1 to 2 Firebase Auth UIDs belonging to the bonded couple."
+        },
+        "spiceLevel": {
+          "type": "string",
+          "enum": ["SWEET", "FLIRTY", "BOLD"],
+          "description": "Shared couple vibe/spice level synced live between both devices."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["WAITING", "CONNECTED", "UNPAIRED"],
+          "description": "Room lifecycle state; UNPAIRED is a terminal state locking further updates."
+        },
+        "blockCount": {
+          "type": "integer",
+          "description": "Total number of encrypted blockchain blocks committed to this room."
+        },
+        "latestBlockHash": {
+          "type": "string",
+          "description": "SHA-256 hash of the most recently mined encrypted block."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set via FieldValue.serverTimestamp() on room creation (immutable)."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set via FieldValue.serverTimestamp() on every room update."
+        }
+      },
+      "required": [
+        "coupleCode",
+        "creatorUid",
+        "creatorName",
+        "partnerUid",
+        "partnerName",
+        "memberUids",
+        "spiceLevel",
+        "status",
+        "blockCount",
+        "latestBlockHash",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CoupleEncryptedBlock": {
+      "title": "CoupleEncryptedBlock",
+      "description": "Immutable, append-only AES-256-GCM + Proof-of-Work blockchain packet carrying an encrypted couple game move or handshake between two bonded phones.",
+      "type": "object",
+      "properties": {
+        "coupleCode": {
+          "type": "string",
+          "description": "6-digit parent couple room code."
+        },
+        "senderUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the sender (must match request.auth.uid)."
+        },
+        "senderName": {
+          "type": "string",
+          "description": "Sanitized display name of the sender (1-32 characters)."
+        },
+        "memberUids": {
+          "type": "array",
+          "description": "Denormalized list of 1 to 2 bonded member UIDs for fast local security rule evaluation."
+        },
+        "blockIndex": {
+          "type": "integer",
+          "description": "Monotonic index of this block in the couple blockchain ledger."
+        },
+        "actionType": {
+          "type": "string",
+          "enum": ["GENESIS_BOND", "HANDSHAKE", "QUIZ", "WYR", "DOODLE", "TTT", "UNPAIR"],
+          "description": "Type of encrypted couple game turn or lifecycle event."
+        },
+        "blockHash": {
+          "type": "string",
+          "description": "Proof-of-Work SHA-256 block hash."
+        },
+        "encryptedPacket": {
+          "type": "string",
+          "description": "AES-256-GCM + HMAC-SHA256 encrypted KRIMOON:BCHAIN: ciphertext envelope."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set via FieldValue.serverTimestamp() on block creation."
+        }
+      },
+      "required": [
+        "coupleCode",
+        "senderUid",
+        "senderName",
+        "memberUids",
+        "blockIndex",
+        "actionType",
+        "blockHash",
+        "encryptedPacket",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/coupleRooms/{coupleCode}": {
+      "schema": { "$ref": "#/entities/CoupleCloudRoom" },
+      "description": "Root collection of bonded 2-partner couple rooms keyed by their 6-digit coupleCode."
+    },
+    "/coupleRooms/{coupleCode}/blocks/{blockId}": {
+      "schema": { "$ref": "#/entities/CoupleEncryptedBlock" },
+      "description": "Append-only stream of AES-256-GCM encrypted blockchain move envelopes for a couple room."
+    }
+  }
+}
