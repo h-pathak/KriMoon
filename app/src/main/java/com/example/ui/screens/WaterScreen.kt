@@ -1,5 +1,12 @@
 package com.example.ui.screens
 
+import android.Manifest
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -77,6 +84,7 @@ import com.example.data.UserProfile
 import com.example.data.WaterLog
 import com.example.model.CyclePhase
 import com.example.model.CycleStatus
+import com.example.notifications.NotificationHelper
 import com.example.notifications.SoundHelper
 import com.example.ui.components.CutePulseButton
 import com.example.ui.components.InteractiveWaterTumbler3D
@@ -113,6 +121,20 @@ fun WaterScreen(
 
     var showResetDialog by remember { mutableStateOf(false) }
     var isEditingGoal by remember { mutableStateOf(false) }
+    var hasNotificationPermission by remember {
+        mutableStateOf(NotificationHelper.hasNotificationPermission(context))
+    }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+        onResult = { granted ->
+            hasNotificationPermission = granted || NotificationHelper.hasNotificationPermission(context)
+            if (granted) {
+                particleController.showToast(coroutineScope, "Hydration reminders enabled! 💧🔔")
+            } else {
+                particleController.showToast(coroutineScope, "Enable notifications in Android Settings for hydration nudges ℹ️")
+            }
+        }
+    )
 
     // Button animation scales
     val minusScale = remember { Animatable(1f) }
@@ -584,13 +606,35 @@ fun WaterScreen(
                         )
                         Spacer(modifier = Modifier.height(2.dp))
                         Text(
-                            text = if (userProfile?.waterRemindersEnabled == true)
+                            text = if (userProfile?.waterRemindersEnabled == true && !hasNotificationPermission)
+                                "Allow notification permission so daily water nudges can reach you."
+                            else if (userProfile?.waterRemindersEnabled == true)
                                 "Scheduled nudges at 10:30 AM, 2:30 PM & 6:00 PM with direct +1 Glass action."
                             else
                                 "Turn on hydration nudges in Settings for scheduled reminders.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                    }
+                    if (!hasNotificationPermission) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                } else {
+                                    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                        data = Uri.fromParts("package", context.packageName, null)
+                                    }
+                                    context.startActivity(intent)
+                                }
+                            },
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = PhasesWaterBlue),
+                            modifier = Modifier.testTag("water_request_notification_permission_btn")
+                        ) {
+                            Text("Allow", fontSize = 12.sp)
+                        }
                     }
                 }
             }

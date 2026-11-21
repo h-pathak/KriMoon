@@ -334,7 +334,12 @@ fun SettingsSheet(
                         title = "🌸 Period & Cycle Predictions",
                         description = "Alerts 2 days before predicted start and on expected period day",
                         checked = cycleReminders,
-                        onCheckedChange = { cycleReminders = it },
+                        onCheckedChange = { enabled ->
+                            cycleReminders = enabled
+                            if (enabled && !hasPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            }
+                        },
                         testTag = "switch_cycle_reminders"
                     )
 
@@ -345,7 +350,12 @@ fun SettingsSheet(
                         title = "💧 Hydration Nudges",
                         description = "Daytime alerts (10:30am, 2:30pm, 6pm) with quick '+1 Glass' action",
                         checked = waterReminders,
-                        onCheckedChange = { waterReminders = it },
+                        onCheckedChange = { enabled ->
+                            waterReminders = enabled
+                            if (enabled && !hasPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            }
+                        },
                         testTag = "switch_water_reminders"
                     )
 

@@ -1046,4 +1046,27 @@ class SecurityHardeningTest {
             shadowAlarmManager.scheduledAlarms.isEmpty()
         )
     }
+
+    @Test
+    fun `AndroidManifest omits SCHEDULE_EXACT_ALARM and declares POST_NOTIFICATIONS for Play compliance`() {
+        val ctx = ApplicationProvider.getApplicationContext<Context>()
+        val pkgInfo = ctx.packageManager.getPackageInfo(
+            ctx.packageName,
+            android.content.pm.PackageManager.GET_PERMISSIONS
+        )
+        val perms = pkgInfo.requestedPermissions?.toSet().orEmpty()
+
+        assertFalse(
+            "SCHEDULE_EXACT_ALARM must not be requested to avoid Google Play exact-alarm policy rejection",
+            perms.contains(android.Manifest.permission.SCHEDULE_EXACT_ALARM)
+        )
+        assertFalse(
+            "USE_EXACT_ALARM must not be requested",
+            perms.contains("android.permission.USE_EXACT_ALARM")
+        )
+        assertTrue(
+            "POST_NOTIFICATIONS must be declared for Android 13+ medication, water, and cycle reminders",
+            perms.contains(android.Manifest.permission.POST_NOTIFICATIONS)
+        )
+    }
 }

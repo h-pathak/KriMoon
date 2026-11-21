@@ -1,6 +1,10 @@
 package com.example.ui.screens
 
+import android.Manifest
 import android.app.TimePickerDialog
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
@@ -78,6 +82,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.Medication
 import com.example.data.UserProfile
+import com.example.notifications.NotificationHelper
 import com.example.notifications.SoundHelper
 import com.example.ui.components.CuteAddButton
 import com.example.ui.components.CuteAddFab
@@ -118,6 +123,25 @@ fun MedicationsScreen(
     var showAddEditDialog by remember { mutableStateOf(false) }
     var editingMedication by remember { mutableStateOf<Medication?>(null) }
     var medicationToDelete by remember { mutableStateOf<Medication?>(null) }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+        onResult = { granted ->
+            if (granted) {
+                particleController.showToast(coroutineScope, "Medication alerts enabled! 🔔💊")
+            } else {
+                particleController.showToast(coroutineScope, "Enable notifications in Android Settings to receive pill reminders ℹ️")
+            }
+        }
+    )
+
+    fun ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            !NotificationHelper.hasNotificationPermission(context)
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     val takenCount = medications.count { it.lastTakenDate == todayDateStr }
     val totalActive = medications.count { it.isEnabled }
@@ -355,6 +379,7 @@ fun MedicationsScreen(
                         },
                         onToggle = { enabled ->
                             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            if (enabled) ensureNotificationPermission()
                             onToggleMedication(med.id, enabled)
                         },
                         onEdit = {
@@ -368,6 +393,7 @@ fun MedicationsScreen(
                         },
                         onSendTestAlert = {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            ensureNotificationPermission()
                             onSendTestAlert(med)
                         },
                         modifier = Modifier
@@ -394,6 +420,7 @@ fun MedicationsScreen(
             userName = userProfile?.name ?: "Krishi",
             onDismiss = { showAddEditDialog = false },
             onSave = { name, dosage, hour, min, emoji, daysOfWeek, sound, message, instructions, colorHex ->
+                ensureNotificationPermission()
                 if (currentEditing == null) {
                     onAddMedication(name, dosage, hour, min, emoji, daysOfWeek, sound, message, instructions, colorHex)
                 } else {
