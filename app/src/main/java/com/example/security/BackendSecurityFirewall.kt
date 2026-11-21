@@ -119,6 +119,10 @@ object BackendSecurityFirewall {
         return LocalVaultCrypto.encryptField(plainText, aadContext)
     }
 
+    fun decryptAtRestResult(storedText: String, aadContext: String = "KRIMOON_LOCAL_DB"): Result<String> {
+        return LocalVaultCrypto.decryptFieldResult(storedText, aadContext)
+    }
+
     fun decryptAtRest(storedText: String, aadContext: String = "KRIMOON_LOCAL_DB"): String {
         return LocalVaultCrypto.decryptField(storedText, aadContext)
     }

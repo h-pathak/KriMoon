@@ -6,12 +6,92 @@ import com.example.security.LocalVaultCrypto
 import com.example.security.LocalVaultUnavailableException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
+
+data class VaultDecryptionIssue(
+    val table: String,
+    val recordKey: String,
+    val column: String,
+    val reason: String
+)
 
 class PhasesRepository(private val database: AppDatabase) {
+
+    companion object {
+        const val VAULT_UNREADABLE_LABEL = "[Encrypted record unreadable — unlock vault]"
+    }
+
+    private val issuesByField = ConcurrentHashMap<String, VaultDecryptionIssue>()
+    private val unreadableRecordKeys = ConcurrentHashMap.newKeySet<String>()
+    private val _decryptionIssues = MutableStateFlow<List<VaultDecryptionIssue>>(emptyList())
+    val decryptionIssues: StateFlow<List<VaultDecryptionIssue>> = _decryptionIssues.asStateFlow()
+
+    fun isRecordUnreadable(table: String, recordKey: String): Boolean {
+        return "$table:$recordKey" in unreadableRecordKeys
+    }
+
+    private fun recordDecryptionFailure(table: String, recordKey: String, column: String, cause: Throwable) {
+        val rowKey = "$table:$recordKey"
+        val fieldKey = "$rowKey:$column"
+        unreadableRecordKeys.add(rowKey)
+        issuesByField[fieldKey] = VaultDecryptionIssue(
+            table = table,
+            recordKey = recordKey,
+            column = column,
+            reason = cause.message?.take(120)?.ifBlank { "AES-256-GCM authentication failed" }
+                ?: "AES-256-GCM authentication failed"
+        )
+        _decryptionIssues.value = issuesByField.values.sortedWith(
+            compareBy<VaultDecryptionIssue> { it.table }.thenBy { it.recordKey }.thenBy { it.column }
+        )
+    }
+
+    private fun clearDecryptionFailure(table: String, recordKey: String, column: String) {
+        val rowKey = "$table:$recordKey"
+        val fieldKey = "$rowKey:$column"
+        if (issuesByField.remove(fieldKey) != null) {
+            if (issuesByField.keys.none { it.startsWith("$rowKey:") }) {
+                unreadableRecordKeys.remove(rowKey)
+            }
+            _decryptionIssues.value = issuesByField.values.sortedWith(
+                compareBy<VaultDecryptionIssue> { it.table }.thenBy { it.recordKey }.thenBy { it.column }
+            )
+        }
+    }
+
+    private fun decryptFieldTracked(
+        storedText: String,
+        aadContext: String,
+        table: String,
+        recordKey: String,
+        column: String,
+        errorFallback: String = VAULT_UNREADABLE_LABEL
+    ): String {
+        val result = LocalVaultCrypto.decryptFieldResult(storedText, aadContext)
+        return result.fold(
+            onSuccess = { plain ->
+                clearDecryptionFailure(table, recordKey, column)
+                plain
+            },
+            onFailure = { err ->
+                recordDecryptionFailure(table, recordKey, column, err)
+                errorFallback
+            }
+        )
+    }
+
+    private fun clearDecryptionTracking() {
+        issuesByField.clear()
+        unreadableRecordKeys.clear()
+        _decryptionIssues.value = emptyList()
+    }
 
     // Transparently decrypted reactive streams backed by Android Keystore AES-256-GCM at rest
     // All decryption runs strictly off the Main thread via flowOn(Dispatchers.Default)
@@ -65,6 +145,16 @@ class PhasesRepository(private val database: AppDatabase) {
         }
     }
 
+    private fun requireWritableRecord(table: String, recordKey: String, vararg candidateValues: String) {
+        requireHealthyVaultForWrite()
+        if (isRecordUnreadable(table, recordKey) || candidateValues.any { it.contains(VAULT_UNREADABLE_LABEL) }) {
+            throw LocalVaultUnavailableException(
+                vaultState = LocalVaultCrypto.vaultState.value,
+                message = "Refusing write to unreadable encrypted record ($table:$recordKey) to preserve original ciphertext."
+            )
+        }
+    }
+
     // --- At-Rest AES-256-GCM Field Encryption & Decryption (Per-Column AAD) ---
 
     private fun UserProfile.encryptForVault(): UserProfile {
@@ -75,8 +165,9 @@ class PhasesRepository(private val database: AppDatabase) {
     }
 
     private fun UserProfile.decryptFromVault(): UserProfile {
+        val key = id.toString()
         return copy(
-            name = LocalVaultCrypto.decryptField(name, "user_profile:name")
+            name = decryptFieldTracked(name, "user_profile:name", "user_profile", key, "name")
         )
     }
 
@@ -88,8 +179,9 @@ class PhasesRepository(private val database: AppDatabase) {
     }
 
     private fun PeriodLog.decryptFromVault(): PeriodLog {
+        val key = id.toString()
         return copy(
-            notes = LocalVaultCrypto.decryptField(notes, "period_logs:notes")
+            notes = decryptFieldTracked(notes, "period_logs:notes", "period_logs", key, "notes")
         )
     }
 
@@ -103,10 +195,11 @@ class PhasesRepository(private val database: AppDatabase) {
     }
 
     private fun DailyCycleLog.decryptFromVault(): DailyCycleLog {
+        val key = dateString.ifBlank { id.toString() }
         return copy(
-            symptoms = LocalVaultCrypto.decryptField(symptoms, "daily_cycle_logs:symptoms"),
-            mood = LocalVaultCrypto.decryptField(mood, "daily_cycle_logs:mood"),
-            notes = LocalVaultCrypto.decryptField(notes, "daily_cycle_logs:notes")
+            symptoms = decryptFieldTracked(symptoms, "daily_cycle_logs:symptoms", "daily_cycle_logs", key, "symptoms"),
+            mood = decryptFieldTracked(mood, "daily_cycle_logs:mood", "daily_cycle_logs", key, "mood"),
+            notes = decryptFieldTracked(notes, "daily_cycle_logs:notes", "daily_cycle_logs", key, "notes")
         )
     }
 
@@ -118,8 +211,9 @@ class PhasesRepository(private val database: AppDatabase) {
     }
 
     private fun UserNote.decryptFromVault(): UserNote {
+        val key = id.toString()
         return copy(
-            content = LocalVaultCrypto.decryptField(content, "user_notes:content")
+            content = decryptFieldTracked(content, "user_notes:content", "user_notes", key, "content")
         )
     }
 
@@ -137,14 +231,18 @@ class PhasesRepository(private val database: AppDatabase) {
     }
 
     private fun Medication.decryptFromVault(): Medication {
+        val key = id.toString()
         return copy(
-            name = LocalVaultCrypto.decryptField(name, "medications:name"),
-            dosage = LocalVaultCrypto.decryptField(dosage, "medications:dosage"),
-            customReminderMessage = LocalVaultCrypto.decryptField(
+            name = decryptFieldTracked(name, "medications:name", "medications", key, "name"),
+            dosage = decryptFieldTracked(dosage, "medications:dosage", "medications", key, "dosage"),
+            customReminderMessage = decryptFieldTracked(
                 customReminderMessage,
-                "medications:customReminderMessage"
+                "medications:customReminderMessage",
+                "medications",
+                key,
+                "customReminderMessage"
             ),
-            instructions = LocalVaultCrypto.decryptField(instructions, "medications:instructions")
+            instructions = decryptFieldTracked(instructions, "medications:instructions", "medications", key, "instructions")
         )
     }
 
@@ -157,9 +255,10 @@ class PhasesRepository(private val database: AppDatabase) {
     }
 
     private fun ShopItem.decryptFromVault(): ShopItem {
+        val key = id.toString()
         return copy(
-            text = LocalVaultCrypto.decryptField(text, "shop_items:text"),
-            notes = LocalVaultCrypto.decryptField(notes, "shop_items:notes")
+            text = decryptFieldTracked(text, "shop_items:text", "shop_items", key, "text"),
+            notes = decryptFieldTracked(notes, "shop_items:notes", "shop_items", key, "notes")
         )
     }
 
@@ -187,20 +286,20 @@ class PhasesRepository(private val database: AppDatabase) {
     private fun CoupleRoomRecord.decryptFromVault(): CoupleRoomRecord {
         val code = coupleCode
         return copy(
-            myName = LocalVaultCrypto.decryptField(myName, "couple_rooms:$code:myName"),
-            partnerName = LocalVaultCrypto.decryptField(partnerName, "couple_rooms:$code:partnerName"),
-            pendingPartnerName = LocalVaultCrypto.decryptField(pendingPartnerName, "couple_rooms:$code:pendingPartnerName"),
-            doodleStrokesJson = LocalVaultCrypto.decryptField(doodleStrokesJson, "couple_rooms:$code:doodleStrokesJson").ifBlank { "[]" },
-            doodlePrompt = LocalVaultCrypto.decryptField(doodlePrompt, "couple_rooms:$code:doodlePrompt"),
-            quizStateJson = LocalVaultCrypto.decryptField(quizStateJson, "couple_rooms:$code:quizStateJson").ifBlank { "{}" },
-            wyrStateJson = LocalVaultCrypto.decryptField(wyrStateJson, "couple_rooms:$code:wyrStateJson").ifBlank { "{}" },
-            ticTacToeStateJson = LocalVaultCrypto.decryptField(ticTacToeStateJson, "couple_rooms:$code:ticTacToeStateJson").ifBlank { "{}" },
-            dareStateJson = LocalVaultCrypto.decryptField(dareStateJson, "couple_rooms:$code:dareStateJson").ifBlank { "{}" },
-            wavelengthStateJson = LocalVaultCrypto.decryptField(wavelengthStateJson, "couple_rooms:$code:wavelengthStateJson").ifBlank { "{}" },
-            whisperStateJson = LocalVaultCrypto.decryptField(whisperStateJson, "couple_rooms:$code:whisperStateJson").ifBlank { "{}" },
-            blockchainLedgerJson = LocalVaultCrypto.decryptField(blockchainLedgerJson, "couple_rooms:$code:blockchainLedgerJson").ifBlank { "[]" },
-            ecdhPrivateKeyB64 = LocalVaultCrypto.decryptField(ecdhPrivateKeyB64, "couple_rooms:$code:ecdhPrivateKeyB64"),
-            ecdhSharedSecretB64 = LocalVaultCrypto.decryptField(ecdhSharedSecretB64, "couple_rooms:$code:ecdhSharedSecretB64")
+            myName = decryptFieldTracked(myName, "couple_rooms:$code:myName", "couple_rooms", code, "myName"),
+            partnerName = decryptFieldTracked(partnerName, "couple_rooms:$code:partnerName", "couple_rooms", code, "partnerName"),
+            pendingPartnerName = decryptFieldTracked(pendingPartnerName, "couple_rooms:$code:pendingPartnerName", "couple_rooms", code, "pendingPartnerName"),
+            doodleStrokesJson = decryptFieldTracked(doodleStrokesJson, "couple_rooms:$code:doodleStrokesJson", "couple_rooms", code, "doodleStrokesJson", errorFallback = "[]").ifBlank { "[]" },
+            doodlePrompt = decryptFieldTracked(doodlePrompt, "couple_rooms:$code:doodlePrompt", "couple_rooms", code, "doodlePrompt"),
+            quizStateJson = decryptFieldTracked(quizStateJson, "couple_rooms:$code:quizStateJson", "couple_rooms", code, "quizStateJson", errorFallback = "{}").ifBlank { "{}" },
+            wyrStateJson = decryptFieldTracked(wyrStateJson, "couple_rooms:$code:wyrStateJson", "couple_rooms", code, "wyrStateJson", errorFallback = "{}").ifBlank { "{}" },
+            ticTacToeStateJson = decryptFieldTracked(ticTacToeStateJson, "couple_rooms:$code:ticTacToeStateJson", "couple_rooms", code, "ticTacToeStateJson", errorFallback = "{}").ifBlank { "{}" },
+            dareStateJson = decryptFieldTracked(dareStateJson, "couple_rooms:$code:dareStateJson", "couple_rooms", code, "dareStateJson", errorFallback = "{}").ifBlank { "{}" },
+            wavelengthStateJson = decryptFieldTracked(wavelengthStateJson, "couple_rooms:$code:wavelengthStateJson", "couple_rooms", code, "wavelengthStateJson", errorFallback = "{}").ifBlank { "{}" },
+            whisperStateJson = decryptFieldTracked(whisperStateJson, "couple_rooms:$code:whisperStateJson", "couple_rooms", code, "whisperStateJson", errorFallback = "{}").ifBlank { "{}" },
+            blockchainLedgerJson = decryptFieldTracked(blockchainLedgerJson, "couple_rooms:$code:blockchainLedgerJson", "couple_rooms", code, "blockchainLedgerJson", errorFallback = "[]").ifBlank { "[]" },
+            ecdhPrivateKeyB64 = decryptFieldTracked(ecdhPrivateKeyB64, "couple_rooms:$code:ecdhPrivateKeyB64", "couple_rooms", code, "ecdhPrivateKeyB64", errorFallback = ""),
+            ecdhSharedSecretB64 = decryptFieldTracked(ecdhSharedSecretB64, "couple_rooms:$code:ecdhSharedSecretB64", "couple_rooms", code, "ecdhSharedSecretB64", errorFallback = "")
         )
     }
 
@@ -286,15 +385,45 @@ class PhasesRepository(private val database: AppDatabase) {
                 }
             }
             database.coupleRoomDao().getAllRooms().firstOrNull()?.forEach { raw ->
-                val needsEnc = (raw.myName.isNotEmpty() && !LocalVaultCrypto.isLatestFormat(raw.myName)) ||
-                    (raw.quizStateJson.isNotEmpty() && !LocalVaultCrypto.isLatestFormat(raw.quizStateJson)) ||
-                    (raw.ecdhPrivateKeyB64.isNotEmpty() && !LocalVaultCrypto.isLatestFormat(raw.ecdhPrivateKeyB64))
+                val code = raw.coupleCode
+                val encryptedColumns = listOf(
+                    raw.myName to "couple_rooms:$code:myName",
+                    raw.partnerName to "couple_rooms:$code:partnerName",
+                    raw.pendingPartnerName to "couple_rooms:$code:pendingPartnerName",
+                    raw.doodleStrokesJson to "couple_rooms:$code:doodleStrokesJson",
+                    raw.doodlePrompt to "couple_rooms:$code:doodlePrompt",
+                    raw.quizStateJson to "couple_rooms:$code:quizStateJson",
+                    raw.wyrStateJson to "couple_rooms:$code:wyrStateJson",
+                    raw.ticTacToeStateJson to "couple_rooms:$code:ticTacToeStateJson",
+                    raw.dareStateJson to "couple_rooms:$code:dareStateJson",
+                    raw.wavelengthStateJson to "couple_rooms:$code:wavelengthStateJson",
+                    raw.whisperStateJson to "couple_rooms:$code:whisperStateJson",
+                    raw.blockchainLedgerJson to "couple_rooms:$code:blockchainLedgerJson",
+                    raw.ecdhPrivateKeyB64 to "couple_rooms:$code:ecdhPrivateKeyB64",
+                    raw.ecdhSharedSecretB64 to "couple_rooms:$code:ecdhSharedSecretB64"
+                )
+                val needsEnc = encryptedColumns.any { (v, _) -> v.isNotEmpty() && !LocalVaultCrypto.isLatestFormat(v) }
                 if (needsEnc) {
-                    val code = raw.coupleCode
-                    val checkName = LocalVaultCrypto.decryptFieldResult(raw.myName, "couple_rooms:$code:myName")
-                    val checkPriv = LocalVaultCrypto.decryptFieldResult(raw.ecdhPrivateKeyB64, "couple_rooms:$code:ecdhPrivateKeyB64")
-                    if (checkName.isSuccess && checkPriv.isSuccess) {
-                        database.coupleRoomDao().insertOrUpdate(raw.decryptFromVault().encryptForVault())
+                    val decrypted = encryptedColumns.map { (v, aad) -> LocalVaultCrypto.decryptFieldResult(v, aad) }
+                    if (decrypted.all { it.isSuccess }) {
+                        database.coupleRoomDao().insertOrUpdate(
+                            raw.copy(
+                                myName = decrypted[0].getOrThrow(),
+                                partnerName = decrypted[1].getOrThrow(),
+                                pendingPartnerName = decrypted[2].getOrThrow(),
+                                doodleStrokesJson = decrypted[3].getOrThrow().ifBlank { "[]" },
+                                doodlePrompt = decrypted[4].getOrThrow(),
+                                quizStateJson = decrypted[5].getOrThrow().ifBlank { "{}" },
+                                wyrStateJson = decrypted[6].getOrThrow().ifBlank { "{}" },
+                                ticTacToeStateJson = decrypted[7].getOrThrow().ifBlank { "{}" },
+                                dareStateJson = decrypted[8].getOrThrow().ifBlank { "{}" },
+                                wavelengthStateJson = decrypted[9].getOrThrow().ifBlank { "{}" },
+                                whisperStateJson = decrypted[10].getOrThrow().ifBlank { "{}" },
+                                blockchainLedgerJson = decrypted[11].getOrThrow().ifBlank { "[]" },
+                                ecdhPrivateKeyB64 = decrypted[12].getOrThrow(),
+                                ecdhSharedSecretB64 = decrypted[13].getOrThrow()
+                            ).encryptForVault()
+                        )
                     }
                 }
             }
@@ -343,6 +472,8 @@ class PhasesRepository(private val database: AppDatabase) {
     }
 
     suspend fun saveDailyCycleLog(log: DailyCycleLog): Long = withContext(Dispatchers.IO) {
+        val key = log.dateString.ifBlank { log.id.toString() }
+        requireWritableRecord("daily_cycle_logs", key, log.symptoms, log.mood, log.notes)
         database.dailyCycleLogDao().insertOrUpdate(log.encryptForVault())
     }
 
@@ -363,6 +494,7 @@ class PhasesRepository(private val database: AppDatabase) {
     }
 
     suspend fun saveProfile(profile: UserProfile) = withContext(Dispatchers.IO) {
+        requireWritableRecord("user_profile", profile.id.toString(), profile.name)
         database.userProfileDao().insertOrUpdate(profile.encryptForVault())
     }
 
@@ -371,10 +503,19 @@ class PhasesRepository(private val database: AppDatabase) {
         viewMode: String,
         sortMode: String
     ) {
-        requireHealthyVaultForWrite()
-        val current = getProfileOnce() ?: return
+        requireWritableRecord("user_profile", "1")
+        val raw = database.userProfileDao().getProfileOnce() ?: return
+        val decName = LocalVaultCrypto.decryptFieldResult(raw.name, "user_profile:name")
+            .getOrElse {
+                recordDecryptionFailure("user_profile", "1", "name", it)
+                throw LocalVaultUnavailableException(
+                    LocalVaultCrypto.vaultState.value,
+                    "Refusing profile preference write because profile name failed decryption."
+                )
+            }
         database.userProfileDao().insertOrUpdate(
-            current.copy(
+            raw.copy(
+                name = decName,
                 shopHideCompleted = hideCompleted,
                 shopViewMode = viewMode,
                 shopSortMode = sortMode
@@ -418,6 +559,7 @@ class PhasesRepository(private val database: AppDatabase) {
     }
 
     suspend fun updatePeriod(period: PeriodLog) {
+        requireWritableRecord("period_logs", period.id.toString(), period.notes)
         database.periodLogDao().update(period.encryptForVault())
     }
 
@@ -468,10 +610,12 @@ class PhasesRepository(private val database: AppDatabase) {
 
     // Shop / Tasks
     suspend fun toggleShopItem(item: ShopItem) {
+        requireWritableRecord("shop_items", item.id.toString(), item.text, item.notes)
         database.shopItemDao().update(item.copy(isDone = !item.isDone).encryptForVault())
     }
 
     suspend fun updateShopItem(item: ShopItem) {
+        requireWritableRecord("shop_items", item.id.toString(), item.text, item.notes)
         database.shopItemDao().update(item.encryptForVault())
     }
 
@@ -482,6 +626,7 @@ class PhasesRepository(private val database: AppDatabase) {
         notes: String = "",
         priority: String = "NORMAL"
     ): Long {
+        requireHealthyVaultForWrite()
         val count = database.shopItemDao().count()
         return database.shopItemDao().insert(
             ShopItem(
@@ -572,6 +717,7 @@ class PhasesRepository(private val database: AppDatabase) {
         instructions: String = "Take with water",
         colorHex: String = "#D4629A"
     ): Long {
+        requireHealthyVaultForWrite()
         return database.medicationDao().insert(
             Medication(
                 name = name.trim(),
@@ -590,6 +736,14 @@ class PhasesRepository(private val database: AppDatabase) {
     }
 
     suspend fun updateMedication(medication: Medication) {
+        requireWritableRecord(
+            "medications",
+            medication.id.toString(),
+            medication.name,
+            medication.dosage,
+            medication.customReminderMessage,
+            medication.instructions
+        )
         database.medicationDao().update(medication.encryptForVault())
     }
 
@@ -597,25 +751,35 @@ class PhasesRepository(private val database: AppDatabase) {
         database.medicationDao().deleteById(id)
     }
 
+    private suspend fun decryptRawMedicationStrictly(id: Long): Medication? = withContext(Dispatchers.IO) {
+        val raw = database.medicationDao().getById(id) ?: return@withContext null
+        val key = id.toString()
+        val n = LocalVaultCrypto.decryptFieldResult(raw.name, "medications:name")
+            .getOrElse { recordDecryptionFailure("medications", key, "name", it); throw LocalVaultUnavailableException(LocalVaultCrypto.vaultState.value, "Medication name failed decryption; write blocked.") }
+        val d = LocalVaultCrypto.decryptFieldResult(raw.dosage, "medications:dosage")
+            .getOrElse { recordDecryptionFailure("medications", key, "dosage", it); throw LocalVaultUnavailableException(LocalVaultCrypto.vaultState.value, "Medication dosage failed decryption; write blocked.") }
+        val m = LocalVaultCrypto.decryptFieldResult(raw.customReminderMessage, "medications:customReminderMessage")
+            .getOrElse { recordDecryptionFailure("medications", key, "customReminderMessage", it); throw LocalVaultUnavailableException(LocalVaultCrypto.vaultState.value, "Medication message failed decryption; write blocked.") }
+        val i = LocalVaultCrypto.decryptFieldResult(raw.instructions, "medications:instructions")
+            .getOrElse { recordDecryptionFailure("medications", key, "instructions", it); throw LocalVaultUnavailableException(LocalVaultCrypto.vaultState.value, "Medication instructions failed decryption; write blocked.") }
+        raw.copy(name = n, dosage = d, customReminderMessage = m, instructions = i)
+    }
+
     suspend fun toggleMedication(id: Long, isEnabled: Boolean) {
-        requireHealthyVaultForWrite()
-        val existing = getMedicationById(id)
-        if (existing != null) {
-            database.medicationDao().update(existing.copy(isEnabled = isEnabled).encryptForVault())
-        }
+        requireWritableRecord("medications", id.toString())
+        val existing = decryptRawMedicationStrictly(id) ?: return
+        database.medicationDao().update(existing.copy(isEnabled = isEnabled).encryptForVault())
     }
 
     suspend fun markMedicationTakenToday(id: Long, todayDateString: String, timeString: String = "") {
-        requireHealthyVaultForWrite()
-        val existing = getMedicationById(id)
-        if (existing != null) {
-            database.medicationDao().update(
-                existing.copy(
-                    lastTakenDate = BackendSecurityFirewall.sanitizeField(todayDateString, 10),
-                    lastTakenTime = BackendSecurityFirewall.sanitizeField(timeString, 16)
-                ).encryptForVault()
-            )
-        }
+        requireWritableRecord("medications", id.toString())
+        val existing = decryptRawMedicationStrictly(id) ?: return
+        database.medicationDao().update(
+            existing.copy(
+                lastTakenDate = BackendSecurityFirewall.sanitizeField(todayDateString, 10),
+                lastTakenTime = BackendSecurityFirewall.sanitizeField(timeString, 16)
+            ).encryptForVault()
+        )
     }
 
     // Backward compatibility bridges
@@ -670,6 +834,7 @@ class PhasesRepository(private val database: AppDatabase) {
     }
 
     suspend fun addNote(content: String, tag: String, reminderTimeMillis: Long? = null): Long {
+        requireHealthyVaultForWrite()
         return database.userNoteDao().insert(
             UserNote(
                 content = content.trim(),
@@ -754,7 +919,7 @@ class PhasesRepository(private val database: AppDatabase) {
     }
 
     suspend fun saveCoupleRoom(room: CoupleRoomRecord) = withContext(Dispatchers.IO) {
-        requireHealthyVaultForWrite()
+        requireWritableRecord("couple_rooms", room.coupleCode, room.myName, room.partnerName, room.pendingPartnerName, room.doodlePrompt)
         val encrypted = room.copy(updatedAt = System.currentTimeMillis()).encryptForVault()
         database.coupleRoomDao().insertOrUpdate(encrypted)
     }
@@ -849,6 +1014,7 @@ class PhasesRepository(private val database: AppDatabase) {
         database.gameScoreDao().clearAll()
         database.coupleRoomDao().clearAll()
         database.pendingCoupleTurnDao().clearAll()
+        clearDecryptionTracking()
         LocalVaultCrypto.cryptographicEraseAndResetVault()
         if (LocalVaultCrypto.canSafelyWrite()) {
             database.userProfileDao().insertOrUpdate(UserProfile(id = 1, isOnboarded = false).encryptForVault())

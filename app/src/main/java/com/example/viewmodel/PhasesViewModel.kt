@@ -129,8 +129,9 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
-    // Fail-closed local vault state & offline queue visibility
+    // Fail-closed local vault state, per-record decryption issues & offline queue visibility
     val vaultState: StateFlow<VaultState> = LocalVaultCrypto.vaultState
+    val vaultDecryptionIssues: StateFlow<List<com.example.data.VaultDecryptionIssue>> = repository.decryptionIssues
 
     val activePendingTurnCount: StateFlow<Int> = repository.activePendingTurnCount
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
@@ -863,7 +864,12 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                 if (!signedInUid.isNullOrBlank()) {
                     val cloudRepo = getCloudRepoOrNull()
                     if (cloudRepo != null) {
-                        tombstonedCount = cloudRepo.tombstoneAllUserRoomsForAccountDeletion().getOrDefault(0)
+                        val tombstoneResult = cloudRepo.tombstoneAllUserRoomsForAccountDeletion()
+                        if (tombstoneResult.isFailure) {
+                            showFeedback("Cloud room scrub failed (check connection) — account deletion paused so no cloud data is stranded.")
+                            return@launch
+                        }
+                        tombstonedCount = tombstoneResult.getOrDefault(0)
                     }
                 }
 
@@ -930,9 +936,15 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
     fun retryCloudSync() {
         val uid = _cloudAuthUid.value ?: return
         val name = _cloudUserName.value
+        val activeCode = activeCoupleRoom.value?.takeIf { !it.isPassAndPlay && it.approvalStatus == "CONNECTED" }?.coupleCode
         detachCloudListeners()
         _cloudAuthUid.value = null
         onCloudUserChanged(uid, name)
+        if (!activeCode.isNullOrBlank()) {
+            viewModelScope.launch {
+                drainPendingTurnsForRoom(activeCode)
+            }
+        }
     }
 
     fun onCloudUserChanged(uid: String?, displayName: String?) {
@@ -1217,9 +1229,9 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                                     processedBlockHashes.add(hash)
                                     continue
                                 }
-                                // Ignore blocks originating from this exact player/device
-                                val isOwnBlock = blk.senderUid == uid &&
-                                    blk.senderName.equals(localRoom.myName.trim(), ignoreCase = true)
+                                // Ignore blocks originating from this exact authenticated UID
+                                // (V2 rules strictly prohibit self-join with duplicate UID, so senderUid == uid is authoritative even if display name changes)
+                                val isOwnBlock = blk.senderUid == uid
                                 if (isOwnBlock) {
                                     processedBlockHashes.add(hash)
                                     continue
@@ -2027,7 +2039,14 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                     }
                     sentBlockHashes.add(freshBlock.blockHash)
 
-                    when (val outcome = cloudRepo.publishEncryptedBlockAtomic(coupleCode, intent, freshBlock, freshPacket)) {
+                    val outcome = cloudRepo.publishEncryptedBlockAtomic(
+                        coupleCode = coupleCode,
+                        intent = intent,
+                        block = freshBlock,
+                        encryptedPacket = freshPacket,
+                        isRetry = pending.retryCount > 0 || attempt > 1
+                    )
+                    when (outcome) {
                         is BlockPublishOutcome.Committed -> {
                             commitOutgoingCoupleBlock(
                                 coupleCode = coupleCode,
@@ -2041,6 +2060,18 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                             resolved = true
                         }
                         is BlockPublishOutcome.AlreadyCommittedIdempotent -> {
+                            coupleRoomMutex.withLock {
+                                repository.getCoupleRoom(coupleCode)?.let { r ->
+                                    val seenTurnIds = CoupleTurnCodec.stringSetFromJson(r.seenClientTurnIdsJson)
+                                    seenTurnIds.add(intent.clientTurnId)
+                                    repository.saveCoupleRoom(
+                                        r.copy(
+                                            lastConfirmedCloudIndex = maxOf(r.lastConfirmedCloudIndex, outcome.blockIndex.toInt()),
+                                            seenClientTurnIdsJson = CoupleTurnCodec.stringSetToJson(seenTurnIds, maxSize = 512)
+                                        )
+                                    )
+                                }
+                            }
                             repository.removePendingTurn(intent.clientTurnId)
                             resolved = true
                         }
@@ -2074,6 +2105,14 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                             return
                         }
                     }
+                }
+                if (!resolved) {
+                    repository.markPendingTurnStatus(
+                        turn = pending,
+                        status = "PENDING",
+                        retryCount = pending.retryCount + 1,
+                        lastError = "Head conflict persisted after 5 rebase attempts"
+                    )
                 }
             }
         }

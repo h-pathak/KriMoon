@@ -657,7 +657,8 @@ class CoupleCloudRepository(
         coupleCode: String,
         intent: CoupleActivityIntent,
         block: CoupleBlock,
-        encryptedPacket: String
+        encryptedPacket: String,
+        isRetry: Boolean = false
     ): BlockPublishOutcome {
         val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
         val blockId = block.blockHash.replace(Regex("[^a-zA-Z0-9_\\-]"), "").take(128)
@@ -668,13 +669,16 @@ class CoupleCloudRepository(
             require(blockId.length >= 8) { "Invalid block hash." }
             require(encryptedPacket.startsWith("KRIMOON:BCHAIN:")) { "Packet must be encrypted." }
 
-            // Idempotency fast-path: verify this clientTurnId wasn't already committed prior to a crash/retry
-            val existingByTurnId = findBlockByClientTurnId(cleanCode, intent.clientTurnId)
-            if (existingByTurnId != null) {
-                return BlockPublishOutcome.AlreadyCommittedIdempotent(
-                    blockHash = existingByTurnId.blockHash,
-                    blockIndex = existingByTurnId.blockIndex
-                )
+            // Idempotency fast-path on retries / crash recovery: check if this clientTurnId was
+            // already committed before power/network loss without scanning the whole subcollection on first send
+            if (isRetry) {
+                val existingByTurnId = findBlockByClientTurnId(cleanCode, intent.clientTurnId)
+                if (existingByTurnId != null) {
+                    return BlockPublishOutcome.AlreadyCommittedIdempotent(
+                        blockHash = existingByTurnId.blockHash,
+                        blockIndex = existingByTurnId.blockIndex
+                    )
+                }
             }
 
             val roomRef = roomsCollection().document(cleanCode)
@@ -724,6 +728,11 @@ class CoupleCloudRepository(
                 }
 
                 val isLazyV1Upgrade = cloudRoom.schemaVersion <= 1
+                if (isLazyV1Upgrade && !Regex("^[0-9a-fA-F]{8,128}$").matches(cloudRoom.latestBlockHash)) {
+                    return@runTransaction BlockPublishOutcome.Failed(
+                        IllegalStateException("Legacy V1 room has invalid latestBlockHash; refusing unsafe V2 anchor migration.")
+                    )
+                }
                 val newCount = (cloudRoom.blockCount + 1L).coerceAtMost(100000L)
                 val anchorHash = if (isLazyV1Upgrade) cloudRoom.latestBlockHash else cloudRoom.migrationAnchorHash
                 val anchorIndex = if (isLazyV1Upgrade) cloudRoom.blockCount else cloudRoom.migrationAnchorIndex
@@ -851,18 +860,26 @@ class CoupleCloudRepository(
         val path = "coupleRooms"
         return try {
             val uid = requireUserId()
-            val roomsSnap = roomsCollection()
+            val memberRoomsSnap = roomsCollection()
                 .whereArrayContains("memberUids", uid)
                 .get()
                 .await()
-            var tombstonedCount = 0
-            for (doc in roomsSnap.documents) {
+            val pendingRoomsSnap = roomsCollection()
+                .whereEqualTo("pendingPartnerUid", uid)
+                .get()
+                .await()
+
+            var scrubbedCount = 0
+            val failures = mutableListOf<String>()
+
+            // 1. Tombstone every room where user is a bonded member
+            for (doc in memberRoomsSnap.documents) {
                 val room = doc.toObject(CoupleCloudRoom::class.java) ?: continue
                 if (room.tombstoned) continue
                 val code = room.coupleCode.ifBlank { doc.id }
                 val roomRef = roomsCollection().document(code)
                 val inviteRef = invitesCollection().document(code)
-                runCatching {
+                val txRes = runCatching {
                     db.runTransaction { tx ->
                         val inviteSnap = tx.get(inviteRef)
                         tx.update(
@@ -891,10 +908,34 @@ class CoupleCloudRepository(
                             )
                         }
                     }.await()
-                    tombstonedCount++
+                }
+                if (txRes.isSuccess) {
+                    scrubbedCount++
+                } else {
+                    failures.add("member:$code")
                 }
             }
-            Result.success(tombstonedCount)
+
+            // 2. Cancel any pending join requests where deleting user is pendingPartnerUid
+            for (doc in pendingRoomsSnap.documents) {
+                val room = doc.toObject(CoupleCloudRoom::class.java) ?: continue
+                if (room.tombstoned || room.status == "UNPAIRED") continue
+                val code = room.coupleCode.ifBlank { doc.id }
+                val cancelRes = declineOrCancelPendingPartner(code)
+                if (cancelRes.isSuccess) {
+                    scrubbedCount++
+                } else {
+                    failures.add("pending:$code")
+                }
+            }
+
+            if (failures.isNotEmpty()) {
+                Result.failure(
+                    IllegalStateException("Could not scrub ${failures.size} cloud room(s) before account deletion.")
+                )
+            } else {
+                Result.success(scrubbedCount)
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

@@ -131,7 +131,9 @@ fun PhasesApp(viewModel: PhasesViewModel) {
     val showSettingsSheet by viewModel.showSettingsSheet.collectAsStateWithLifecycle()
     val feedbackMessage by viewModel.feedbackMessage.collectAsStateWithLifecycle()
     val vaultState by viewModel.vaultState.collectAsStateWithLifecycle()
+    val vaultDecryptionIssues by viewModel.vaultDecryptionIssues.collectAsStateWithLifecycle()
     val cloudAuthUid by viewModel.cloudAuthUid.collectAsStateWithLifecycle()
+    var dismissedDecryptionIssueCount by remember { mutableStateOf(0) }
 
     val snackbarHostState = remember { SnackbarHostState() }
     val particleController = remember { ParticleController() }
@@ -249,6 +251,39 @@ fun PhasesApp(viewModel: PhasesViewModel) {
                     vaultState = vaultState,
                     onRetryUnlock = { viewModel.retryVaultUnlock() },
                     onConfirmResetVault = { viewModel.confirmResetCorruptedVault() }
+                )
+            } else if (vaultDecryptionIssues.isNotEmpty() && vaultDecryptionIssues.size > dismissedDecryptionIssueCount) {
+                val affectedTables = remember(vaultDecryptionIssues) {
+                    vaultDecryptionIssues.map { it.table }.distinct().joinToString(", ")
+                }
+                AlertDialog(
+                    onDismissRequest = { dismissedDecryptionIssueCount = vaultDecryptionIssues.size },
+                    title = { Text("Encrypted Record Authentication Warning") },
+                    text = {
+                        Text(
+                            "${vaultDecryptionIssues.size} encrypted field(s) in ($affectedTables) failed AES-256-GCM verification. " +
+                                "KriMoon has blocked writes to those rows so original ciphertext cannot be overwritten, and will never display them as empty."
+                        )
+                    },
+                    confirmButton = {
+                        Button(
+                            onClick = {
+                                dismissedDecryptionIssueCount = 0
+                                viewModel.retryVaultUnlock()
+                            },
+                            modifier = Modifier.testTag("vault_issue_retry_btn")
+                        ) {
+                            Text("Retry Unlock")
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(
+                            onClick = { dismissedDecryptionIssueCount = vaultDecryptionIssues.size },
+                            modifier = Modifier.testTag("vault_issue_dismiss_btn")
+                        ) {
+                            Text("Keep Protected")
+                        }
+                    }
                 )
             }
 

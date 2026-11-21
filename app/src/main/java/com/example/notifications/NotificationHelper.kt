@@ -587,6 +587,7 @@ object NotificationHelper {
         }
 
         val intent = Intent(context, NotificationReceiver::class.java).apply {
+            setPackage(context.packageName)
             this.action = action
         }
 
@@ -831,6 +832,7 @@ object NotificationHelper {
     fun cancelNoteReminder(context: Context, noteId: Long) {
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
         val intent = Intent(context, NotificationReceiver::class.java).apply {
+            setPackage(context.packageName)
             action = ACTION_NOTE_REMINDER
         }
         val requestCode = (NOTIFICATION_ID_NOTE_BASE + noteId).toInt()

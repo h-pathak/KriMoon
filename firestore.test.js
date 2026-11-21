@@ -261,6 +261,22 @@ test("Zero-Knowledge ECDH Handshake & Host Approval: rejects self-join, MITM key
     })
   );
 
+  // Partner 2 CANNOT overwrite hostDisplayHint or downgrade schemaVersion on /coupleInvites during join
+  const tamperedInviteJoin = krishiDb.batch();
+  tamperedInviteJoin.update(krishiDb.collection("coupleRooms").doc(ROOM_CODE), {
+    pendingPartnerUid: KRISHI_UID,
+    pendingPartnerName: "Krishi",
+    pendingPartnerPublicKey: PARTNER_PUB_KEY,
+    status: "PENDING_APPROVAL",
+    updatedAt: new Date(Date.now() - 710),
+  });
+  tamperedInviteJoin.update(krishiDb.collection("coupleInvites").doc(ROOM_CODE), {
+    status: "PENDING",
+    hostDisplayHint: "XX",
+    updatedAt: new Date(Date.now() - 710),
+  });
+  await assertFails(tamperedInviteJoin.commit());
+
   // Partner 2 submits blind atomic join request (room + invite) -> PENDING_APPROVAL
   const joinBatch = krishiDb.batch();
   joinBatch.update(krishiDb.collection("coupleRooms").doc(ROOM_CODE), {

@@ -315,18 +315,24 @@ service cloud.firestore {
                        isValidCoupleCode(coupleCode) &&
                        isValidCoupleInvite(request.resource.data, coupleCode) &&
                        exists(/databases/$(database)/documents/coupleRooms/$(coupleCode)) &&
-                       existsAfter(/databases/$(database)/documents/coupleRooms/$(coupleCode)) && (
+                       existsAfter(/databases/$(database)/documents/coupleRooms/$(coupleCode)) &&
+                       request.resource.data.schemaVersion == resource.data.schemaVersion && (
                          (request.resource.data.status == 'PENDING' &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']) &&
                           getAfter(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.status == 'PENDING_APPROVAL' &&
                           getAfter(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.pendingPartnerUid == request.auth.uid) ||
                          (request.resource.data.status == 'WAITING' &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']) &&
                           getAfter(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.status == 'WAITING' &&
                           (get(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.creatorUid == request.auth.uid ||
                            get(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.pendingPartnerUid == request.auth.uid)) ||
                          (request.resource.data.status == 'LOCKED' &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']) &&
                           getAfter(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.status == 'CONNECTED' &&
                           get(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.creatorUid == request.auth.uid) ||
                          (request.resource.data.status == 'RETIRED' &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'hostDisplayHint', 'updatedAt']) &&
+                          request.resource.data.hostDisplayHint == '' &&
                           getAfter(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.status == 'UNPAIRED' &&
                           request.auth.uid in get(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.memberUids)
                        );

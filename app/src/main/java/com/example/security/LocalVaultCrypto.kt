@@ -556,7 +556,10 @@ object LocalVaultCrypto {
         return try {
             val payload = storedText.removePrefix(LEGACY_STATIC_PREFIX)
             val parts = payload.split(":")
-            if (parts.size != 2) return Result.success(storedText)
+            if (parts.size != 2) {
+                BackendSecurityFirewall.recordNeutralizedThreat()
+                return Result.failure(SecurityException("Malformed legacy vault ciphertext."))
+            }
             val iv = Base64.decode(parts[0], Base64.NO_WRAP)
             val ct = Base64.decode(parts[1], Base64.NO_WRAP)
             val salt = "KriMoon_AtRest_Salt_v2_KriMoonLocalVault_v2".toByteArray(StandardCharsets.UTF_8)

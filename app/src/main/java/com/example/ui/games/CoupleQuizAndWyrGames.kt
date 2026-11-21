@@ -180,7 +180,7 @@ private fun SyncedChoiceRoundGame(
         if (room.isPassAndPlay) return
         val code = room.coupleCode
         val sender = room.myName
-        val prevHash = room.lastBlockHash.ifBlank { CoupleBlockchain.genesisHash(code) }
+        val prevHash = room.lastBlockHash.ifBlank { CoupleBlockchain.createDeterministicGenesisBlock(code).blockHash }
         val nextIndex = room.blockHeight
         val sharedSecret = room.ecdhSharedSecretB64
         scope.launch {

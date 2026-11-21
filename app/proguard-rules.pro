@@ -1,21 +1,35 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# KriMoon Release R8 / ProGuard Configuration
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# Preserve stack trace line numbers while obfuscating source file names
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
+-keepattributes Signature,*Annotation*
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# Keep Firebase Firestore POJO models & @Keep annotated classes (reflection deserialization)
+-keep class com.example.cloud.CoupleCloudRoom { *; }
+-keep class com.example.cloud.CoupleCloudInvite { *; }
+-keep class com.example.cloud.CoupleEncryptedBlock { *; }
+-keep @androidx.annotation.Keep class * { *; }
+-keepclasseswithmembers class * {
+    @androidx.annotation.Keep <fields>;
+    @androidx.annotation.Keep <methods>;
+}
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# Keep Room database, entities, and generated implementations
+-keep class * extends androidx.room.RoomDatabase
+-keep class com.example.data.** { *; }
+
+# Keep Jetpack Credential Manager & Google ID token credential classes
+-keep class androidx.credentials.** { *; }
+-keep class com.google.android.libraries.identity.googleid.** { *; }
+
+# Keep Firebase App Check Play Integrity provider entrypoints
+-keep class com.google.firebase.appcheck.playintegrity.** { *; }
+
+# Strip verbose/debug/info logs from release builds to prevent metadata leakage
+-assumenosideeffects class android.util.Log {
+    public static boolean isLoggable(java.lang.String, int);
+    public static int v(...);
+    public static int d(...);
+    public static int i(...);
+}

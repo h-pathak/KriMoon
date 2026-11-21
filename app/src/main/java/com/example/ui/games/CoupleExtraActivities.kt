@@ -136,7 +136,7 @@ fun CoupleTruthOrDareGame(
                         coupleCode = room.coupleCode,
                         senderName = room.myName,
                         state = next,
-                        previousHash = room.lastBlockHash.ifBlank { CoupleBlockchain.genesisHash(room.coupleCode) },
+                        previousHash = room.lastBlockHash.ifBlank { CoupleBlockchain.createDeterministicGenesisBlock(room.coupleCode).blockHash },
                         blockIndex = room.blockHeight.coerceAtLeast(1),
                         ecdhSharedSecretB64 = sharedSecret
                     )
@@ -531,7 +531,7 @@ fun CoupleWavelengthGame(
                         coupleCode = room.coupleCode,
                         senderName = room.myName,
                         state = next,
-                        previousHash = room.lastBlockHash.ifBlank { CoupleBlockchain.genesisHash(room.coupleCode) },
+                        previousHash = room.lastBlockHash.ifBlank { CoupleBlockchain.createDeterministicGenesisBlock(room.coupleCode).blockHash },
                         blockIndex = room.blockHeight.coerceAtLeast(1),
                         ecdhSharedSecretB64 = sharedSecret
                     )
@@ -1037,7 +1037,7 @@ fun CoupleDateWhispersGame(
                         senderName = room.myName,
                         likedDateId = likedDateId,
                         whisperNote = note,
-                        previousHash = room.lastBlockHash.ifBlank { CoupleBlockchain.genesisHash(room.coupleCode) },
+                        previousHash = room.lastBlockHash.ifBlank { CoupleBlockchain.createDeterministicGenesisBlock(room.coupleCode).blockHash },
                         blockIndex = room.blockHeight.coerceAtLeast(1),
                         ecdhSharedSecretB64 = sharedSecret
                     )

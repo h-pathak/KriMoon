@@ -122,7 +122,7 @@ class NotificationReceiver : BroadcastReceiver() {
     ) {
         val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
         val med = if (medId > 0) repo.getMedicationById(medId) else null
-        if (med == null || !med.isEnabled) return
+        if (med == null || !med.isEnabled || repo.isRecordUnreadable("medications", medId.toString())) return
 
         // If already taken today, do not nag
         if (med.lastTakenDate == todayStr) return
@@ -177,9 +177,8 @@ class NotificationReceiver : BroadcastReceiver() {
         val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
         val nowTimeStr = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
         val med = if (medId > 0) repo.getMedicationById(medId) else null
-        if (med != null) {
-            repo.markMedicationTakenToday(medId, todayStr, nowTimeStr)
-        }
+        if (med == null || repo.isRecordUnreadable("medications", medId.toString())) return
+        repo.markMedicationTakenToday(medId, todayStr, nowTimeStr)
 
         val medName = med?.name?.ifBlank { "your pill" } ?: "your pill"
         val greeting = if (userName.isNotBlank()) userName else "Krishi"
@@ -371,7 +370,7 @@ class NotificationReceiver : BroadcastReceiver() {
     ) {
         if (noteId <= 0L) return
         val note = repo.getNoteById(noteId) ?: return
-        if (note.content.isBlank()) return
+        if (note.content.isBlank() || repo.isRecordUnreadable("user_notes", noteId.toString())) return
 
         repo.markNoteReminderFired(note.id, note.reminderTimeMillis, reminderFired = true)
         NotificationHelper.showNoteReminderNotification(context, note.copy(reminderFired = true))
@@ -409,7 +408,9 @@ class NotificationReceiver : BroadcastReceiver() {
         context: Context,
         repo: PhasesRepository
     ) {
-        val notes = repo.getAllNotesOnce()
+        val notes = repo.getAllNotesOnce().filter {
+            it.content.isNotBlank() && !repo.isRecordUnreadable("user_notes", it.id.toString())
+        }
         if (notes.isEmpty()) return
 
         val selectedNote = notes.random()

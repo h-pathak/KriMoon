@@ -122,7 +122,7 @@ fun CoupleDoodleGame(
         if (currentRoom.isPassAndPlay) return
         val code = currentRoom.coupleCode
         val sender = currentRoom.myName
-        val prevHash = currentRoom.lastBlockHash.ifBlank { CoupleBlockchain.genesisHash(code) }
+        val prevHash = currentRoom.lastBlockHash.ifBlank { CoupleBlockchain.createDeterministicGenesisBlock(code).blockHash }
         val nextIndex = currentRoom.blockHeight
         val sharedSecret = currentRoom.ecdhSharedSecretB64
         scope.launch {
