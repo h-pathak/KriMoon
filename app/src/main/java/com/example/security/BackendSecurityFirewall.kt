@@ -297,39 +297,67 @@ object BackendSecurityFirewall {
     }
 
     /**
-     * Runs a live 14-Layer Security & Data-Breach Audit across Local Vault, OS Hardening, and Couple E2EE.
+     * Runs a live 12-Layer Security Audit across Local Vault, OS Hardening, and Couple E2EE.
+     * Reports real vault health and chain verification scope without inflated security claims.
      */
     fun runSecurityAudit(coupleRooms: List<CoupleRoomRecord> = emptyList()): BackendSecurityAuditReport {
-        val allChainsValid = coupleRooms.all { room ->
+        val vaultState = LocalVaultCrypto.vaultState.value
+        val vaultHealthy = vaultState == VaultState.HEALTHY || vaultState == VaultState.TEST_EPHEMERAL
+
+        val chainResults = coupleRooms.map { room ->
             val blocks = CoupleBlockchain.ledgerFromJson(room.blockchainLedgerJson)
-            CoupleBlockchain.verifyChain(blocks, room.coupleCode).isValid
+            CoupleBlockchain.verifyChain(
+                blocks = blocks,
+                coupleCode = room.coupleCode,
+                schemaVersion = room.chainSchemaVersion,
+                migrationAnchorHash = room.migrationAnchorHash,
+                migrationAnchorIndex = room.migrationAnchorIndex,
+                prunedAnchorHash = room.prunedAnchorHash,
+                prunedBlockCount = room.prunedBlockCount
+            )
         }
+        val allChainsValid = chainResults.all { it.isValid }
+        val anyPruned = chainResults.any { it.prunedBlockCount > 0 }
         val connectedRooms = coupleRooms.filter { !it.isPassAndPlay && it.approvalStatus == "CONNECTED" }
         val allConnectedUseEcdh = connectedRooms.all { it.ecdhSharedSecretB64.isNotBlank() }
         val totalCouplePassed = coupleRooms.sumOf { it.firewallPassedCount }
         val totalCoupleBlocked = coupleRooms.sumOf { it.firewallBlockedCount }
-        val keystoreLabel = if (LocalVaultCrypto.isHardwareKeystoreBacked) {
-            "Hardware-backed AndroidKeyStore AES-256-GCM with per-column AAD"
-        } else {
-            "Active AES-256-GCM field vault with per-column AAD"
+        val keystoreLabel = when {
+            !vaultHealthy -> "Vault locked ($vaultState) — fail-closed protection preserving ciphertext"
+            LocalVaultCrypto.isHardwareKeystoreBacked ->
+                "Hardware-backed AndroidKeyStore KEK + wrapped 256-bit DEK (AES-256-GCM + AAD)"
+            vaultState == VaultState.TEST_EPHEMERAL ->
+                "JVM/Robolectric test-mode AES-256-GCM vault (non-hardware)"
+            else -> "AES-256-GCM field vault with per-column AAD"
+        }
+        val chainDetail = when {
+            !allChainsValid -> "Hash-chain anomaly detected — inspect Couple Lounge room integrity"
+            anyPruned -> "SHA-256 PoW verified for retained window (older blocks pruned locally)"
+            else -> "SHA-256 PoW ('00') + sequential previousHash linkage verified from anchor"
         }
 
         val layers = listOf(
-            FirewallLayerStatus(1, "SQL & XSS Deep Packet Inspection (DPI)", "Backend DB", true, "Sanitizes all text inputs & blocks injection tokens"),
-            FirewallLayerStatus(2, "Hardware AndroidKeyStore AES-256-GCM Vault", "Local Storage", true, keystoreLabel),
+            FirewallLayerStatus(1, "SQL & XSS Deep Packet Inspection (DPI)", "Backend DB", true, "Sanitizes text inputs & blocks injection tokens"),
+            FirewallLayerStatus(2, "Hardware AndroidKeyStore AES-256-GCM Vault", "Local Storage", vaultHealthy, keystoreLabel),
             FirewallLayerStatus(3, "Entity Bounds & Schema Invariant Guard", "Backend DB", true, "Enforces strict medical, cycle & room schema bounds"),
-            FirewallLayerStatus(4, "Sliding-Window Rate & Brute-Force Shield", "Traffic", true, "Throttles room-join attempts and rapid DB/packet floods"),
+            FirewallLayerStatus(4, "Sliding-Window Rate & Brute-Force Shield", "Traffic", true, "Client-side join & flood throttling (production backend rate limiter recommended)"),
             FirewallLayerStatus(5, "IPC & Zero-Plaintext Alarm Intent Firewall", "OS / IPC", true, "Package-scoped PendingIntents carry IDs only — never raw note/med text"),
-            FirewallLayerStatus(6, "SQLite Secure-Delete & Crypto-Erasure Engine", "Local Storage", true, "PRAGMA secure_delete=ON + Keystore key rotation on data wipe"),
+            FirewallLayerStatus(6, "SQLite Secure-Delete & Crypto-Erasure Engine", "Local Storage", true, "PRAGMA secure_delete=ON + Keystore DEK erasure on user-confirmed wipe"),
             FirewallLayerStatus(7, "Lock-Screen, Screenshot & Tapjacking Shield", "Privacy", true, "FLAG_SECURE + VISIBILITY_PRIVATE + filterTouchesWhenObscured"),
             FirewallLayerStatus(8, "Cloud & ADB Backup Extraction Lockdown", "OS / Backup", true, "allowBackup=false + database/pref/file extraction excluded"),
             FirewallLayerStatus(9, "Zero-Cleartext Network & Zero-PII Log Policy", "Network", true, "cleartextTrafficPermitted=false + email/UID redaction in logs"),
-            FirewallLayerStatus(10, "Zero-Knowledge ECDH P-256 + HKDF-SHA256 E2EE", "Couple E2EE", allConnectedUseEcdh, "On-device secp256r1 keys; server & room code cannot decrypt moves"),
-            FirewallLayerStatus(11, "Proof-of-Work Blockchain & Anti-Replay Shield", "Blockchain", allChainsValid, "SHA-256 PoW ('00') + payload hash + append-only immutable blocks"),
-            FirewallLayerStatus(12, "Host Approval & Bonded Identity Lock", "Couple P2P", true, "Single-use room codes + Host confirmation + immutable member keys")
+            FirewallLayerStatus(10, "Zero-Knowledge ECDH P-256 + HKDF-SHA256 E2EE", "Couple E2EE", allConnectedUseEcdh, "Validated secp256r1 curve/point keys; v3 anti-downgrade active"),
+            FirewallLayerStatus(11, "Hash-Chain & Sequence Anti-Replay Shield", "Blockchain", allChainsValid, chainDetail),
+            FirewallLayerStatus(12, "Host Approval & Minimal Invite Isolation", "Couple P2P", true, "Minimal /coupleInvites lookup + Host confirmation + immutable member keys")
         )
 
-        val allHealthy = allChainsValid && allConnectedUseEcdh
+        val allHealthy = vaultHealthy && allChainsValid && allConnectedUseEcdh
+        val statusHeadline = when {
+            !vaultHealthy -> "VAULT LOCKED · ACTION REQUIRED"
+            allHealthy && anyPruned -> "12 LAYERS ACTIVE · PRUNED CHAIN WINDOW VERIFIED"
+            allHealthy -> "12 SECURITY LAYERS ACTIVE · INTEGRITY VERIFIED"
+            else -> "CHECK VAULT OR RECONNECT ROOM"
+        }
         return BackendSecurityAuditReport(
             totalFirewallLayers = layers.size,
             activeFirewallLayers = layers.count { it.isActive },
@@ -340,7 +368,7 @@ object BackendSecurityFirewall {
             cleartextNetworkBlocked = true,
             lockScreenRedactionEnabled = true,
             coupleBlockchainIntegrityValid = allChainsValid,
-            zeroBreachStatus = if (allHealthy) "ZERO BREACHES · ALL 12 LAYERS VERIFIED" else "CHECK VAULT OR RECONNECT ROOM",
+            zeroBreachStatus = statusHeadline,
             layers = layers
         )
     }

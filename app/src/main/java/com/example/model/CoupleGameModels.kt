@@ -3,14 +3,20 @@ package com.example.model
 import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
+import java.math.BigInteger
 import java.nio.charset.StandardCharsets
 import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
+import java.security.PublicKey
 import java.security.SecureRandom
+import java.security.interfaces.ECPublicKey
+import java.security.spec.ECFieldFp
 import java.security.spec.ECGenParameterSpec
+import java.security.spec.ECPoint
 import java.security.spec.PKCS8EncodedKeySpec
 import java.security.spec.X509EncodedKeySpec
+import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.KeyAgreement
 import javax.crypto.Mac
@@ -76,14 +82,15 @@ data class TicTacToeSyncState(
 data class CoupleBlock(
     val index: Int,
     val timestamp: Long,
-    val actionType: String, // "GENESIS_BOND", "HANDSHAKE", "QUIZ", "WYR", "DOODLE", "TTT", "UNPAIR"
+    val actionType: String, // "GENESIS_BOND", "HANDSHAKE", "QUIZ", "WYR", "DOODLE", "TTT", "DARE", "WAVELENGTH", "WHISPER", "UNPAIR"
     val senderName: String,
     val previousHash: String,
     val payloadHash: String,
     val nonce: Int,
     val blockHash: String,
     val cipherPreview: String = "",
-    val signaturePreview: String = ""
+    val signaturePreview: String = "",
+    val clientTurnId: String = ""
 )
 
 data class EncryptedEnvelope(
@@ -93,12 +100,53 @@ data class EncryptedEnvelope(
     val cipherSuite: String = "AES-256-GCM/PBKDF2-HMAC-SHA256"
 )
 
+enum class ChainVerificationScope {
+    FULL_FROM_GENESIS,
+    MIGRATED_FROM_V1_ANCHOR,
+    PRUNED_WINDOW_ONLY,
+    INVALID
+}
+
 data class ChainVerificationResult(
     val isValid: Boolean,
     val verifiedBlockCount: Int,
     val latestBlockHash: String,
-    val summary: String
+    val summary: String,
+    val scope: ChainVerificationScope = ChainVerificationScope.FULL_FROM_GENESIS,
+    val prunedBlockCount: Int = 0,
+    val migrationAnchorHash: String = ""
 )
+
+/**
+ * Plaintext activity intent stored encrypted inside the local pending-turn vault.
+ * Whenever a queued intent must be rebased onto a newer cloud chain head, a fresh block is mined
+ * and the intent payload is re-encrypted with a brand-new 96-bit AES-GCM nonce and updated AAD.
+ */
+data class CoupleActivityIntent(
+    val clientTurnId: String = UUID.randomUUID().toString(),
+    val actionType: String,
+    val senderName: String,
+    val payloadJson: String
+) {
+    fun toJsonString(): String = JSONObject().apply {
+        put("ctid", clientTurnId)
+        put("act", actionType)
+        put("snd", senderName)
+        put("payload", payloadJson)
+    }.toString()
+
+    companion object {
+        fun fromJsonString(raw: String): CoupleActivityIntent? = runCatching {
+            val o = JSONObject(raw)
+            val ctid = o.optString("ctid", "").ifBlank { UUID.randomUUID().toString() }
+            val act = o.optString("act", "")
+            val snd = o.optString("snd", "")
+            val payload = o.optString("payload", "")
+            if (act.isBlank() || payload.isBlank()) null
+            else CoupleActivityIntent(ctid, act, snd, payload)
+        }.getOrNull()
+    }
+}
 
 sealed class DecodedTurnPacket {
     abstract val coupleCode: String
@@ -188,6 +236,14 @@ data class CoupleEcdhKeyPair(
 object CoupleEcdhEngine {
     private const val CURVE_NAME = "secp256r1"
 
+    // NIST P-256 / secp256r1 domain parameters (FIPS 186-4 / SEC 2)
+    private val P256_P = BigInteger("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff", 16)
+    private val P256_A = BigInteger("ffffffff00000001000000000000000000000000fffffffffffffffffffffffc", 16)
+    private val P256_B = BigInteger("5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b", 16)
+    private val P256_GX = BigInteger("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296", 16)
+    private val P256_GY = BigInteger("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5", 16)
+    private val P256_N = BigInteger("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", 16)
+
     fun generateKeyPair(): CoupleEcdhKeyPair {
         val kpg = KeyPairGenerator.getInstance("EC")
         kpg.initialize(ECGenParameterSpec(CURVE_NAME), SecureRandom())
@@ -197,12 +253,37 @@ object CoupleEcdhEngine {
         return CoupleEcdhKeyPair(publicKeyB64 = pubB64, privateKeyB64 = privB64)
     }
 
+    /**
+     * Strictly validates that [pub] is an [ECPublicKey] on NIST P-256 (secp256r1),
+     * not the point at infinity, with coordinates in [0, p-1] satisfying y^2 = x^3 + ax + b (mod p).
+     */
+    fun validateNistP256PublicKey(pub: PublicKey): ECPublicKey? {
+        val ecPub = pub as? ECPublicKey ?: return null
+        val params = ecPub.params ?: return null
+        val field = params.curve.field as? ECFieldFp ?: return null
+        if (field.p != P256_P) return null
+        if (params.curve.a != P256_A || params.curve.b != P256_B) return null
+        if (params.generator.affineX != P256_GX || params.generator.affineY != P256_GY) return null
+        if (params.order != P256_N || params.cofactor != 1) return null
+
+        val w = ecPub.w ?: return null
+        if (w == ECPoint.POINT_INFINITY) return null
+        val x = w.affineX ?: return null
+        val y = w.affineY ?: return null
+        if (x < BigInteger.ZERO || x >= P256_P || y < BigInteger.ZERO || y >= P256_P) return null
+
+        val lhs = y.multiply(y).mod(P256_P)
+        val rhs = x.pow(3).add(P256_A.multiply(x)).add(P256_B).mod(P256_P)
+        if (lhs != rhs) return null
+        return ecPub
+    }
+
     fun isValidPublicKeyB64(publicKeyB64: String): Boolean {
         if (publicKeyB64.length !in 80..256) return false
         return try {
             val bytes = Base64.decode(publicKeyB64, Base64.NO_WRAP)
-            KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(bytes))
-            true
+            val pub = KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(bytes))
+            validateNistP256PublicKey(pub) != null
         } catch (_: Throwable) {
             false
         }
@@ -210,6 +291,7 @@ object CoupleEcdhEngine {
 
     /**
      * Derives a 256-bit zero-knowledge shared master secret (Base64) from local private key + peer public key,
+     * after strict NIST P-256 curve/point validation and rejection of all-zero raw ECDH secrets,
      * bound via HKDF-SHA256 to the room code and lexicographically sorted public keys (transcript binding).
      */
     fun deriveSharedSecretB64(
@@ -224,13 +306,20 @@ object CoupleEcdhEngine {
             val privKey = keyFactory.generatePrivate(
                 PKCS8EncodedKeySpec(Base64.decode(myPrivateKeyB64, Base64.NO_WRAP))
             )
-            val peerPub = keyFactory.generatePublic(
+            val rawPeerPub = keyFactory.generatePublic(
                 X509EncodedKeySpec(Base64.decode(peerPublicKeyB64, Base64.NO_WRAP))
             )
+            val peerPub = validateNistP256PublicKey(rawPeerPub) ?: return null
+
             val agreement = KeyAgreement.getInstance("ECDH")
             agreement.init(privKey)
             agreement.doPhase(peerPub, true)
             val rawSecret = agreement.generateSecret()
+
+            // Reject invalid length or all-zero ECDH shared secret
+            if (rawSecret.size != 32 || rawSecret.all { it.toInt() == 0 }) {
+                return null
+            }
 
             val sortedPubs = listOf(myPublicKeyB64.trim(), peerPublicKeyB64.trim()).sorted()
             val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
@@ -244,6 +333,7 @@ object CoupleEcdhEngine {
                 info = "KriMoon_MasterSecret_v3|$cleanCode".toByteArray(StandardCharsets.UTF_8),
                 length = 32
             )
+            rawSecret.fill(0)
             Base64.encodeToString(masterSecret, Base64.NO_WRAP)
         } catch (_: Throwable) {
             null
@@ -449,17 +539,44 @@ object CoupleCryptoEngine {
  */
 object CoupleBlockchain {
     const val POW_PREFIX = "00"
+    const val SCHEMA_VERSION_V1 = 1
+    const val SCHEMA_VERSION_V2 = 2
+    const val MAX_LOCAL_LEDGER_BLOCKS = 80
 
     fun genesisHash(coupleCode: String): String {
         val clean = CoupleTurnCodec.normalizeCode(coupleCode)
         return "00" + CoupleCryptoEngine.sha256Hex("KRIMOON_GENESIS_ANCHOR_V2_$clean").drop(2)
     }
 
-    fun createGenesisBlock(coupleCode: String, creatorName: String): CoupleBlock {
+    /**
+     * Canonical deterministic Genesis block (Index #0) for newly created V2 rooms.
+     * Independent of mutable creator display name so both devices and Firestore agree identically.
+     */
+    fun createDeterministicGenesisBlock(coupleCode: String): CoupleBlock {
+        val clean = CoupleTurnCodec.normalizeCode(coupleCode)
+        val rootAnchor = genesisHash(clean)
+        val payloadHash = CoupleCryptoEngine.sha256Hex("GENESIS_V2|$clean")
+        val deterministicTs = 1700000000000L + (clean.toLongOrNull() ?: 0L)
+        return mineBlock(
+            index = 0,
+            actionType = "GENESIS_BOND",
+            senderName = "Genesis",
+            previousHash = rootAnchor,
+            payloadHash = payloadHash,
+            timestamp = deterministicTs,
+            cipherPreview = "AES256-GCM-GENESIS-V2",
+            signaturePreview = CoupleCryptoEngine.keyFingerprint(clean)
+        )
+    }
+
+    /**
+     * Legacy V1 Genesis block builder retained solely for backward-compatible verification of
+     * existing V1 rooms created before deterministic V2 Genesis rollout.
+     */
+    fun createLegacyV1GenesisBlock(coupleCode: String, creatorName: String): CoupleBlock {
         val clean = CoupleTurnCodec.normalizeCode(coupleCode)
         val rootAnchor = genesisHash(clean)
         val payloadHash = CoupleCryptoEngine.sha256Hex("GENESIS_BOND|$clean|${creatorName.trim()}")
-        // Deterministic timestamp for Genesis block per coupleCode so both devices share identical Genesis anchor
         val deterministicTs = 1700000000000L + (clean.toLongOrNull() ?: 0L)
         return mineBlock(
             index = 0,
@@ -471,6 +588,10 @@ object CoupleBlockchain {
             cipherPreview = "AES256-GCM-GENESIS",
             signaturePreview = CoupleCryptoEngine.keyFingerprint(clean)
         )
+    }
+
+    fun createGenesisBlock(coupleCode: String, creatorName: String): CoupleBlock {
+        return createDeterministicGenesisBlock(coupleCode)
     }
 
     fun computeBlockHash(
@@ -494,7 +615,8 @@ object CoupleBlockchain {
         payloadHash: String,
         timestamp: Long = System.currentTimeMillis(),
         cipherPreview: String = "",
-        signaturePreview: String = ""
+        signaturePreview: String = "",
+        clientTurnId: String = ""
     ): CoupleBlock {
         var nonce = 0
         var hash = computeBlockHash(index, timestamp, actionType, senderName, previousHash, payloadHash, nonce)
@@ -512,11 +634,13 @@ object CoupleBlockchain {
             nonce = nonce,
             blockHash = hash,
             cipherPreview = cipherPreview,
-            signaturePreview = signaturePreview
+            signaturePreview = signaturePreview,
+            clientTurnId = clientTurnId
         )
     }
 
     fun verifyBlock(block: CoupleBlock): Boolean {
+        if (block.index < 0 || block.previousHash.isBlank() || block.payloadHash.isBlank()) return false
         if (!block.blockHash.startsWith(POW_PREFIX)) return false
         val expected = computeBlockHash(
             index = block.index,
@@ -530,41 +654,280 @@ object CoupleBlockchain {
         return CoupleCryptoEngine.constantTimeEquals(expected, block.blockHash)
     }
 
-    fun verifyChain(blocks: List<CoupleBlock>, coupleCode: String): ChainVerificationResult {
+    /**
+     * Strict sequential hash-chain verifier supporting:
+     * - Newly created V2 rooms anchored at deterministic Block #0 ([ChainVerificationScope.FULL_FROM_GENESIS]).
+     * - Upgraded V1->V2 rooms where immutable legacy V1 blocks remain intact and V2 continuity begins
+     *   from [migrationAnchorHash] at [migrationAnchorIndex] ([ChainVerificationScope.MIGRATED_FROM_V1_ANCHOR]).
+     * - Locally pruned rolling windows (honestly reported as [ChainVerificationScope.PRUNED_WINDOW_ONLY]).
+     *
+     * Rejects: invalid PoW/SHA-256, duplicate blockHash or duplicate index, non-sequential index jumps,
+     * broken previousHash linkage, and mismatched Genesis or V1 migration anchors.
+     */
+    fun verifyChain(
+        blocks: List<CoupleBlock>,
+        coupleCode: String,
+        schemaVersion: Int = SCHEMA_VERSION_V2,
+        migrationAnchorHash: String = "",
+        migrationAnchorIndex: Int = 0,
+        prunedAnchorHash: String = "",
+        prunedBlockCount: Int = 0
+    ): ChainVerificationResult {
+        val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
+        val expectedGenesisAnchor = genesisHash(cleanCode)
+
         if (blocks.isEmpty()) {
-            val genesis = createGenesisBlock(coupleCode, "System")
+            if (prunedBlockCount > 0) {
+                return ChainVerificationResult(
+                    isValid = false,
+                    verifiedBlockCount = 0,
+                    latestBlockHash = prunedAnchorHash,
+                    summary = "Invalid chain state: prunedBlockCount=$prunedBlockCount with empty local window",
+                    scope = ChainVerificationScope.INVALID,
+                    prunedBlockCount = prunedBlockCount,
+                    migrationAnchorHash = migrationAnchorHash
+                )
+            }
+            val genesis = createDeterministicGenesisBlock(cleanCode)
             return ChainVerificationResult(
                 isValid = true,
                 verifiedBlockCount = 1,
                 latestBlockHash = genesis.blockHash,
-                summary = "Genesis Anchor Ready · PoW Verified"
+                summary = "Genesis Anchor Ready · PoW Verified",
+                scope = ChainVerificationScope.FULL_FROM_GENESIS,
+                prunedBlockCount = 0,
+                migrationAnchorHash = migrationAnchorHash
             )
         }
-        val knownHashes = mutableSetOf(genesisHash(coupleCode))
-        for (b in blocks) {
+
+        val seenHashes = HashSet<String>(blocks.size * 2)
+        val seenIndices = HashSet<Int>(blocks.size * 2)
+
+        // 1. Validate every block individually and enforce strict consecutive linkage & uniqueness
+        for (i in blocks.indices) {
+            val b = blocks[i]
             if (!verifyBlock(b)) {
                 return ChainVerificationResult(
                     isValid = false,
-                    verifiedBlockCount = blocks.size,
+                    verifiedBlockCount = i,
                     latestBlockHash = b.blockHash,
-                    summary = "Tamper alert at Block #${b.index}: Invalid SHA-256 PoW hash"
+                    summary = "Tamper alert at Block #${b.index}: Invalid SHA-256 PoW hash",
+                    scope = ChainVerificationScope.INVALID,
+                    prunedBlockCount = prunedBlockCount,
+                    migrationAnchorHash = migrationAnchorHash
                 )
             }
-            if (b.previousHash.isBlank()) {
+            if (!seenHashes.add(b.blockHash)) {
                 return ChainVerificationResult(
                     isValid = false,
-                    verifiedBlockCount = blocks.size,
+                    verifiedBlockCount = i,
                     latestBlockHash = b.blockHash,
-                    summary = "Broken link at Block #${b.index}: Missing previousHash"
+                    summary = "Duplicate blockHash detected at Block #${b.index}",
+                    scope = ChainVerificationScope.INVALID,
+                    prunedBlockCount = prunedBlockCount,
+                    migrationAnchorHash = migrationAnchorHash
                 )
             }
-            knownHashes.add(b.blockHash)
+            if (!seenIndices.add(b.index)) {
+                return ChainVerificationResult(
+                    isValid = false,
+                    verifiedBlockCount = i,
+                    latestBlockHash = b.blockHash,
+                    summary = "Duplicate block index #${b.index} detected",
+                    scope = ChainVerificationScope.INVALID,
+                    prunedBlockCount = prunedBlockCount,
+                    migrationAnchorHash = migrationAnchorHash
+                )
+            }
+            if (i > 0) {
+                val prev = blocks[i - 1]
+                if (b.index != prev.index + 1) {
+                    return ChainVerificationResult(
+                        isValid = false,
+                        verifiedBlockCount = i,
+                        latestBlockHash = b.blockHash,
+                        summary = "Non-sequential block index at #${b.index} (expected #${prev.index + 1})",
+                        scope = ChainVerificationScope.INVALID,
+                        prunedBlockCount = prunedBlockCount,
+                        migrationAnchorHash = migrationAnchorHash
+                    )
+                }
+                val isMigrationBoundary = migrationAnchorHash.isNotBlank() &&
+                    migrationAnchorIndex > 0 &&
+                    b.index == migrationAnchorIndex
+                if (isMigrationBoundary) {
+                    // At an explicit V1->V2 migration boundary, previousHash MUST match BOTH the
+                    // recorded migrationAnchorHash AND the last verified V1 block's blockHash.
+                    if (!CoupleCryptoEngine.constantTimeEquals(prev.blockHash, migrationAnchorHash) ||
+                        !CoupleCryptoEngine.constantTimeEquals(b.previousHash, migrationAnchorHash)
+                    ) {
+                        return ChainVerificationResult(
+                            isValid = false,
+                            verifiedBlockCount = i,
+                            latestBlockHash = b.blockHash,
+                            summary = "V1->V2 migration anchor mismatch at Block #${b.index}",
+                            scope = ChainVerificationScope.INVALID,
+                            prunedBlockCount = prunedBlockCount,
+                            migrationAnchorHash = migrationAnchorHash
+                        )
+                    }
+                } else if (!CoupleCryptoEngine.constantTimeEquals(b.previousHash, prev.blockHash)) {
+                    // Legacy V1 compatibility: rooms created before V2 could link Block #1 to genesisHash(code)
+                    val isLegacyV1Block1Link = schemaVersion == SCHEMA_VERSION_V1 &&
+                        prev.index == 0 && b.index == 1 &&
+                        CoupleCryptoEngine.constantTimeEquals(b.previousHash, expectedGenesisAnchor)
+                    if (!isLegacyV1Block1Link) {
+                        return ChainVerificationResult(
+                            isValid = false,
+                            verifiedBlockCount = i,
+                            latestBlockHash = b.blockHash,
+                            summary = "Broken link at Block #${b.index}: previousHash does not match Block #${prev.index}",
+                            scope = ChainVerificationScope.INVALID,
+                            prunedBlockCount = prunedBlockCount,
+                            migrationAnchorHash = migrationAnchorHash
+                        )
+                    }
+                }
+            }
         }
+
+        // 2. Validate root/anchor boundary of the first block in the verified window
+        val first = blocks.first()
+        val resolvedScope: ChainVerificationScope = when {
+            first.index == 0 -> {
+                if (!CoupleCryptoEngine.constantTimeEquals(first.previousHash, expectedGenesisAnchor)) {
+                    return ChainVerificationResult(
+                        isValid = false,
+                        verifiedBlockCount = 0,
+                        latestBlockHash = first.blockHash,
+                        summary = "Genesis anchor mismatch at Block #0 for room #$cleanCode",
+                        scope = ChainVerificationScope.INVALID,
+                        prunedBlockCount = prunedBlockCount,
+                        migrationAnchorHash = migrationAnchorHash
+                    )
+                }
+                if (schemaVersion >= SCHEMA_VERSION_V2 &&
+                    migrationAnchorHash.isBlank() &&
+                    first.senderName == "Genesis"
+                ) {
+                    val expectedV2Genesis = createDeterministicGenesisBlock(cleanCode)
+                    if (!CoupleCryptoEngine.constantTimeEquals(first.blockHash, expectedV2Genesis.blockHash)) {
+                        return ChainVerificationResult(
+                            isValid = false,
+                            verifiedBlockCount = 0,
+                            latestBlockHash = first.blockHash,
+                            summary = "Deterministic V2 Genesis hash mismatch at Block #0",
+                            scope = ChainVerificationScope.INVALID,
+                            prunedBlockCount = prunedBlockCount,
+                            migrationAnchorHash = migrationAnchorHash
+                        )
+                    }
+                }
+                if (migrationAnchorHash.isNotBlank()) {
+                    ChainVerificationScope.MIGRATED_FROM_V1_ANCHOR
+                } else {
+                    ChainVerificationScope.FULL_FROM_GENESIS
+                }
+            }
+            migrationAnchorHash.isNotBlank() && first.index == migrationAnchorIndex -> {
+                if (!CoupleCryptoEngine.constantTimeEquals(first.previousHash, migrationAnchorHash)) {
+                    return ChainVerificationResult(
+                        isValid = false,
+                        verifiedBlockCount = 0,
+                        latestBlockHash = first.blockHash,
+                        summary = "V2 chain head at Block #${first.index} does not match V1 migrationAnchorHash",
+                        scope = ChainVerificationScope.INVALID,
+                        prunedBlockCount = prunedBlockCount,
+                        migrationAnchorHash = migrationAnchorHash
+                    )
+                }
+                ChainVerificationScope.MIGRATED_FROM_V1_ANCHOR
+            }
+            prunedBlockCount > 0 && prunedAnchorHash.isNotBlank() -> {
+                if (!CoupleCryptoEngine.constantTimeEquals(first.previousHash, prunedAnchorHash)) {
+                    return ChainVerificationResult(
+                        isValid = false,
+                        verifiedBlockCount = 0,
+                        latestBlockHash = first.blockHash,
+                        summary = "Pruned window anchor mismatch at Block #${first.index}",
+                        scope = ChainVerificationScope.INVALID,
+                        prunedBlockCount = prunedBlockCount,
+                        migrationAnchorHash = migrationAnchorHash
+                    )
+                }
+                ChainVerificationScope.PRUNED_WINDOW_ONLY
+            }
+            prunedBlockCount > 0 -> {
+                ChainVerificationScope.PRUNED_WINDOW_ONLY
+            }
+            schemaVersion == SCHEMA_VERSION_V1 && first.index == 1 &&
+                CoupleCryptoEngine.constantTimeEquals(first.previousHash, expectedGenesisAnchor) -> {
+                ChainVerificationScope.FULL_FROM_GENESIS
+            }
+            else -> {
+                return ChainVerificationResult(
+                    isValid = false,
+                    verifiedBlockCount = 0,
+                    latestBlockHash = first.blockHash,
+                    summary = "Genesis mismatch: chain begins at Block #${first.index} without Genesis, migration anchor, or pruned anchor",
+                    scope = ChainVerificationScope.INVALID,
+                    prunedBlockCount = prunedBlockCount,
+                    migrationAnchorHash = migrationAnchorHash
+                )
+            }
+        }
+
+        val summary = when (resolvedScope) {
+            ChainVerificationScope.FULL_FROM_GENESIS ->
+                "Verified ${blocks.size} Blocks from Genesis · SHA-256 + PoW Intact"
+            ChainVerificationScope.MIGRATED_FROM_V1_ANCHOR ->
+                "Verified ${blocks.size} Blocks from V1 Migration Anchor (#$migrationAnchorIndex) · Intact"
+            ChainVerificationScope.PRUNED_WINDOW_ONLY ->
+                "Verified latest ${blocks.size} Blocks ($prunedBlockCount earlier blocks pruned locally)"
+            ChainVerificationScope.INVALID -> "Chain verification failed"
+        }
+
         return ChainVerificationResult(
             isValid = true,
             verifiedBlockCount = blocks.size,
             latestBlockHash = blocks.last().blockHash,
-            summary = "Verified ${blocks.size} Blocks · PoW + SHA-256 Chain Intact"
+            summary = summary,
+            scope = resolvedScope,
+            prunedBlockCount = prunedBlockCount,
+            migrationAnchorHash = migrationAnchorHash
+        )
+    }
+
+    /**
+     * Retains at most [maxBlocks] recent blocks while recording the exact pruned count and
+     * the [prunedAnchorHash] (blockHash of the last evicted block) so [verifyChain] can
+     * honestly verify and report [ChainVerificationScope.PRUNED_WINDOW_ONLY].
+     */
+    data class PrunedLedgerWindow(
+        val retainedBlocks: List<CoupleBlock>,
+        val newlyPrunedCount: Int,
+        val prunedAnchorHash: String
+    )
+
+    fun pruneLedgerWindow(
+        blocks: List<CoupleBlock>,
+        existingPrunedCount: Int = 0,
+        existingPrunedAnchorHash: String = "",
+        maxBlocks: Int = MAX_LOCAL_LEDGER_BLOCKS
+    ): PrunedLedgerWindow {
+        if (blocks.size <= maxBlocks) {
+            return PrunedLedgerWindow(
+                retainedBlocks = blocks,
+                newlyPrunedCount = existingPrunedCount,
+                prunedAnchorHash = existingPrunedAnchorHash
+            )
+        }
+        val dropCount = blocks.size - maxBlocks
+        val lastDropped = blocks[dropCount - 1]
+        return PrunedLedgerWindow(
+            retainedBlocks = blocks.drop(dropCount),
+            newlyPrunedCount = existingPrunedCount + dropCount,
+            prunedAnchorHash = lastDropped.blockHash
         )
     }
 
@@ -580,6 +943,7 @@ object CoupleBlockchain {
             put("bh", block.blockHash)
             put("cp", block.cipherPreview)
             put("sp", block.signaturePreview)
+            if (block.clientTurnId.isNotBlank()) put("ctid", block.clientTurnId)
         }
     }
 
@@ -594,13 +958,14 @@ object CoupleBlockchain {
             nonce = o.optInt("nc", 0),
             blockHash = o.optString("bh", ""),
             cipherPreview = o.optString("cp", ""),
-            signaturePreview = o.optString("sp", "")
+            signaturePreview = o.optString("sp", ""),
+            clientTurnId = o.optString("ctid", "")
         )
     }
 
     fun ledgerToJson(blocks: List<CoupleBlock>): String {
         val arr = JSONArray()
-        blocks.takeLast(80).forEach { arr.put(blockToJson(it)) }
+        blocks.takeLast(MAX_LOCAL_LEDGER_BLOCKS).forEach { arr.put(blockToJson(it)) }
         return arr.toString()
     }
 
@@ -642,7 +1007,11 @@ object CoupleFirewall {
         existingLedger: List<CoupleBlock> = emptyList(),
         lockedPartnerName: String = "",
         myName: String = "",
-        ecdhSharedSecretB64: String = ""
+        ecdhSharedSecretB64: String = "",
+        minProtocolVersion: Int = if (ecdhSharedSecretB64.isNotBlank()) CoupleTurnCodec.PROTOCOL_VERSION_ECDH_V3 else CoupleTurnCodec.PROTOCOL_VERSION_LEGACY_V2,
+        minAcceptedBlockIndex: Int = 0,
+        seenClientTurnIds: Set<String> = emptySet(),
+        seenReplayHashes: Set<String> = emptySet()
     ): Result<DecodedTurnPacket> {
         // Rule 0: Sliding-Window Rate Limiter & Flood Guard
         if (!com.example.security.BackendSecurityFirewall.allowRateLimitedOperation("couple_pkt_$expectedCoupleCode", maxOpsPerWindow = 50)) {
@@ -663,15 +1032,19 @@ object CoupleFirewall {
             }
         }
 
-        // Delegate to Codec which executes Rule 2 (Room Tag), Rule 3 (ECDH+HKDF / HMAC-SHA256 & AES-256-GCM),
-        // Rule 4 (Blockchain PoW & Payload Hash), Rule 5 (Anti-Replay), and Rule 6 (Partner Lock).
+        // Delegate to Codec which executes Room Tag, Protocol Anti-Downgrade, Sequence+clientTurnId Replay,
+        // ECDH+HKDF / HMAC-SHA256 & AES-256-GCM, Blockchain PoW & Payload Hash, and Partner Lock.
         return CoupleTurnCodec.decodeSecuredPacket(
             rawInput = trimmed,
             expectedCoupleCode = expectedCoupleCode,
             existingLedger = existingLedger,
             lockedPartnerName = lockedPartnerName,
             myName = myName,
-            ecdhSharedSecretB64 = ecdhSharedSecretB64
+            ecdhSharedSecretB64 = ecdhSharedSecretB64,
+            minProtocolVersion = minProtocolVersion,
+            minAcceptedBlockIndex = minAcceptedBlockIndex,
+            seenClientTurnIds = seenClientTurnIds,
+            seenReplayHashes = seenReplayHashes
         )
     }
 }
@@ -701,6 +1074,10 @@ object CoupleGameDecks {
 object CoupleTurnCodec {
     private const val PREFIX = "KRIMOON:"
     private const val BCHAIN_PREFIX = "KRIMOON:BCHAIN:"
+
+    /** Independent cryptographic wire protocol versions (decoupled from DB/Firestore schemaVersion). */
+    const val PROTOCOL_VERSION_LEGACY_V2 = 2
+    const val PROTOCOL_VERSION_ECDH_V3 = 3
 
     private val codeRandom = SecureRandom()
 
@@ -746,9 +1123,119 @@ object CoupleTurnCodec {
     }
 
     /**
+     * Re-mines and re-encrypts a queued [CoupleActivityIntent] against a new chain head
+     * `(previousHash, blockIndex)`. Always generates a fresh 96-bit AES-GCM nonce/IV and fresh
+     * authenticated metadata (AAD) — never reuses ciphertext across rebases.
+     */
+    fun sealIntentWithFreshNonce(
+        coupleCode: String,
+        intent: CoupleActivityIntent,
+        previousHash: String,
+        blockIndex: Int,
+        ecdhSharedSecretB64: String = ""
+    ): Pair<String, CoupleBlock> {
+        val payloadObj = JSONObject(intent.payloadJson)
+        return sealBlockchainPacket(
+            coupleCode = coupleCode,
+            senderName = intent.senderName,
+            actionType = intent.actionType,
+            plainPayloadObj = payloadObj,
+            previousHash = previousHash,
+            blockIndex = blockIndex,
+            ecdhSharedSecretB64 = ecdhSharedSecretB64,
+            clientTurnId = intent.clientTurnId
+        )
+    }
+
+    /**
+     * Extracts the outer IV Base64 string from a sealed KRIMOON:BCHAIN: packet for testing & audit
+     * of fresh-nonce generation during conflict rebasing.
+     */
+    fun peekPacketIvBase64(rawInput: String): String? {
+        return try {
+            val idx = rawInput.indexOf(BCHAIN_PREFIX)
+            if (idx < 0) return null
+            val token = rawInput.substring(idx + BCHAIN_PREFIX.length).trim().split(Regex("\\s+")).first()
+            val outer = JSONObject(String(Base64.decode(token, Base64.DEFAULT), StandardCharsets.UTF_8))
+            outer.optString("iv", "").takeIf { it.isNotBlank() }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Recovers a [CoupleActivityIntent] from an outgoing locally-sealed packet so the turn can be
+     * persisted encrypted in [com.example.data.PendingCoupleTurn] and re-encrypted with a brand-new
+     * 96-bit AES-GCM nonce if the cloud chain head advances before commit.
+     */
+    fun extractActivityIntent(
+        rawPacket: String,
+        coupleCode: String,
+        ecdhSharedSecretB64: String = ""
+    ): Result<CoupleActivityIntent> {
+        return try {
+            val cleanCode = normalizeCode(coupleCode)
+            val bchainIdx = rawPacket.indexOf(BCHAIN_PREFIX)
+            if (bchainIdx < 0) {
+                return Result.failure(IllegalArgumentException("Missing KRIMOON:BCHAIN header"))
+            }
+            val token = rawPacket.substring(bchainIdx + BCHAIN_PREFIX.length).trim().split(Regex("\\s+")).first()
+            val outer = JSONObject(String(Base64.decode(token, Base64.DEFAULT), StandardCharsets.UTF_8))
+            val pv = if (outer.has("pv")) outer.optInt("pv", 2) else outer.optInt("v", 2)
+            val ctid = outer.optString("ctid", "").ifBlank { UUID.randomUUID().toString() }
+            val blkObj = outer.optJSONObject("blk")
+                ?: return Result.failure(IllegalArgumentException("Missing blk header"))
+            val block = CoupleBlockchain.blockFromJson(blkObj)
+            val aad = if (pv >= PROTOCOL_VERSION_ECDH_V3) {
+                "$cleanCode|${block.blockHash}|${block.previousHash}|${block.index}|${block.actionType}|v$pv|$ctid"
+            } else {
+                "$cleanCode|${block.blockHash}|${block.actionType}|v$pv"
+            }
+            val plain = CoupleCryptoEngine.decryptPayload(
+                ivBase64 = outer.optString("iv", ""),
+                cipherBase64 = outer.optString("ct", ""),
+                expectedHmacHex = outer.optString("sig", ""),
+                coupleCode = cleanCode,
+                aad = aad,
+                ecdhSharedSecretB64 = if (pv >= PROTOCOL_VERSION_ECDH_V3) ecdhSharedSecretB64 else ""
+            ).getOrElse { return Result.failure(it) }
+            Result.success(
+                CoupleActivityIntent(
+                    clientTurnId = ctid,
+                    actionType = block.actionType,
+                    senderName = block.senderName,
+                    payloadJson = plain
+                )
+            )
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    fun stringSetFromJson(json: String): LinkedHashSet<String> {
+        val result = LinkedHashSet<String>()
+        runCatching {
+            val arr = JSONArray(json.ifBlank { "[]" })
+            for (i in 0 until arr.length()) {
+                val item = arr.optString(i, "")
+                if (item.isNotBlank()) result.add(item)
+            }
+        }
+        return result
+    }
+
+    fun stringSetToJson(items: Collection<String>, maxSize: Int = 512): String {
+        val trimmed = if (items.size > maxSize) items.toList().takeLast(maxSize) else items
+        val arr = JSONArray()
+        trimmed.forEach { if (it.isNotBlank()) arr.put(it) }
+        return arr.toString()
+    }
+
+    /**
      * Core Blockchain + ECDH-P256 / AES-256-GCM Packet Builder.
-     * Mines a PoW CoupleBlock, encrypts the inner payload with AES-256-GCM bound to the block hash via AAD,
-     * signs with HMAC-SHA256, and returns both the wire string and mined CoupleBlock.
+     * Mines a PoW CoupleBlock, encrypts the inner payload with AES-256-GCM using a fresh 96-bit nonce
+     * bound to (coupleCode, blockHash, previousHash, blockIndex, actionType, protocolVersion, clientTurnId)
+     * via AAD + HMAC-SHA256, and returns both the wire string and mined CoupleBlock.
      * Uses zero-knowledge Protocol v3 when [ecdhSharedSecretB64] is present.
      */
     private fun sealBlockchainPacket(
@@ -758,11 +1245,14 @@ object CoupleTurnCodec {
         plainPayloadObj: JSONObject,
         previousHash: String,
         blockIndex: Int,
-        ecdhSharedSecretB64: String = ""
+        ecdhSharedSecretB64: String = "",
+        clientTurnId: String = UUID.randomUUID().toString()
     ): Pair<String, CoupleBlock> {
         val cleanCode = normalizeCode(coupleCode)
         val cleanSender = CoupleFirewall.sanitizeName(senderName)
-        val prev = previousHash.ifBlank { CoupleBlockchain.genesisHash(cleanCode) }
+        val prev = previousHash.ifBlank { CoupleBlockchain.createDeterministicGenesisBlock(cleanCode).blockHash }
+        val cleanTurnId = clientTurnId.replace(Regex("[^a-zA-Z0-9_\\-]"), "").take(64)
+            .ifBlank { UUID.randomUUID().toString() }
         val plainJson = plainPayloadObj.toString()
         val payloadHash = CoupleCryptoEngine.sha256Hex(plainJson)
 
@@ -771,11 +1261,20 @@ object CoupleTurnCodec {
             actionType = actionType,
             senderName = cleanSender,
             previousHash = prev,
-            payloadHash = payloadHash
+            payloadHash = payloadHash,
+            clientTurnId = cleanTurnId
         )
 
-        val packetVersion = if (ecdhSharedSecretB64.isNotBlank()) 3 else 2
-        val aad = "$cleanCode|${mined.blockHash}|$actionType|v$packetVersion"
+        val protocolVersion = if (ecdhSharedSecretB64.isNotBlank()) {
+            PROTOCOL_VERSION_ECDH_V3
+        } else {
+            PROTOCOL_VERSION_LEGACY_V2
+        }
+        val aad = if (protocolVersion >= PROTOCOL_VERSION_ECDH_V3) {
+            "$cleanCode|${mined.blockHash}|${mined.previousHash}|${mined.index}|$actionType|v$protocolVersion|$cleanTurnId"
+        } else {
+            "$cleanCode|${mined.blockHash}|$actionType|v$protocolVersion"
+        }
         val envelope = CoupleCryptoEngine.encryptPayload(
             plainJson = plainJson,
             coupleCode = cleanCode,
@@ -789,7 +1288,9 @@ object CoupleTurnCodec {
         )
 
         val outer = JSONObject().apply {
-            put("v", packetVersion)
+            put("v", protocolVersion)
+            put("pv", protocolVersion)
+            put("ctid", cleanTurnId)
             put("tag", codeTag(cleanCode))
             put("blk", CoupleBlockchain.blockToJson(finalBlock))
             put("iv", envelope.ivBase64)
@@ -1017,7 +1518,11 @@ object CoupleTurnCodec {
         existingLedger: List<CoupleBlock> = emptyList(),
         lockedPartnerName: String = "",
         myName: String = "",
-        ecdhSharedSecretB64: String = ""
+        ecdhSharedSecretB64: String = "",
+        minProtocolVersion: Int = if (ecdhSharedSecretB64.isNotBlank()) PROTOCOL_VERSION_ECDH_V3 else PROTOCOL_VERSION_LEGACY_V2,
+        minAcceptedBlockIndex: Int = 0,
+        seenClientTurnIds: Set<String> = emptySet(),
+        seenReplayHashes: Set<String> = emptySet()
     ): Result<DecodedTurnPacket> {
         return CoupleFirewall.inspectAndFilter(
             rawInput = rawInput,
@@ -1025,7 +1530,11 @@ object CoupleTurnCodec {
             existingLedger = existingLedger,
             lockedPartnerName = lockedPartnerName,
             myName = myName,
-            ecdhSharedSecretB64 = ecdhSharedSecretB64
+            ecdhSharedSecretB64 = ecdhSharedSecretB64,
+            minProtocolVersion = minProtocolVersion,
+            minAcceptedBlockIndex = minAcceptedBlockIndex,
+            seenClientTurnIds = seenClientTurnIds,
+            seenReplayHashes = seenReplayHashes
         )
     }
 
@@ -1035,7 +1544,11 @@ object CoupleTurnCodec {
         existingLedger: List<CoupleBlock>,
         lockedPartnerName: String,
         myName: String,
-        ecdhSharedSecretB64: String = ""
+        ecdhSharedSecretB64: String = "",
+        minProtocolVersion: Int = if (ecdhSharedSecretB64.isNotBlank()) PROTOCOL_VERSION_ECDH_V3 else PROTOCOL_VERSION_LEGACY_V2,
+        minAcceptedBlockIndex: Int = 0,
+        seenClientTurnIds: Set<String> = emptySet(),
+        seenReplayHashes: Set<String> = emptySet()
     ): Result<DecodedTurnPacket> {
         return try {
             val cleanCode = normalizeCode(expectedCoupleCode)
@@ -1047,9 +1560,21 @@ object CoupleTurnCodec {
             val token = rawInput.substring(bchainIdx + BCHAIN_PREFIX.length).trim().split(Regex("\\s+")).first()
             val outerJsonStr = String(Base64.decode(token, Base64.DEFAULT), StandardCharsets.UTF_8)
             val outer = JSONObject(outerJsonStr)
-            val packetVersion = outer.optInt("v", 2)
+            val packetVersion = if (outer.has("pv")) outer.optInt("pv", 2) else outer.optInt("v", 2)
+            val outerClientTurnId = outer.optString("ctid", "")
 
-            // Firewall Rule 2: Room Key Tag Isolation
+            // Firewall Rule 2a: Cryptographic Protocol Anti-Downgrade (independent of DB schemaVersion)
+            val effectiveMinProtocol = maxOf(
+                minProtocolVersion,
+                if (ecdhSharedSecretB64.isNotBlank()) PROTOCOL_VERSION_ECDH_V3 else PROTOCOL_VERSION_LEGACY_V2
+            )
+            if (packetVersion < effectiveMinProtocol) {
+                return Result.failure(
+                    SecurityException("FIREWALL BLOCKED: Cryptographic protocol downgrade rejected (packet v$packetVersion < required v$effectiveMinProtocol).")
+                )
+            }
+
+            // Firewall Rule 2b: Room Key Tag Isolation
             val tag = outer.optString("tag", "")
             if (!CoupleCryptoEngine.constantTimeEquals(tag, codeTag(cleanCode))) {
                 return Result.failure(SecurityException("FIREWALL BLOCKED: Packet belongs to a different Couple Code!"))
@@ -1057,15 +1582,32 @@ object CoupleTurnCodec {
 
             val blockObj = outer.optJSONObject("blk")
                 ?: return Result.failure(SecurityException("FIREWALL BLOCKED: Missing Blockchain header."))
-            val block = CoupleBlockchain.blockFromJson(blockObj)
+            val block = CoupleBlockchain.blockFromJson(blockObj).let { parsed ->
+                if (parsed.clientTurnId.isBlank() && outerClientTurnId.isNotBlank()) {
+                    parsed.copy(clientTurnId = outerClientTurnId)
+                } else parsed
+            }
 
             // Firewall Rule 4a: Proof-of-Work & SHA-256 Block Hash Verification
             if (!CoupleBlockchain.verifyBlock(block)) {
                 return Result.failure(SecurityException("FIREWALL BLOCKED: Blockchain Proof-of-Work or SHA-256 hash invalid!"))
             }
 
-            // Firewall Rule 5: Anti-Replay Duplicate Block Filter
-            if (existingLedger.any { it.blockHash == block.blockHash }) {
+            // Firewall Rule 5a (PRIMARY Replay Protection): Persistent Monotonic Sequence & Unique clientTurnId
+            if (minAcceptedBlockIndex > 0 && block.index < minAcceptedBlockIndex) {
+                return Result.failure(
+                    SecurityException("FIREWALL BLOCKED: Stale sequence replay — Block #${block.index} < minimum expected #$minAcceptedBlockIndex.")
+                )
+            }
+            val effectiveTurnId = block.clientTurnId.ifBlank { outerClientTurnId }
+            if (effectiveTurnId.isNotBlank() && effectiveTurnId in seenClientTurnIds) {
+                return Result.failure(
+                    SecurityException("FIREWALL BLOCKED: Replay detected — clientTurnId '$effectiveTurnId' already committed.")
+                )
+            }
+
+            // Firewall Rule 5b (SUPPLEMENTARY Replay Protection): Rolling Hash Ring Buffer & Ledger
+            if (block.blockHash in seenReplayHashes || existingLedger.any { it.blockHash == block.blockHash }) {
                 return Result.failure(SecurityException("FIREWALL BLOCKED: Replay detected — Block #${block.index} already committed."))
             }
 
@@ -1085,22 +1627,34 @@ object CoupleTurnCodec {
             val ctB64 = outer.optString("ct", "")
             val sigHex = outer.optString("sig", "")
 
-            val decryptedResult = if (packetVersion >= 3) {
+            val decryptedResult = if (packetVersion >= PROTOCOL_VERSION_ECDH_V3) {
                 if (ecdhSharedSecretB64.isBlank()) {
                     return Result.failure(
                         SecurityException("FIREWALL BLOCKED: Zero-knowledge ECDH shared secret required to decrypt v3 packet.")
                     )
                 }
-                CoupleCryptoEngine.decryptPayload(
-                    ivBase64 = ivB64,
-                    cipherBase64 = ctB64,
-                    expectedHmacHex = sigHex,
-                    coupleCode = cleanCode,
-                    aad = "$cleanCode|${block.blockHash}|${block.actionType}|v$packetVersion",
-                    ecdhSharedSecretB64 = ecdhSharedSecretB64
-                )
+                if (effectiveTurnId.isNotBlank()) {
+                    CoupleCryptoEngine.decryptPayload(
+                        ivBase64 = ivB64,
+                        cipherBase64 = ctB64,
+                        expectedHmacHex = sigHex,
+                        coupleCode = cleanCode,
+                        aad = "$cleanCode|${block.blockHash}|${block.previousHash}|${block.index}|${block.actionType}|v$packetVersion|$effectiveTurnId",
+                        ecdhSharedSecretB64 = ecdhSharedSecretB64
+                    )
+                } else {
+                    // Backward compatibility with existing pre-patch v3 blocks lacking clientTurnId
+                    CoupleCryptoEngine.decryptPayload(
+                        ivBase64 = ivB64,
+                        cipherBase64 = ctB64,
+                        expectedHmacHex = sigHex,
+                        coupleCode = cleanCode,
+                        aad = "$cleanCode|${block.blockHash}|${block.actionType}|v$packetVersion",
+                        ecdhSharedSecretB64 = ecdhSharedSecretB64
+                    )
+                }
             } else {
-                // Backward-compatible v2 decryption (try v2-tagged AAD first, then legacy untagged AAD)
+                // Only reachable when effectiveMinProtocol < 3 (e.g., Pass & Play / pre-ECDH room)
                 val v2Tagged = CoupleCryptoEngine.decryptPayload(
                     ivBase64 = ivB64,
                     cipherBase64 = ctB64,

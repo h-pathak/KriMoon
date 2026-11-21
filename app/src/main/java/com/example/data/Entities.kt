@@ -159,6 +159,36 @@ data class CoupleRoomRecord(
     val ecdhPublicKeyB64: String = "",
     val ecdhPrivateKeyB64: String = "",
     val peerPublicKeyB64: String = "",
-    val ecdhSharedSecretB64: String = ""
+    val ecdhSharedSecretB64: String = "",
+    val chainSchemaVersion: Int = 2,
+    val minProtocolVersion: Int = 2,
+    val migrationAnchorHash: String = "",
+    val migrationAnchorIndex: Int = 0,
+    val prunedBlockCount: Int = 0,
+    val prunedAnchorHash: String = "",
+    val lastConfirmedCloudIndex: Int = 0,
+    val seenClientTurnIdsJson: String = "[]",
+    val seenReplayHashesJson: String = "[]"
 )
+
+@Entity(
+    tableName = "pending_couple_turns",
+    indices = [
+        Index(value = ["clientTurnId"], unique = true),
+        Index(value = ["coupleCode", "createdAt"])
+    ]
+)
+data class PendingCoupleTurn(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val clientTurnId: String,
+    val coupleCode: String,
+    val actionType: String,
+    val encryptedIntentJson: String,
+    val retryCount: Int = 0,
+    val status: String = "PENDING", // "PENDING", "SYNCING", "FAILED_PERMANENT"
+    val lastError: String = "",
+    val createdAt: Long = System.currentTimeMillis(),
+    val updatedAt: Long = System.currentTimeMillis()
+)
+
 

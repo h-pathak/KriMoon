@@ -2,8 +2,10 @@ package com.example.cloud
 
 import android.content.Context
 import com.example.R
+import com.example.model.CoupleActivityIntent
 import com.example.model.CoupleBlock
 import com.example.model.CoupleBlockchain
+import com.example.model.CoupleEcdhEngine
 import com.example.model.CoupleTurnCodec
 import com.example.model.SpiceLevel
 import com.example.security.BackendSecurityFirewall
@@ -47,11 +49,13 @@ class CoupleCloudRepository(
 
     private fun roomsCollection() = db.collection("coupleRooms")
 
+    private fun invitesCollection() = db.collection("coupleInvites")
+
     private fun blocksCollection(coupleCode: String) =
         roomsCollection().document(coupleCode).collection("blocks")
 
     /**
-     * Real-time stream of all bonded rooms for the authenticated user.
+     * Real-time stream of all active bonded rooms for the authenticated user.
      * Matches firestore.rules allow list via .whereArrayContains("memberUids", uid).
      */
     fun observeUserRooms(userId: String): Flow<List<CoupleCloudRoom>> = flow {
@@ -68,7 +72,7 @@ class CoupleCloudRepository(
                     snapshot.toObjects(
                         CoupleCloudRoom::class.java,
                         DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
-                    ).filter { it.status != "UNPAIRED" }
+                    ).filter { it.status != "UNPAIRED" && !it.tombstoned }
                 }
                 .catch { error ->
                     val firestoreError = generateSequence(error) { it.cause }
@@ -85,7 +89,7 @@ class CoupleCloudRepository(
     }
 
     /**
-     * Real-time stream of a single room document (works for bonded members AND pending join requesters).
+     * Real-time stream of a single room document (strictly for bonded members OR active pending partner).
      */
     fun observeRoom(coupleCode: String, userId: String): Flow<CoupleCloudRoom?> = flow {
         val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
@@ -142,9 +146,9 @@ class CoupleCloudRepository(
                         CoupleEncryptedBlock::class.java,
                         DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
                     ).sortedWith(
-                        compareBy<CoupleEncryptedBlock> { it.createdAt?.seconds ?: 0L }
+                        compareBy<CoupleEncryptedBlock> { it.blockIndex }
+                            .thenBy { it.createdAt?.seconds ?: 0L }
                             .thenBy { it.createdAt?.nanoseconds ?: 0 }
-                            .thenBy { it.blockIndex }
                     )
                 }
                 .catch { error ->
@@ -162,8 +166,34 @@ class CoupleCloudRepository(
     }
 
     /**
-     * Atomically reserves a globally unique, never-before-used 6-digit room code via Firestore transaction.
-     * Because rooms can never be deleted, once reserved here, NO other couple can ever claim this code.
+     * Looks up minimal non-sensitive invite metadata in /coupleInvites/{coupleCode}.
+     * Never exposes creator UID, public keys, or chain hashes.
+     */
+    suspend fun lookupCoupleInvite(coupleCode: String): Result<CoupleCloudInvite?> {
+        val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
+        val path = "coupleInvites/$cleanCode"
+        return try {
+            requireUserId()
+            require(cleanCode.length == 6) { "Room code must be 6 digits." }
+            val snap = invitesCollection().document(cleanCode).get().await()
+            val invite = if (snap.exists()) {
+                snap.toObject(CoupleCloudInvite::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+            } else {
+                null
+            }
+            Result.success(invite)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.GET, path)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Atomically reserves a globally unique, never-before-used 6-digit V2 room code via Firestore transaction,
+     * anchoring latestBlockHash to the deterministic V2 Genesis Block #0 hash and publishing the minimal
+     * /coupleInvites/{code} lookup record in the exact same transaction.
      */
     suspend fun createUniqueCloudRoom(
         myName: String,
@@ -177,6 +207,9 @@ class CoupleCloudRepository(
             val cleanName = BackendSecurityFirewall.sanitizeField(myName, maxLength = 32).ifBlank { "Host" }
             val safeSpice = if (spiceLevel.name in setOf("SWEET", "FLIRTY", "BOLD")) spiceLevel.name else "FLIRTY"
             val safePubKey = creatorPublicKey.trim().take(256)
+            require(CoupleEcdhEngine.isValidPublicKeyB64(safePubKey)) {
+                "Valid NIST P-256 public key is required to create a zero-knowledge room."
+            }
             val explicitCode = preferredCode?.let { CoupleTurnCodec.normalizeCode(it) }?.takeIf { it.length == 6 }
 
             val attempts = if (explicitCode != null) 1 else 10
@@ -185,41 +218,58 @@ class CoupleCloudRepository(
             repeat(attempts) {
                 val candidate = explicitCode ?: CoupleTurnCodec.generateUniqueCode(triedCodes)
                 triedCodes.add(candidate)
-                val docRef = roomsCollection().document(candidate)
-                val genesisHash = CoupleBlockchain.genesisHash(candidate).take(128)
+                val roomRef = roomsCollection().document(candidate)
+                val inviteRef = invitesCollection().document(candidate)
+                val deterministicGenesis = CoupleBlockchain.createDeterministicGenesisBlock(candidate)
+                val genesisBlockHash = deterministicGenesis.blockHash.take(128)
+                val hostHint = cleanName.take(12)
 
                 val claimed: Boolean = try {
                     db.runTransaction { tx ->
-                        val snap = tx.get(docRef)
-                        if (snap.exists()) {
-                            false
-                        } else {
-                            val payload = mapOf(
-                                "coupleCode" to candidate,
-                                "creatorUid" to uid,
-                                "creatorName" to cleanName,
-                                "creatorPublicKey" to safePubKey,
-                                "partnerUid" to "",
-                                "partnerName" to "",
-                                "partnerPublicKey" to "",
-                                "pendingPartnerUid" to "",
-                                "pendingPartnerName" to "",
-                                "pendingPartnerPublicKey" to "",
-                                "memberUids" to listOf(uid),
-                                "spiceLevel" to safeSpice,
-                                "status" to "WAITING",
-                                "blockCount" to 1L,
-                                "latestBlockHash" to genesisHash,
-                                "createdAt" to FieldValue.serverTimestamp(),
-                                "updatedAt" to FieldValue.serverTimestamp()
-                            )
-                            tx.set(docRef, payload)
-                            true
+                        val inviteSnap = tx.get(inviteRef)
+                        if (inviteSnap.exists()) {
+                            return@runTransaction false
                         }
+                        val roomSnap = tx.get(roomRef)
+                        if (roomSnap.exists()) {
+                            return@runTransaction false
+                        }
+                        val roomPayload = mapOf(
+                            "coupleCode" to candidate,
+                            "creatorUid" to uid,
+                            "creatorName" to cleanName,
+                            "creatorPublicKey" to safePubKey,
+                            "partnerUid" to "",
+                            "partnerName" to "",
+                            "partnerPublicKey" to "",
+                            "pendingPartnerUid" to "",
+                            "pendingPartnerName" to "",
+                            "pendingPartnerPublicKey" to "",
+                            "memberUids" to listOf(uid),
+                            "spiceLevel" to safeSpice,
+                            "status" to "WAITING",
+                            "blockCount" to 1L,
+                            "latestBlockHash" to genesisBlockHash,
+                            "schemaVersion" to CoupleBlockchain.SCHEMA_VERSION_V2,
+                            "migrationAnchorHash" to "",
+                            "migrationAnchorIndex" to 0L,
+                            "tombstoned" to false,
+                            "createdAt" to FieldValue.serverTimestamp(),
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                        val invitePayload = mapOf(
+                            "coupleCode" to candidate,
+                            "status" to "WAITING",
+                            "hostDisplayHint" to hostHint,
+                            "schemaVersion" to CoupleBlockchain.SCHEMA_VERSION_V2,
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                        tx.set(roomRef, roomPayload)
+                        tx.set(inviteRef, invitePayload)
+                        true
                     }.await()
                 } catch (e: FirebaseFirestoreException) {
                     if (e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
-                        // Existing room owned by another couple rejects read/write -> treat as already taken
                         false
                     } else {
                         throw e
@@ -243,7 +293,11 @@ class CoupleCloudRepository(
                         spiceLevel = safeSpice,
                         status = "WAITING",
                         blockCount = 1L,
-                        latestBlockHash = genesisHash
+                        latestBlockHash = genesisBlockHash,
+                        schemaVersion = CoupleBlockchain.SCHEMA_VERSION_V2,
+                        migrationAnchorHash = "",
+                        migrationAnchorIndex = 0L,
+                        tombstoned = false
                     )
                     return Result.success(
                         CloudJoinResult(
@@ -272,8 +326,9 @@ class CoupleCloudRepository(
     }
 
     /**
-     * Submits a join request to an existing Host's room code.
-     * The joining partner enters PENDING_APPROVAL until the Host explicitly taps Allow.
+     * Submits a join request to an existing Host's room code using minimal /coupleInvites lookup
+     * and an atomic blind WriteBatch (never requiring stranger read access on /coupleRooms/{code}).
+     * Strictly rejects self-joining with the same Firebase Auth account.
      */
     suspend fun requestToJoinCloudRoom(
         coupleCode: String,
@@ -292,96 +347,81 @@ class CoupleCloudRepository(
             require(cleanCode.length == 6) { "Room code must be 6 digits." }
             val cleanName = BackendSecurityFirewall.sanitizeField(myName, maxLength = 32).ifBlank { "Partner" }
             val safePubKey = partnerPublicKey.trim().take(256)
-            val docRef = roomsCollection().document(cleanCode)
+            require(CoupleEcdhEngine.isValidPublicKeyB64(safePubKey)) {
+                "Valid NIST P-256 public key is required to request entry."
+            }
 
-            val existingSnap = try {
-                docRef.get().await()
+            val roomRef = roomsCollection().document(cleanCode)
+            val inviteRef = invitesCollection().document(cleanCode)
+
+            // 1. Check if caller is ALREADY a bonded member or active pending partner (allowed under strict rules)
+            val myExistingRoom: CoupleCloudRoom? = try {
+                val snap = roomRef.get().await()
+                if (snap.exists()) {
+                    snap.toObject(CoupleCloudRoom::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+                } else null
             } catch (e: FirebaseFirestoreException) {
-                if (e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                if (e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) null else throw e
+            }
+
+            if (myExistingRoom != null) {
+                if (myExistingRoom.status == "UNPAIRED" || myExistingRoom.tombstoned) {
                     return Result.failure(
-                        SecurityException("Room #$cleanCode is private and already locked to another couple.")
+                        IllegalStateException("Room #$cleanCode has permanently ended and cannot be reused.")
                     )
                 }
-                throw e
-            }
-
-            if (!existingSnap.exists()) {
-                return Result.failure(
-                    IllegalStateException("Room #$cleanCode doesn't exist yet. Ask your partner to create the room first.")
-                )
-            }
-
-            val existing = existingSnap.toObject(
-                CoupleCloudRoom::class.java,
-                DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
-            ) ?: return Result.failure(IllegalStateException("Unable to read room data."))
-
-            if (existing.status == "UNPAIRED") {
-                return Result.failure(
-                    IllegalStateException("Room #$cleanCode has permanently ended and cannot be reused.")
-                )
-            }
-
-            // Already awaiting approval by this user
-            if (existing.status == "PENDING_APPROVAL" && existing.pendingPartnerUid == uid) {
-                return Result.success(
-                    CloudJoinResult(
-                        room = existing,
-                        createdNew = false,
-                        isPendingHostApproval = true,
-                        justJoinedAsPartner = false
-                    )
-                )
-            }
-
-            // Already a bonded member
-            if (uid in existing.memberUids) {
-                // Same-account 2nd phone testing: if status is WAITING and name differs, submit pending request so Host can approve
-                if (existing.creatorUid == uid &&
-                    existing.status == "WAITING" &&
-                    existing.memberUids.size == 1 &&
-                    !existing.creatorName.equals(cleanName, ignoreCase = true)
-                ) {
-                    docRef.update(
-                        mapOf(
-                            "pendingPartnerUid" to uid,
-                            "pendingPartnerName" to cleanName,
-                            "pendingPartnerPublicKey" to safePubKey,
-                            "status" to "PENDING_APPROVAL",
-                            "updatedAt" to FieldValue.serverTimestamp()
-                        )
-                    ).await()
+                if (myExistingRoom.status == "PENDING_APPROVAL" && myExistingRoom.pendingPartnerUid == uid) {
                     return Result.success(
                         CloudJoinResult(
-                            room = existing.copy(
-                                pendingPartnerUid = uid,
-                                pendingPartnerName = cleanName,
-                                pendingPartnerPublicKey = safePubKey,
-                                status = "PENDING_APPROVAL"
-                            ),
+                            room = myExistingRoom,
                             createdNew = false,
                             isPendingHostApproval = true,
                             justJoinedAsPartner = false
                         )
                     )
                 }
-                return Result.success(
-                    CloudJoinResult(
-                        room = existing,
-                        createdNew = false,
-                        isPendingHostApproval = false,
-                        justJoinedAsPartner = false
+                if (uid in myExistingRoom.memberUids) {
+                    if (myExistingRoom.creatorUid == uid && myExistingRoom.status == "WAITING") {
+                        return Result.failure(
+                            SecurityException("You created Room #$cleanCode with this Google account. Sign in with your partner's separate Google account on their phone to join.")
+                        )
+                    }
+                    return Result.success(
+                        CloudJoinResult(
+                            room = myExistingRoom,
+                            createdNew = false,
+                            isPendingHostApproval = false,
+                            justJoinedAsPartner = false
+                        )
                     )
-                )
+                }
             }
 
-            // Open WAITING room -> submit join request with Partner's ECDH public key for Host confirmation
-            if (existing.status == "WAITING" &&
-                existing.memberUids.size == 1 &&
-                existing.partnerUid.isBlank() &&
-                existing.pendingPartnerUid.isBlank()
-            ) {
-                docRef.update(
+            // 2. Query minimal /coupleInvites/{code} index (non-sensitive availability check)
+            val inviteSnap = inviteRef.get().await()
+            val invite = if (inviteSnap.exists()) {
+                inviteSnap.toObject(CoupleCloudInvite::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+            } else null
+
+            if (invite != null) {
+                when (invite.status) {
+                    "RETIRED" -> return Result.failure(
+                        IllegalStateException("Room #$cleanCode has permanently ended and cannot be reused.")
+                    )
+                    "LOCKED" -> return Result.failure(
+                        SecurityException("Room #$cleanCode is private and already locked to 2 partners.")
+                    )
+                    "PENDING" -> return Result.failure(
+                        SecurityException("Room #$cleanCode already has a pending request awaiting the Host.")
+                    )
+                }
+            }
+
+            // 3. Submit blind atomic join request (does not read stranger's /coupleRooms doc)
+            try {
+                val batch = db.batch()
+                batch.update(
+                    roomRef,
                     mapOf(
                         "pendingPartnerUid" to uid,
                         "pendingPartnerName" to cleanName,
@@ -389,30 +429,50 @@ class CoupleCloudRepository(
                         "status" to "PENDING_APPROVAL",
                         "updatedAt" to FieldValue.serverTimestamp()
                     )
-                ).await()
-                val pendingRoom = existing.copy(
-                    pendingPartnerUid = uid,
-                    pendingPartnerName = cleanName,
-                    pendingPartnerPublicKey = safePubKey,
-                    status = "PENDING_APPROVAL"
                 )
-                return Result.success(
-                    CloudJoinResult(
-                        room = pendingRoom,
-                        createdNew = false,
-                        isPendingHostApproval = true,
-                        justJoinedAsPartner = false
+                if (invite != null) {
+                    batch.update(
+                        inviteRef,
+                        mapOf(
+                            "status" to "PENDING",
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
                     )
-                )
+                }
+                batch.commit().await()
+            } catch (e: FirebaseFirestoreException) {
+                return when (e.code) {
+                    FirebaseFirestoreException.Code.NOT_FOUND -> Result.failure(
+                        IllegalStateException("Room #$cleanCode doesn't exist yet. Ask your partner to create the room first.")
+                    )
+                    FirebaseFirestoreException.Code.PERMISSION_DENIED -> Result.failure(
+                        SecurityException("Room #$cleanCode is private, already pending, or belongs to your own account.")
+                    )
+                    else -> Result.failure(e)
+                }
             }
 
-            if (existing.status == "PENDING_APPROVAL") {
-                return Result.failure(
-                    SecurityException("Room #$cleanCode already has a pending request awaiting the Host.")
+            // 4. Now that caller IS pendingPartnerUid, strict allow get permits reading the room state
+            val joinedSnap = roomRef.get().await()
+            val pendingRoom = joinedSnap.toObject(
+                CoupleCloudRoom::class.java,
+                DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+            ) ?: CoupleCloudRoom(
+                id = cleanCode,
+                coupleCode = cleanCode,
+                pendingPartnerUid = uid,
+                pendingPartnerName = cleanName,
+                pendingPartnerPublicKey = safePubKey,
+                status = "PENDING_APPROVAL"
+            )
+            Result.success(
+                CloudJoinResult(
+                    room = pendingRoom,
+                    createdNew = false,
+                    isPendingHostApproval = true,
+                    justJoinedAsPartner = false
                 )
-            }
-
-            Result.failure(SecurityException("Room #$cleanCode is private and permanently locked to 2 partners."))
+            )
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -422,8 +482,8 @@ class CoupleCloudRepository(
     }
 
     /**
-     * Host-only secondary confirmation: allows the pending partner into the room,
-     * locking memberUids to the couple and transitioning status to CONNECTED.
+     * Host-only secondary confirmation: atomically promotes pending partner into bonded memberUids,
+     * transitions room to CONNECTED, and locks /coupleInvites/{code} to LOCKED.
      */
     suspend fun approvePendingPartner(coupleCode: String): Result<CoupleCloudRoom> {
         val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
@@ -431,11 +491,13 @@ class CoupleCloudRepository(
         return try {
             val uid = requireUserId()
             require(cleanCode.length == 6) { "Invalid room code." }
-            val docRef = roomsCollection().document(cleanCode)
+            val roomRef = roomsCollection().document(cleanCode)
+            val inviteRef = invitesCollection().document(cleanCode)
 
             val approvedRoom = db.runTransaction { tx ->
-                val snap = tx.get(docRef)
-                val existing = snap.toObject(
+                val roomSnap = tx.get(roomRef)
+                val inviteSnap = tx.get(inviteRef)
+                val existing = roomSnap.toObject(
                     CoupleCloudRoom::class.java,
                     DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
                 ) ?: throw IllegalStateException("Room not found.")
@@ -446,19 +508,16 @@ class CoupleCloudRepository(
                 if (existing.status != "PENDING_APPROVAL" || existing.pendingPartnerUid.isBlank()) {
                     throw IllegalStateException("No pending partner request to approve.")
                 }
-
-                val isSameAccountTest = existing.pendingPartnerUid == existing.creatorUid
-                val finalPartnerUid = if (isSameAccountTest) "" else existing.pendingPartnerUid
-                val finalMembers = if (isSameAccountTest) {
-                    existing.memberUids
-                } else {
-                    listOf(existing.creatorUid, existing.pendingPartnerUid)
+                if (existing.pendingPartnerUid == existing.creatorUid) {
+                    throw SecurityException("Self-approval with the same account is prohibited.")
                 }
 
+                val finalMembers = listOf(existing.creatorUid, existing.pendingPartnerUid)
+
                 tx.update(
-                    docRef,
+                    roomRef,
                     mapOf(
-                        "partnerUid" to finalPartnerUid,
+                        "partnerUid" to existing.pendingPartnerUid,
                         "partnerName" to existing.pendingPartnerName,
                         "partnerPublicKey" to existing.pendingPartnerPublicKey,
                         "memberUids" to finalMembers,
@@ -469,9 +528,18 @@ class CoupleCloudRepository(
                         "updatedAt" to FieldValue.serverTimestamp()
                     )
                 )
+                if (inviteSnap.exists()) {
+                    tx.update(
+                        inviteRef,
+                        mapOf(
+                            "status" to "LOCKED",
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                    )
+                }
 
                 existing.copy(
-                    partnerUid = finalPartnerUid,
+                    partnerUid = existing.pendingPartnerUid,
                     partnerName = existing.pendingPartnerName,
                     partnerPublicKey = existing.pendingPartnerPublicKey,
                     memberUids = finalMembers,
@@ -492,8 +560,8 @@ class CoupleCloudRepository(
     }
 
     /**
-     * Host declines a join request OR the waiting partner cancels their own request,
-     * returning the room cleanly to WAITING.
+     * Host declines a join request OR waiting partner cancels their own request,
+     * atomically returning both /coupleRooms/{code} and /coupleInvites/{code} to WAITING.
      */
     suspend fun declineOrCancelPendingPartner(coupleCode: String): Result<Unit> {
         val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
@@ -501,15 +569,31 @@ class CoupleCloudRepository(
         return try {
             requireUserId()
             require(cleanCode.length == 6) { "Invalid room code." }
-            roomsCollection().document(cleanCode).update(
-                mapOf(
-                    "pendingPartnerUid" to "",
-                    "pendingPartnerName" to "",
-                    "pendingPartnerPublicKey" to "",
-                    "status" to "WAITING",
-                    "updatedAt" to FieldValue.serverTimestamp()
+            val roomRef = roomsCollection().document(cleanCode)
+            val inviteRef = invitesCollection().document(cleanCode)
+
+            db.runTransaction { tx ->
+                val inviteSnap = tx.get(inviteRef)
+                tx.update(
+                    roomRef,
+                    mapOf(
+                        "pendingPartnerUid" to "",
+                        "pendingPartnerName" to "",
+                        "pendingPartnerPublicKey" to "",
+                        "status" to "WAITING",
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
                 )
-            ).await()
+                if (inviteSnap.exists()) {
+                    tx.update(
+                        inviteRef,
+                        mapOf(
+                            "status" to "WAITING",
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                    )
+                }
+            }.await()
             Result.success(Unit)
         } catch (e: CancellationException) {
             throw e
@@ -520,14 +604,61 @@ class CoupleCloudRepository(
     }
 
     /**
-     * Publishes an AES-256-GCM + PoW Blockchain encrypted packet live to the bonded partner.
+     * Fetches the authoritative cloud room head for rebase/sync operations.
      */
-    suspend fun publishEncryptedBlock(
+    suspend fun fetchRoomOnce(coupleCode: String): Result<CoupleCloudRoom?> {
+        val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
+        val path = "coupleRooms/$cleanCode"
+        return try {
+            requireUserId()
+            require(cleanCode.length == 6) { "Invalid couple code." }
+            val snap = roomsCollection().document(cleanCode).get().await()
+            val room = if (snap.exists()) {
+                snap.toObject(CoupleCloudRoom::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+            } else null
+            Result.success(room)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.GET, path)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Checks if a block with [clientTurnId] has already been committed to Firestore (idempotency guard
+     * for crash recovery where a prior commit succeeded just before the device lost power/network).
+     */
+    suspend fun findBlockByClientTurnId(coupleCode: String, clientTurnId: String): CoupleEncryptedBlock? {
+        val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
+        val uid = auth.currentUser?.uid ?: return null
+        if (cleanCode.length != 6 || clientTurnId.isBlank()) return null
+        return runCatching {
+            val snap = blocksCollection(cleanCode)
+                .whereArrayContains("memberUids", uid)
+                .get()
+                .await()
+            snap.toObjects(CoupleEncryptedBlock::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+                .firstOrNull { it.clientTurnId == clientTurnId }
+        }.getOrNull()
+    }
+
+    /**
+     * Atomically publishes an encrypted V2 block AND advances the parent room head in ONE Firestore
+     * transaction, validated bidirectionally by firestore.rules (`get()`, `getAfter()`, `existsAfter()`).
+     *
+     * - If the cloud room head has advanced concurrently, returns [BlockPublishOutcome.HeadConflict]
+     *   so the caller can rebase the intent onto the new head with a brand-new 96-bit AES-GCM nonce.
+     * - If a legacy V1 room is encountered (`schemaVersion == 1`), atomically records
+     *   `migrationAnchorHash = roomBefore.latestBlockHash` and `migrationAnchorIndex = roomBefore.blockCount`
+     *   without touching any immutable legacy V1 blocks.
+     */
+    suspend fun publishEncryptedBlockAtomic(
         coupleCode: String,
-        senderName: String,
+        intent: CoupleActivityIntent,
         block: CoupleBlock,
         encryptedPacket: String
-    ): Result<Unit> {
+    ): BlockPublishOutcome {
         val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
         val blockId = block.blockHash.replace(Regex("[^a-zA-Z0-9_\\-]"), "").take(128)
         val path = "coupleRooms/$cleanCode/blocks/$blockId"
@@ -537,54 +668,108 @@ class CoupleCloudRepository(
             require(blockId.length >= 8) { "Invalid block hash." }
             require(encryptedPacket.startsWith("KRIMOON:BCHAIN:")) { "Packet must be encrypted." }
 
+            // Idempotency fast-path: verify this clientTurnId wasn't already committed prior to a crash/retry
+            val existingByTurnId = findBlockByClientTurnId(cleanCode, intent.clientTurnId)
+            if (existingByTurnId != null) {
+                return BlockPublishOutcome.AlreadyCommittedIdempotent(
+                    blockHash = existingByTurnId.blockHash,
+                    blockIndex = existingByTurnId.blockIndex
+                )
+            }
+
             val roomRef = roomsCollection().document(cleanCode)
-            val roomSnap = roomRef.get().await()
-            val cloudRoom = roomSnap.toObject(
-                CoupleCloudRoom::class.java,
-                DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
-            ) ?: return Result.failure(IllegalStateException("Couple room not found."))
-
-            if (cloudRoom.status == "UNPAIRED") {
-                return Result.failure(IllegalStateException("Couple room has been unpaired."))
-            }
-            if (uid !in cloudRoom.memberUids) {
-                return Result.failure(SecurityException("Not a bonded member of this room."))
-            }
-
-            val cleanSender = BackendSecurityFirewall.sanitizeField(senderName, maxLength = 32).ifBlank { "Partner" }
+            val blockRef = blocksCollection(cleanCode).document(blockId)
+            val cleanSender = BackendSecurityFirewall.sanitizeField(intent.senderName, maxLength = 32).ifBlank { "Partner" }
             val allowedActions = setOf(
                 "GENESIS_BOND", "HANDSHAKE", "QUIZ", "WYR", "DOODLE", "TTT",
                 "DARE", "WAVELENGTH", "WHISPER", "UNPAIR"
             )
             val safeAction = if (block.actionType in allowedActions) block.actionType else "HANDSHAKE"
+            val cleanTurnId = intent.clientTurnId.replace(Regex("[^a-zA-Z0-9_\\-]"), "").take(64)
 
-            val blockPayload = mapOf(
-                "coupleCode" to cleanCode,
-                "senderUid" to uid,
-                "senderName" to cleanSender,
-                "memberUids" to cloudRoom.memberUids,
-                "blockIndex" to block.index.toLong().coerceIn(0L, 100000L),
-                "actionType" to safeAction,
-                "blockHash" to block.blockHash.take(128),
-                "encryptedPacket" to encryptedPacket.take(65536),
-                "createdAt" to FieldValue.serverTimestamp()
-            )
-            blocksCollection(cleanCode).document(blockId).set(blockPayload).await()
+            db.runTransaction { tx ->
+                val roomSnap = tx.get(roomRef)
+                val cloudRoom = roomSnap.toObject(
+                    CoupleCloudRoom::class.java,
+                    DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+                ) ?: return@runTransaction BlockPublishOutcome.Failed(IllegalStateException("Couple room not found."))
 
-            roomRef.update(
-                mapOf(
-                    "blockCount" to (cloudRoom.blockCount + 1L).coerceAtMost(100000L),
+                if (cloudRoom.status == "UNPAIRED" || cloudRoom.tombstoned) {
+                    return@runTransaction BlockPublishOutcome.RoomRetired
+                }
+                if (uid !in cloudRoom.memberUids) {
+                    return@runTransaction BlockPublishOutcome.Failed(SecurityException("Not a bonded member of this room."))
+                }
+
+                // Check idempotent block document existence first
+                val existingBlockSnap = tx.get(blockRef)
+                if (existingBlockSnap.exists()) {
+                    return@runTransaction BlockPublishOutcome.AlreadyCommittedIdempotent(
+                        blockHash = block.blockHash,
+                        blockIndex = block.index.toLong()
+                    )
+                }
+
+                // Detect concurrent head advancement -> return authoritative head so caller re-encrypts with fresh nonce
+                if (cloudRoom.blockCount != block.index.toLong() ||
+                    cloudRoom.latestBlockHash != block.previousHash
+                ) {
+                    return@runTransaction BlockPublishOutcome.HeadConflict(
+                        currentCloudBlockCount = cloudRoom.blockCount,
+                        currentCloudLatestHash = cloudRoom.latestBlockHash,
+                        currentSchemaVersion = cloudRoom.schemaVersion.coerceAtLeast(1),
+                        migrationAnchorHash = cloudRoom.migrationAnchorHash,
+                        migrationAnchorIndex = cloudRoom.migrationAnchorIndex.toInt()
+                    )
+                }
+
+                val isLazyV1Upgrade = cloudRoom.schemaVersion <= 1
+                val newCount = (cloudRoom.blockCount + 1L).coerceAtMost(100000L)
+                val anchorHash = if (isLazyV1Upgrade) cloudRoom.latestBlockHash else cloudRoom.migrationAnchorHash
+                val anchorIndex = if (isLazyV1Upgrade) cloudRoom.blockCount else cloudRoom.migrationAnchorIndex
+
+                val blockPayload = mapOf(
+                    "coupleCode" to cleanCode,
+                    "senderUid" to uid,
+                    "senderName" to cleanSender,
+                    "memberUids" to cloudRoom.memberUids,
+                    "blockIndex" to block.index.toLong().coerceIn(0L, 100000L),
+                    "actionType" to safeAction,
+                    "previousHash" to block.previousHash.take(128),
+                    "blockHash" to block.blockHash.take(128),
+                    "schemaVersion" to CoupleBlockchain.SCHEMA_VERSION_V2,
+                    "clientTurnId" to cleanTurnId,
+                    "encryptedPacket" to encryptedPacket.take(65536),
+                    "createdAt" to FieldValue.serverTimestamp()
+                )
+                tx.set(blockRef, blockPayload)
+
+                val roomUpdate = mutableMapOf<String, Any>(
+                    "blockCount" to newCount,
                     "latestBlockHash" to block.blockHash.take(128),
                     "updatedAt" to FieldValue.serverTimestamp()
                 )
-            ).await()
+                if (isLazyV1Upgrade) {
+                    roomUpdate["schemaVersion"] = CoupleBlockchain.SCHEMA_VERSION_V2
+                    roomUpdate["migrationAnchorHash"] = anchorHash
+                    roomUpdate["migrationAnchorIndex"] = anchorIndex
+                }
+                tx.update(roomRef, roomUpdate)
 
-            Result.success(Unit)
+                BlockPublishOutcome.Committed(
+                    block = block,
+                    encryptedPacket = encryptedPacket,
+                    newCloudBlockCount = newCount,
+                    newSchemaVersion = CoupleBlockchain.SCHEMA_VERSION_V2,
+                    migrationAnchorHash = anchorHash,
+                    migrationAnchorIndex = anchorIndex.toInt()
+                )
+            }.await()
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             handleFirestoreError(e, OperationType.CREATE, path)
-            Result.failure(e)
+            BlockPublishOutcome.Failed(e)
         }
     }
 
@@ -613,8 +798,8 @@ class CoupleCloudRepository(
     }
 
     /**
-     * Permanently retires the couple room in Firestore (terminal UNPAIRED state).
-     * Document is never deleted so no other couple can ever reuse this 6-digit code.
+     * Permanently retires the couple room in Firestore (terminal UNPAIRED state) and marks
+     * /coupleInvites/{code} as RETIRED atomically.
      */
     suspend fun unpairCloudRoom(coupleCode: String): Result<Unit> {
         val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
@@ -622,16 +807,94 @@ class CoupleCloudRepository(
         return try {
             requireUserId()
             require(cleanCode.length == 6) { "Invalid couple code." }
-            roomsCollection().document(cleanCode).update(
-                mapOf(
-                    "status" to "UNPAIRED",
-                    "pendingPartnerUid" to "",
-                    "pendingPartnerName" to "",
-                    "pendingPartnerPublicKey" to "",
-                    "updatedAt" to FieldValue.serverTimestamp()
+            val roomRef = roomsCollection().document(cleanCode)
+            val inviteRef = invitesCollection().document(cleanCode)
+            db.runTransaction { tx ->
+                val inviteSnap = tx.get(inviteRef)
+                tx.update(
+                    roomRef,
+                    mapOf(
+                        "status" to "UNPAIRED",
+                        "pendingPartnerUid" to "",
+                        "pendingPartnerName" to "",
+                        "pendingPartnerPublicKey" to "",
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
                 )
-            ).await()
+                if (inviteSnap.exists()) {
+                    tx.update(
+                        inviteRef,
+                        mapOf(
+                            "status" to "RETIRED",
+                            "hostDisplayHint" to "",
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                    )
+                }
+            }.await()
             Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.UPDATE, path)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Account-deletion tombstone: scrubs personal display names and public keys from every room
+     * where the authenticated user is a member, retaining only non-identifying code reservation fields.
+     * Note: Immutable append-only /blocks ciphertext subcollections cannot be deleted client-side,
+     * and become cryptographically unreadable once local ECDH private keys are erased.
+     */
+    suspend fun tombstoneAllUserRoomsForAccountDeletion(): Result<Int> {
+        val path = "coupleRooms"
+        return try {
+            val uid = requireUserId()
+            val roomsSnap = roomsCollection()
+                .whereArrayContains("memberUids", uid)
+                .get()
+                .await()
+            var tombstonedCount = 0
+            for (doc in roomsSnap.documents) {
+                val room = doc.toObject(CoupleCloudRoom::class.java) ?: continue
+                if (room.tombstoned) continue
+                val code = room.coupleCode.ifBlank { doc.id }
+                val roomRef = roomsCollection().document(code)
+                val inviteRef = invitesCollection().document(code)
+                runCatching {
+                    db.runTransaction { tx ->
+                        val inviteSnap = tx.get(inviteRef)
+                        tx.update(
+                            roomRef,
+                            mapOf(
+                                "status" to "UNPAIRED",
+                                "tombstoned" to true,
+                                "creatorName" to "",
+                                "partnerName" to "",
+                                "creatorPublicKey" to "",
+                                "partnerPublicKey" to "",
+                                "pendingPartnerUid" to "",
+                                "pendingPartnerName" to "",
+                                "pendingPartnerPublicKey" to "",
+                                "updatedAt" to FieldValue.serverTimestamp()
+                            )
+                        )
+                        if (inviteSnap.exists()) {
+                            tx.update(
+                                inviteRef,
+                                mapOf(
+                                    "status" to "RETIRED",
+                                    "hostDisplayHint" to "",
+                                    "updatedAt" to FieldValue.serverTimestamp()
+                                )
+                            )
+                        }
+                    }.await()
+                    tombstonedCount++
+                }
+            }
+            Result.success(tombstonedCount)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

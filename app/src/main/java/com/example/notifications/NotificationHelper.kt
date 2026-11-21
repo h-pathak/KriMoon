@@ -353,9 +353,9 @@ object NotificationHelper {
         when (type) {
             "medicine" -> {
                 val takeMedIntent = Intent(context, NotificationReceiver::class.java).apply {
+                    setPackage(context.packageName)
                     action = ACTION_TAKE_MEDICINE_QUICK
                     putExtra(EXTRA_MEDICINE_ID, -1L)
-                    putExtra(EXTRA_MEDICINE_NAME, medicineName)
                 }
                 val takeMedPending = PendingIntent.getBroadcast(
                     context,
@@ -387,6 +387,7 @@ object NotificationHelper {
             }
             "water" -> {
                 val addWaterIntent = Intent(context, NotificationReceiver::class.java).apply {
+                    setPackage(context.packageName)
                     action = ACTION_ADD_WATER_QUICK
                 }
                 val addWaterPending = PendingIntent.getBroadcast(
@@ -608,8 +609,34 @@ object NotificationHelper {
         }
     }
 
-    fun cancelAllReminders(context: Context) {
+    fun cancelMedicineAlarm(context: Context, medId: Long) {
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+        val intent = Intent(context, NotificationReceiver::class.java).apply {
+            setPackage(context.packageName)
+            action = ACTION_MEDICINE_REMINDER
+        }
+        val requestCode = (NOTIFICATION_ID_MEDICINE_BASE + medId).toInt()
+        val pendingIntent = PendingIntent.getBroadcast(
+            context,
+            requestCode,
+            intent,
+            PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
+        )
+        if (pendingIntent != null) {
+            alarmManager.cancel(pendingIntent)
+            pendingIntent.cancel()
+        }
+        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        notificationManager?.cancel(requestCode)
+    }
+
+    fun cancelAllReminders(
+        context: Context,
+        medicines: List<MedicineReminder> = emptyList(),
+        notes: List<UserNote> = emptyList(),
+        cancelPostedNotifications: Boolean = false
+    ) {
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager
         val actions = listOf(
             201 to ACTION_WATER_REMINDER,
             202 to ACTION_WATER_REMINDER,
@@ -618,19 +645,34 @@ object NotificationHelper {
             401 to ACTION_CHECKIN_REMINDER
         )
 
-        for ((code, action) in actions) {
-            val intent = Intent(context, NotificationReceiver::class.java).apply {
-                this.action = action
+        if (alarmManager != null) {
+            for ((code, action) in actions) {
+                val intent = Intent(context, NotificationReceiver::class.java).apply {
+                    setPackage(context.packageName)
+                    this.action = action
+                }
+                val pendingIntent = PendingIntent.getBroadcast(
+                    context,
+                    code,
+                    intent,
+                    PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
+                )
+                if (pendingIntent != null) {
+                    alarmManager.cancel(pendingIntent)
+                    pendingIntent.cancel()
+                }
             }
-            val pendingIntent = PendingIntent.getBroadcast(
-                context,
-                code,
-                intent,
-                PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
-            )
-            if (pendingIntent != null) {
-                alarmManager.cancel(pendingIntent)
-                pendingIntent.cancel()
+            for (med in medicines) {
+                cancelMedicineAlarm(context, med.id)
+            }
+            for (note in notes) {
+                cancelNoteReminder(context, note.id)
+            }
+        }
+
+        if (cancelPostedNotifications) {
+            runCatching {
+                NotificationManagerCompat.from(context).cancelAll()
             }
         }
     }

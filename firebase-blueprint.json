@@ -1,8 +1,38 @@
 {
   "entities": {
+    "CoupleCloudInvite": {
+      "title": "CoupleCloudInvite",
+      "description": "Minimal non-sensitive invite lookup record keyed by 6-digit coupleCode. Exposes only availability status, an optional short host hint, and schema version without leaking UIDs, public keys, full names, or chain hashes.",
+      "type": "object",
+      "properties": {
+        "coupleCode": {
+          "type": "string",
+          "description": "6-digit globally unique numeric room code matching the document ID."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["WAITING", "PENDING", "LOCKED", "RETIRED"],
+          "description": "Minimal invite availability state synchronized atomically with CoupleCloudRoom."
+        },
+        "hostDisplayHint": {
+          "type": "string",
+          "description": "Short non-identifying host hint (0-16 characters; scrubbed to empty string on tombstone)."
+        },
+        "schemaVersion": {
+          "type": "integer",
+          "description": "Independent Firestore schema version (1 or 2)."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of latest state transition."
+        }
+      },
+      "required": ["coupleCode", "status", "hostDisplayHint", "schemaVersion", "updatedAt"]
+    },
     "CoupleCloudRoom": {
       "title": "CoupleCloudRoom",
-      "description": "Real-time zero-knowledge E2EE bonded room connecting at most two authenticated partners via a permanently unique 6-digit couple code, Host secondary confirmation, and immutable ECDH P-256 public key exchange. Room documents are never deleted so a generated code can never be reused by another couple.",
+      "description": "Real-time zero-knowledge E2EE bonded room connecting at most two distinct authenticated partners via a permanently unique 6-digit couple code, Host secondary confirmation, atomic head advancement, V1->V2 migration anchor, and non-identifying tombstone retirement.",
       "type": "object",
       "properties": {
         "coupleCode": {
@@ -15,27 +45,27 @@
         },
         "creatorName": {
           "type": "string",
-          "description": "Display name of the room creator (1-32 characters, immutable after creation)."
+          "description": "Display name of the room creator (1-32 chars; scrubbed to empty string when tombstoned)."
         },
         "creatorPublicKey": {
           "type": "string",
-          "description": "Base64 X.509 SPKI ECDH P-256 public key of the Host partner (immutable once set; private key never leaves device)."
+          "description": "Base64 X.509 SPKI ECDH P-256 public key of the Host partner (immutable while active; scrubbed to empty string when tombstoned)."
         },
         "partnerUid": {
           "type": "string",
-          "description": "Firebase Auth UID of the approved joining partner (empty string until Host approves, immutable once set)."
+          "description": "Firebase Auth UID of the approved joining partner (must be distinct from creatorUid)."
         },
         "partnerName": {
           "type": "string",
-          "description": "Display name of the approved joining partner (0-32 characters, immutable once approved)."
+          "description": "Display name of the approved joining partner (0-32 chars; scrubbed to empty string when tombstoned)."
         },
         "partnerPublicKey": {
           "type": "string",
-          "description": "Base64 X.509 SPKI ECDH P-256 public key of the approved partner (promoted from pendingPartnerPublicKey on Host approval, immutable once set)."
+          "description": "Base64 X.509 SPKI ECDH P-256 public key of the approved partner (immutable while active; scrubbed to empty string when tombstoned)."
         },
         "pendingPartnerUid": {
           "type": "string",
-          "description": "Firebase Auth UID of a partner awaiting Host secondary confirmation (empty string when no request is pending)."
+          "description": "Firebase Auth UID of a partner awaiting Host secondary confirmation (must differ from creatorUid)."
         },
         "pendingPartnerName": {
           "type": "string",
@@ -47,7 +77,7 @@
         },
         "memberUids": {
           "type": "array",
-          "description": "Bounded list of 1 to 2 Firebase Auth UIDs belonging to the bonded couple."
+          "description": "Bounded list of 1 to 2 distinct Firebase Auth UIDs belonging to the bonded couple."
         },
         "spiceLevel": {
           "type": "string",
@@ -57,25 +87,41 @@
         "status": {
           "type": "string",
           "enum": ["WAITING", "PENDING_APPROVAL", "CONNECTED", "UNPAIRED"],
-          "description": "Room lifecycle state; WAITING accepts a join request -> PENDING_APPROVAL awaits Host Allow/Decline -> CONNECTED unlocks zero-knowledge ECDH play; UNPAIRED permanently locks and retires the code."
+          "description": "Room lifecycle state; UNPAIRED permanently retires the code."
         },
         "blockCount": {
           "type": "integer",
-          "description": "Monotonically increasing total number of encrypted blockchain blocks committed to this room."
+          "description": "Monotonically increasing total number of blocks (advanced atomically by +1 with every /blocks create)."
         },
         "latestBlockHash": {
           "type": "string",
-          "description": "SHA-256 hash of the most recently mined encrypted block."
+          "description": "SHA-256 hash of the deterministic Genesis block or most recently committed block."
+        },
+        "schemaVersion": {
+          "type": "integer",
+          "description": "Independent Firestore room schema version (1 = legacy, 2 = atomic V2 with previousHash and clientTurnId)."
+        },
+        "migrationAnchorHash": {
+          "type": "string",
+          "description": "Last verified V1 room head hash recorded when a legacy V1 room lazily upgrades to V2 without rewriting legacy history."
+        },
+        "migrationAnchorIndex": {
+          "type": "integer",
+          "description": "Block index at which V2 continuity begins after a V1->V2 room upgrade."
+        },
+        "tombstoned": {
+          "type": "boolean",
+          "description": "True when personal names and public keys have been permanently scrubbed during account deletion while preserving code non-reuse."
         },
         "createdAt": {
           "type": "string",
           "format": "date-time",
-          "description": "Server timestamp set via FieldValue.serverTimestamp() on room creation (immutable)."
+          "description": "Server timestamp set on room creation (immutable)."
         },
         "updatedAt": {
           "type": "string",
           "format": "date-time",
-          "description": "Server timestamp set via FieldValue.serverTimestamp() on every room update."
+          "description": "Server timestamp set on every room update."
         }
       },
       "required": [
@@ -100,7 +146,7 @@
     },
     "CoupleEncryptedBlock": {
       "title": "CoupleEncryptedBlock",
-      "description": "Immutable, append-only, non-deletable ECDH-P256 + HKDF-SHA256 + AES-256-GCM + Proof-of-Work blockchain packet carrying an encrypted couple game move, activity turn, or handshake between two bonded phones.",
+      "description": "Immutable, append-only, non-deletable ECDH-P256 + HKDF-SHA256 + AES-256-GCM + Proof-of-Work blockchain packet committed atomically with room head advancement.",
       "type": "object",
       "properties": {
         "coupleCode": {
@@ -121,16 +167,28 @@
         },
         "blockIndex": {
           "type": "integer",
-          "description": "Monotonic index of this block in the couple blockchain ledger."
+          "description": "Strict sequential index matching pre-transaction room.blockCount."
         },
         "actionType": {
           "type": "string",
           "enum": ["GENESIS_BOND", "HANDSHAKE", "QUIZ", "WYR", "DOODLE", "TTT", "DARE", "WAVELENGTH", "WHISPER", "UNPAIR"],
           "description": "Type of encrypted couple activity turn or lifecycle event."
         },
+        "previousHash": {
+          "type": "string",
+          "description": "SHA-256 hash of the pre-transaction room.latestBlockHash (required for schemaVersion 2)."
+        },
         "blockHash": {
           "type": "string",
-          "description": "Proof-of-Work SHA-256 block hash."
+          "description": "Proof-of-Work SHA-256 block hash matching document ID blockId."
+        },
+        "schemaVersion": {
+          "type": "integer",
+          "description": "Block schema version (1 or 2), independent of wire cryptographic protocolVersion."
+        },
+        "clientTurnId": {
+          "type": "string",
+          "description": "Client-generated unique turn UUID for idempotent delivery and primary replay protection."
         },
         "encryptedPacket": {
           "type": "string",
@@ -156,13 +214,17 @@
     }
   },
   "firestore": {
+    "/coupleInvites/{coupleCode}": {
+      "schema": { "$ref": "#/entities/CoupleCloudInvite" },
+      "description": "Minimal non-sensitive invite availability index keyed by 6-digit coupleCode."
+    },
     "/coupleRooms/{coupleCode}": {
       "schema": { "$ref": "#/entities/CoupleCloudRoom" },
-      "description": "Root collection of permanently unique 2-partner couple rooms with Host approval gating and immutable ECDH P-256 public key exchange, keyed by their 6-digit coupleCode."
+      "description": "Root collection of permanently unique 2-partner couple rooms keyed by 6-digit coupleCode; strictly member/pending-scoped."
     },
     "/coupleRooms/{coupleCode}/blocks/{blockId}": {
       "schema": { "$ref": "#/entities/CoupleEncryptedBlock" },
-      "description": "Immutable, non-deletable append-only stream of zero-knowledge encrypted blockchain move envelopes for a couple room."
+      "description": "Immutable, non-deletable append-only stream of zero-knowledge encrypted blockchain move envelopes keyed by blockHash."
     }
   }
 }

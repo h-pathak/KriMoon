@@ -403,12 +403,15 @@ class ExampleRobolectricTest {
         assertEquals(6, codeB.length)
         assertFalse("Generated codes should be unique", codeA == codeB)
 
+        val genesis = com.example.model.CoupleBlockchain.createGenesisBlock(codeA, "Krishi")
         val quizPacket = com.example.model.CoupleTurnCodec.encodeQuizTurn(
             coupleCode = codeA,
             senderName = "Krishi",
             roundIndex = 2,
             choiceIndex = 1,
-            spiceLevel = com.example.model.SpiceLevel.FLIRTY
+            spiceLevel = com.example.model.SpiceLevel.FLIRTY,
+            previousHash = genesis.blockHash,
+            blockIndex = 1
         )
         assertTrue("Packet must use Blockchain AES-256-GCM header", quizPacket.startsWith("KRIMOON:BCHAIN:"))
 
@@ -480,8 +483,7 @@ class ExampleRobolectricTest {
         assertEquals(3, tttDecoded.state.roundCount)
         assertEquals(quiz.block.blockHash, tttBlock.previousHash)
 
-        // Verify chain integrity across Genesis + Quiz Block + TicTacToe Block
-        val genesis = com.example.model.CoupleBlockchain.createGenesisBlock(codeA, "Krishi")
+        // Verify chain integrity across deterministic V2 Genesis + Quiz Block + TicTacToe Block
         val chainVerify = com.example.model.CoupleBlockchain.verifyChain(listOf(genesis, quiz.block, tttBlock), codeA)
         assertTrue("Full blockchain ledger must verify cleanly", chainVerify.isValid)
         assertEquals(3, chainVerify.verifiedBlockCount)
@@ -549,7 +551,7 @@ class ExampleRobolectricTest {
         val audit = firewall.runSecurityAudit()
         assertEquals(12, audit.totalFirewallLayers)
         assertEquals(12, audit.activeFirewallLayers)
-        assertTrue(audit.zeroBreachStatus.contains("ZERO BREACHES"))
+        assertTrue(audit.zeroBreachStatus.contains("12 SECURITY LAYERS ACTIVE"))
         assertEquals(12, audit.layers.size)
 
         // 2. Verify SQLi and XSS payload neutralization

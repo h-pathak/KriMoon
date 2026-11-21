@@ -15,6 +15,9 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarDuration
@@ -22,19 +25,24 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.cloud.authStateFlow
 import com.example.data.UserProfile
 import com.example.model.CycleStatus
 import com.example.notifications.NotificationHelper
+import com.example.security.VaultState
 import com.example.ui.components.LocalParticleController
 import com.example.ui.components.ParticleBurstOverlay
 import com.example.ui.components.ParticleController
@@ -122,6 +130,8 @@ fun PhasesApp(viewModel: PhasesViewModel) {
     val currentScreen by viewModel.currentScreen.collectAsStateWithLifecycle()
     val showSettingsSheet by viewModel.showSettingsSheet.collectAsStateWithLifecycle()
     val feedbackMessage by viewModel.feedbackMessage.collectAsStateWithLifecycle()
+    val vaultState by viewModel.vaultState.collectAsStateWithLifecycle()
+    val cloudAuthUid by viewModel.cloudAuthUid.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
     val particleController = remember { ParticleController() }
@@ -226,15 +236,101 @@ fun PhasesApp(viewModel: PhasesViewModel) {
                             },
                             onSendTestNotification = { type -> viewModel.sendTestNotification(type) },
                             onClearAllData = { viewModel.clearAllData() },
+                            isSignedIn = !cloudAuthUid.isNullOrBlank(),
+                            onDeleteAccount = { viewModel.deleteAccountAndEraseData() },
                             onDismiss = { viewModel.setShowSettings(false) }
                         )
                     }
                 }
             }
 
+            if (vaultState == VaultState.KEY_UNAVAILABLE || vaultState == VaultState.KEY_CORRUPTED) {
+                VaultRecoveryModal(
+                    vaultState = vaultState,
+                    onRetryUnlock = { viewModel.retryVaultUnlock() },
+                    onConfirmResetVault = { viewModel.confirmResetCorruptedVault() }
+                )
+            }
+
             ParticleBurstOverlay(controller = particleController)
         }
     }
+}
+
+@Composable
+private fun VaultRecoveryModal(
+    vaultState: VaultState,
+    onRetryUnlock: () -> Unit,
+    onConfirmResetVault: () -> Unit
+) {
+    var confirmResetStep by remember { mutableStateOf(false) }
+
+    val titleText = if (confirmResetStep) {
+        "Confirm Local Vault Reset?"
+    } else if (vaultState == VaultState.KEY_CORRUPTED) {
+        "Local Encryption Key Unavailable"
+    } else {
+        "Private Vault Locked"
+    }
+
+    val bodyText = if (confirmResetStep) {
+        "Resetting the local vault generates a brand-new Android Keystore key and permanently erases all unreadable local health logs, notes, reminders, and local couple room data on this device. This cannot be undone."
+    } else if (vaultState == VaultState.KEY_CORRUPTED) {
+        "Your device's Android Keystore key could not unwrap the local vault key (for example after a system restore or security reset). KriMoon has preserved your encrypted database untouched instead of overwriting it.\n\nYou can retry unlocking, or explicitly reset the local vault to start fresh."
+    } else {
+        "Android Keystore is temporarily unavailable. KriMoon has paused local writes to protect your encrypted records.\n\nEnsure your device is unlocked and tap Retry Unlock, or reset the local vault if the key was permanently lost."
+    }
+
+    AlertDialog(
+        onDismissRequest = { /* Fail-closed: require explicit user action */ },
+        properties = DialogProperties(
+            dismissOnBackPress = false,
+            dismissOnClickOutside = false
+        ),
+        title = { Text(titleText) },
+        text = { Text(bodyText) },
+        confirmButton = {
+            if (confirmResetStep) {
+                Button(
+                    onClick = {
+                        confirmResetStep = false
+                        onConfirmResetVault()
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    ),
+                    modifier = Modifier.testTag("vault_confirm_reset_btn")
+                ) {
+                    Text("Erase & Reset Vault")
+                }
+            } else {
+                Button(
+                    onClick = onRetryUnlock,
+                    modifier = Modifier.testTag("vault_retry_unlock_btn")
+                ) {
+                    Text("Retry Unlock")
+                }
+            }
+        },
+        dismissButton = {
+            if (confirmResetStep) {
+                TextButton(
+                    onClick = { confirmResetStep = false },
+                    modifier = Modifier.testTag("vault_cancel_reset_btn")
+                ) {
+                    Text("Go Back")
+                }
+            } else {
+                TextButton(
+                    onClick = { confirmResetStep = true },
+                    modifier = Modifier.testTag("vault_reset_btn")
+                ) {
+                    Text("Reset Local Vault", color = MaterialTheme.colorScheme.error)
+                }
+            }
+        }
+    )
 }
 
 @Composable
@@ -404,14 +500,16 @@ private fun PlayTabHost(
     val cloudAuthUid by viewModel.cloudAuthUid.collectAsStateWithLifecycle()
     val cloudSyncStatus by viewModel.cloudSyncStatus.collectAsStateWithLifecycle()
     val isCloudBusy by viewModel.isCloudBusy.collectAsStateWithLifecycle()
+    val pendingTurnCount by viewModel.activePendingTurnCount.collectAsStateWithLifecycle()
 
-    val loungeState = remember(coupleRooms, activeCoupleRoom, cloudAuthUid, cloudSyncStatus, isCloudBusy) {
+    val loungeState = remember(coupleRooms, activeCoupleRoom, cloudAuthUid, cloudSyncStatus, isCloudBusy, pendingTurnCount) {
         CoupleLoungeUiState(
             coupleRooms = coupleRooms,
             activeRoom = activeCoupleRoom,
             cloudAuthUid = cloudAuthUid,
             cloudSyncStatus = cloudSyncStatus,
-            isCloudBusy = isCloudBusy
+            isCloudBusy = isCloudBusy,
+            pendingTurnCount = pendingTurnCount
         )
     }
     val loungeActions = remember(viewModel) {

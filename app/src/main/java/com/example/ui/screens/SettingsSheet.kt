@@ -106,6 +106,8 @@ fun SettingsSheet(
     ) -> Unit,
     onSendTestNotification: (type: String) -> Unit = {},
     onClearAllData: () -> Unit,
+    isSignedIn: Boolean = false,
+    onDeleteAccount: () -> Unit = {},
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -139,6 +141,7 @@ fun SettingsSheet(
     var celebrationSoundsEnabled by remember { mutableStateOf(SoundHelper.isCelebrationSoundEnabled(context)) }
 
     var showClearConfirmDialog by remember { mutableStateOf(false) }
+    var showDeleteAccountDialog by remember { mutableStateOf(false) }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -631,7 +634,7 @@ fun SettingsSheet(
                             color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
-                            text = "Health logs stay on your device, and Couple Lounge stays privately encrypted between you two.",
+                            text = "Health logs are encrypted on-device with Android Keystore AES-256-GCM. Couple Lounge rooms sync end-to-end encrypted turns via ECDH P-256.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             lineHeight = 17.sp
@@ -689,6 +692,26 @@ fun SettingsSheet(
                 Text("Clear All Local Data")
             }
 
+            if (isSignedIn) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Button(
+                    onClick = { showDeleteAccountDialog = true },
+                    shape = RoundedCornerShape(16.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                        contentColor = MaterialTheme.colorScheme.onErrorContainer
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("delete_account_button")
+                ) {
+                    Icon(Icons.Default.DeleteForever, contentDescription = null)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Delete Account & Erase Cloud Rooms", fontWeight = FontWeight.SemiBold)
+                }
+            }
+
             Spacer(modifier = Modifier.height(28.dp))
         }
     }
@@ -696,20 +719,57 @@ fun SettingsSheet(
     if (showClearConfirmDialog) {
         AlertDialog(
             onDismissRequest = { showClearConfirmDialog = false },
-            title = { Text("Erase All Data?") },
-            text = { Text("This will permanently remove all period logs, notes, water counts, and restart the onboarding process. All scheduled reminders will be cancelled.") },
+            title = { Text("Erase All Local Data?") },
+            text = {
+                Text(
+                    "This permanently erases all local period logs, notes, water counts, medicine reminders, and rotates your local encryption key. All scheduled reminders and active notifications will be cancelled."
+                )
+            },
             confirmButton = {
                 TextButton(
                     onClick = {
                         onClearAllData()
                         showClearConfirmDialog = false
-                    }
+                    },
+                    modifier = Modifier.testTag("confirm_clear_data_button")
                 ) {
                     Text("Clear Everything", color = MaterialTheme.colorScheme.error)
                 }
             },
             dismissButton = {
                 TextButton(onClick = { showClearConfirmDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    if (showDeleteAccountDialog) {
+        AlertDialog(
+            onDismissRequest = { showDeleteAccountDialog = false },
+            title = { Text("Delete Account & Erase Data?") },
+            text = {
+                Text(
+                    "This will:\n" +
+                        "• Erase all local health records, notes, reminders, and encryption keys.\n" +
+                        "• Disconnect your Couple Lounge rooms and scrub your display names and public keys from Firestore.\n" +
+                        "• Delete your Firebase sign-in account (if recently signed in).\n\n" +
+                        "Retained non-identifying records: retired 6-digit room codes stay tombstoned so they can never be reused, and append-only encrypted turn ciphertext becomes unreadable once local keys are erased."
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showDeleteAccountDialog = false
+                        onDeleteAccount()
+                    },
+                    modifier = Modifier.testTag("confirm_delete_account_button")
+                ) {
+                    Text("Delete Permanently", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteAccountDialog = false }) {
                     Text("Cancel")
                 }
             }

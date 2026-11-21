@@ -107,7 +107,8 @@ data class CoupleLoungeUiState(
     val activeRoom: CoupleRoomRecord? = null,
     val cloudAuthUid: String? = null,
     val cloudSyncStatus: String = "SIGNED_OUT",
-    val isCloudBusy: Boolean = false
+    val isCloudBusy: Boolean = false,
+    val pendingTurnCount: Int = 0
 )
 
 @Immutable
@@ -274,6 +275,7 @@ fun CoupleGamesHub(
             isSignedIn = isSignedIn,
             cloudSyncStatus = loungeState.cloudSyncStatus,
             hasPendingHostApproval = hasPendingHostApproval,
+            pendingTurnCount = loungeState.pendingTurnCount,
             onRequireSignIn = { bypassAuthForLocalPlay = false },
             onRetryCloudSync = actions.onRetryCloudSync,
             onTogglePassAndPlay = actions.onTogglePassAndPlay,
@@ -332,6 +334,7 @@ private fun CoupleActiveRoomHeaderCard(
     isSignedIn: Boolean,
     cloudSyncStatus: String,
     hasPendingHostApproval: Boolean,
+    pendingTurnCount: Int = 0,
     onRequireSignIn: () -> Unit,
     onRetryCloudSync: () -> Unit,
     onTogglePassAndPlay: (Boolean) -> Unit,
@@ -377,6 +380,7 @@ private fun CoupleActiveRoomHeaderCard(
                     isOffline = isOffline,
                     isConnecting = isConnecting,
                     hasPendingHostApproval = hasPendingHostApproval,
+                    pendingTurnCount = pendingTurnCount,
                     onRequireSignIn = onRequireSignIn,
                     onRetryCloudSync = onRetryCloudSync,
                     onTogglePassAndPlay = { onTogglePassAndPlay(!activeRoom.isPassAndPlay) },
@@ -413,6 +417,7 @@ private fun CoupleRoomPresenceAndMenuRow(
     isOffline: Boolean,
     isConnecting: Boolean,
     hasPendingHostApproval: Boolean,
+    pendingTurnCount: Int = 0,
     onRequireSignIn: () -> Unit,
     onRetryCloudSync: () -> Unit,
     onTogglePassAndPlay: () -> Unit,
@@ -493,6 +498,25 @@ private fun CoupleRoomPresenceAndMenuRow(
                         contentDescription = "Always-on private protection",
                         tint = Color(0xFFF9A8D4),
                         modifier = Modifier.size(13.dp)
+                    )
+                }
+            }
+
+            if (!isPassAndPlay && pendingTurnCount > 0) {
+                Surface(
+                    shape = RoundedCornerShape(100.dp),
+                    color = WaitingAmber.copy(alpha = 0.16f),
+                    border = BorderStroke(0.8.dp, WaitingAmber.copy(alpha = 0.5f)),
+                    modifier = Modifier.testTag("pending_sync_badge")
+                ) {
+                    Text(
+                        text = "Queued $pendingTurnCount",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 10.sp
+                        ),
+                        color = WaitingAmber,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                     )
                 }
             }

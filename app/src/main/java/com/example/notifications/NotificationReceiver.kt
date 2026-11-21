@@ -24,8 +24,11 @@ class NotificationReceiver : BroadcastReceiver() {
         val action = intent?.action ?: return
         val pendingResult = goAsync()
 
-        CoroutineScope(Dispatchers.IO).launch {
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + Dispatchers.IO).launch {
             try {
+                if (!com.example.security.LocalVaultCrypto.canSafelyWrite()) {
+                    return@launch
+                }
                 val db = AppDatabase.getInstance(context)
                 val repo = PhasesRepository(db)
                 val profile = repo.getProfileOnce()
@@ -103,6 +106,8 @@ class NotificationReceiver : BroadcastReceiver() {
                         } catch (_: Exception) {}
                     }
                 }
+            } catch (_: Throwable) {
+                // Fail-closed: never crash broadcast receiver on locked vault or transient storage error
             } finally {
                 pendingResult.finish()
             }

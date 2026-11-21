@@ -21,9 +21,10 @@ import kotlinx.coroutines.launch
         Medication::class,
         TaskCategory::class,
         GameScoreRecord::class,
-        CoupleRoomRecord::class
+        CoupleRoomRecord::class,
+        PendingCoupleTurn::class
     ],
-    version = 14,
+    version = 15,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -37,6 +38,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun medicationDao(): MedicationDao
     abstract fun gameScoreDao(): GameScoreDao
     abstract fun coupleRoomDao(): CoupleRoomDao
+    abstract fun pendingCoupleTurnDao(): PendingCoupleTurnDao
     fun medicineReminderDao(): MedicationDao = medicationDao()
 
     companion object {
@@ -256,6 +258,15 @@ abstract class AppDatabase : RoomDatabase() {
                     "`ecdhPrivateKeyB64` TEXT NOT NULL DEFAULT '', " +
                     "`peerPublicKeyB64` TEXT NOT NULL DEFAULT '', " +
                     "`ecdhSharedSecretB64` TEXT NOT NULL DEFAULT '', " +
+                    "`chainSchemaVersion` INTEGER NOT NULL DEFAULT 1, " +
+                    "`minProtocolVersion` INTEGER NOT NULL DEFAULT 2, " +
+                    "`migrationAnchorHash` TEXT NOT NULL DEFAULT '', " +
+                    "`migrationAnchorIndex` INTEGER NOT NULL DEFAULT 0, " +
+                    "`prunedBlockCount` INTEGER NOT NULL DEFAULT 0, " +
+                    "`prunedAnchorHash` TEXT NOT NULL DEFAULT '', " +
+                    "`lastConfirmedCloudIndex` INTEGER NOT NULL DEFAULT 0, " +
+                    "`seenClientTurnIdsJson` TEXT NOT NULL DEFAULT '[]', " +
+                    "`seenReplayHashesJson` TEXT NOT NULL DEFAULT '[]', " +
                     "PRIMARY KEY(`coupleCode`))"
             )
             addColumnIfNotExists(db, "couple_rooms", "isBonded", "INTEGER NOT NULL DEFAULT 1")
@@ -276,6 +287,51 @@ abstract class AppDatabase : RoomDatabase() {
             addColumnIfNotExists(db, "couple_rooms", "ecdhPrivateKeyB64", "TEXT NOT NULL DEFAULT ''")
             addColumnIfNotExists(db, "couple_rooms", "peerPublicKeyB64", "TEXT NOT NULL DEFAULT ''")
             addColumnIfNotExists(db, "couple_rooms", "ecdhSharedSecretB64", "TEXT NOT NULL DEFAULT ''")
+            // Existing v14 rooms default to chainSchemaVersion=1 so they lazily upgrade to V2 with an explicit migration anchor
+            addColumnIfNotExists(db, "couple_rooms", "chainSchemaVersion", "INTEGER NOT NULL DEFAULT 1")
+            addColumnIfNotExists(db, "couple_rooms", "minProtocolVersion", "INTEGER NOT NULL DEFAULT 2")
+            addColumnIfNotExists(db, "couple_rooms", "migrationAnchorHash", "TEXT NOT NULL DEFAULT ''")
+            addColumnIfNotExists(db, "couple_rooms", "migrationAnchorIndex", "INTEGER NOT NULL DEFAULT 0")
+            addColumnIfNotExists(db, "couple_rooms", "prunedBlockCount", "INTEGER NOT NULL DEFAULT 0")
+            addColumnIfNotExists(db, "couple_rooms", "prunedAnchorHash", "TEXT NOT NULL DEFAULT ''")
+            addColumnIfNotExists(db, "couple_rooms", "lastConfirmedCloudIndex", "INTEGER NOT NULL DEFAULT 0")
+            addColumnIfNotExists(db, "couple_rooms", "seenClientTurnIdsJson", "TEXT NOT NULL DEFAULT '[]'")
+            addColumnIfNotExists(db, "couple_rooms", "seenReplayHashesJson", "TEXT NOT NULL DEFAULT '[]'")
+
+            // Preserve ECDH protocol v3 floor for any migrated room that already established an ECDH secret
+            try {
+                db.execSQL(
+                    "UPDATE `couple_rooms` SET `minProtocolVersion` = 3 " +
+                        "WHERE `ecdhSharedSecretB64` != '' AND `minProtocolVersion` < 3"
+                )
+            } catch (_: Throwable) {}
+
+            // Durable encrypted pending-turn queue for offline Couple Lounge moves
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `pending_couple_turns` (" +
+                    "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                    "`clientTurnId` TEXT NOT NULL, " +
+                    "`coupleCode` TEXT NOT NULL, " +
+                    "`actionType` TEXT NOT NULL, " +
+                    "`encryptedIntentJson` TEXT NOT NULL, " +
+                    "`retryCount` INTEGER NOT NULL DEFAULT 0, " +
+                    "`status` TEXT NOT NULL DEFAULT 'PENDING', " +
+                    "`lastError` TEXT NOT NULL DEFAULT '', " +
+                    "`createdAt` INTEGER NOT NULL, " +
+                    "`updatedAt` INTEGER NOT NULL)"
+            )
+            try {
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_pending_couple_turns_clientTurnId` " +
+                        "ON `pending_couple_turns` (`clientTurnId`)"
+                )
+            } catch (_: Throwable) {}
+            try {
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_pending_couple_turns_coupleCode_createdAt` " +
+                        "ON `pending_couple_turns` (`coupleCode`, `createdAt`)"
+                )
+            } catch (_: Throwable) {}
         }
 
         private val MIGRATION_1_2 = object : Migration(1, 2) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
@@ -323,6 +379,12 @@ abstract class AppDatabase : RoomDatabase() {
         private val MIGRATION_11_14 = object : Migration(11, 14) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
         private val MIGRATION_10_14 = object : Migration(10, 14) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
         private val MIGRATION_1_14 = object : Migration(1, 14) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        internal val MIGRATION_14_15 = object : Migration(14, 15) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_13_15 = object : Migration(13, 15) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_12_15 = object : Migration(12, 15) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_11_15 = object : Migration(11, 15) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_10_15 = object : Migration(10, 15) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_1_15 = object : Migration(1, 15) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
 
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
@@ -381,8 +443,14 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_12_14,
                     MIGRATION_11_14,
                     MIGRATION_10_14,
-                    MIGRATION_1_14
-                ).fallbackToDestructiveMigration(dropAllTables = true)
+                    MIGRATION_1_14,
+                    MIGRATION_14_15,
+                    MIGRATION_13_15,
+                    MIGRATION_12_15,
+                    MIGRATION_11_15,
+                    MIGRATION_10_15,
+                    MIGRATION_1_15
+                )
                 .addCallback(object : Callback() {
                     override fun onOpen(db: SupportSQLiteDatabase) {
                         super.onOpen(db)

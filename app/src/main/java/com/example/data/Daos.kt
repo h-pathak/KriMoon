@@ -234,4 +234,38 @@ interface CoupleRoomDao {
     suspend fun clearAll()
 }
 
+@Dao
+interface PendingCoupleTurnDao {
+    @Query("SELECT * FROM pending_couple_turns WHERE coupleCode = :coupleCode ORDER BY createdAt ASC, id ASC")
+    fun observePendingForRoom(coupleCode: String): Flow<List<PendingCoupleTurn>>
+
+    @Query("SELECT COUNT(*) FROM pending_couple_turns WHERE status != 'FAILED_PERMANENT'")
+    fun observeActivePendingCount(): Flow<Int>
+
+    @Query("SELECT * FROM pending_couple_turns WHERE coupleCode = :coupleCode AND status != 'FAILED_PERMANENT' ORDER BY createdAt ASC, id ASC")
+    suspend fun getPendingForRoomOnce(coupleCode: String): List<PendingCoupleTurn>
+
+    @Query("SELECT * FROM pending_couple_turns WHERE status != 'FAILED_PERMANENT' ORDER BY createdAt ASC, id ASC")
+    suspend fun getAllPendingOnce(): List<PendingCoupleTurn>
+
+    @Query("SELECT * FROM pending_couple_turns WHERE clientTurnId = :clientTurnId LIMIT 1")
+    suspend fun getByClientTurnId(clientTurnId: String): PendingCoupleTurn?
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insert(turn: PendingCoupleTurn): Long
+
+    @Update
+    suspend fun update(turn: PendingCoupleTurn)
+
+    @Query("DELETE FROM pending_couple_turns WHERE clientTurnId = :clientTurnId")
+    suspend fun deleteByClientTurnId(clientTurnId: String)
+
+    @Query("DELETE FROM pending_couple_turns WHERE coupleCode = :coupleCode")
+    suspend fun deleteByRoom(coupleCode: String)
+
+    @Query("DELETE FROM pending_couple_turns")
+    suspend fun clearAll()
+}
+
+
 

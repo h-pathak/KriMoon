@@ -1,7 +1,9 @@
 package com.example.data
 
+import com.example.model.CoupleActivityIntent
 import com.example.security.BackendSecurityFirewall
 import com.example.security.LocalVaultCrypto
+import com.example.security.LocalVaultUnavailableException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.firstOrNull
@@ -46,6 +48,22 @@ class PhasesRepository(private val database: AppDatabase) {
     val coupleRooms: Flow<List<CoupleRoomRecord>> = database.coupleRoomDao().getAllRooms()
         .map { list -> list.map { it.decryptFromVault() } }
         .flowOn(Dispatchers.Default)
+
+    val activePendingTurnCount: Flow<Int> = database.pendingCoupleTurnDao().observeActivePendingCount()
+
+    fun observePendingTurnsForRoom(coupleCode: String): Flow<List<PendingCoupleTurn>> {
+        val clean = coupleCode.filter { it.isDigit() }.take(6)
+        return database.pendingCoupleTurnDao().observePendingForRoom(clean)
+    }
+
+    private fun requireHealthyVaultForWrite() {
+        if (!LocalVaultCrypto.canSafelyWrite()) {
+            throw LocalVaultUnavailableException(
+                vaultState = LocalVaultCrypto.vaultState.value,
+                message = "Local vault is locked (${LocalVaultCrypto.vaultState.value}); refusing write to protect existing encrypted records."
+            )
+        }
+    }
 
     // --- At-Rest AES-256-GCM Field Encryption & Decryption (Per-Column AAD) ---
 
@@ -189,17 +207,26 @@ class PhasesRepository(private val database: AppDatabase) {
     /**
      * One-time background upgrade that transparently encrypts any pre-existing plaintext rows
      * in SQLite using the hardware-backed Android Keystore AES-256-GCM vault.
+     * Fail-closed: aborts immediately if the vault key is unavailable or any existing encrypted
+     * field fails authenticated decryption, guaranteeing valid ciphertext is never overwritten.
      */
     suspend fun migratePlaintextRecordsToEncryptedVault() = withContext(Dispatchers.IO) {
+        if (!LocalVaultCrypto.canSafelyWrite()) return@withContext
         try {
             database.userProfileDao().getProfileOnce()?.let { raw ->
                 if (raw.name.isNotEmpty() && !LocalVaultCrypto.isLatestFormat(raw.name)) {
-                    database.userProfileDao().insertOrUpdate(raw.decryptFromVault().encryptForVault())
+                    val dec = LocalVaultCrypto.decryptFieldResult(raw.name, "user_profile:name")
+                    if (dec.isSuccess) {
+                        database.userProfileDao().insertOrUpdate(raw.copy(name = dec.getOrThrow()).encryptForVault())
+                    }
                 }
             }
             database.periodLogDao().getAllPeriods().firstOrNull()?.forEach { raw ->
                 if (raw.notes.isNotEmpty() && !LocalVaultCrypto.isLatestFormat(raw.notes)) {
-                    database.periodLogDao().update(raw.decryptFromVault().encryptForVault())
+                    val dec = LocalVaultCrypto.decryptFieldResult(raw.notes, "period_logs:notes")
+                    if (dec.isSuccess) {
+                        database.periodLogDao().update(raw.copy(notes = dec.getOrThrow()).encryptForVault())
+                    }
                 }
             }
             database.dailyCycleLogDao().getAllLogs().firstOrNull()?.forEach { raw ->
@@ -207,12 +234,22 @@ class PhasesRepository(private val database: AppDatabase) {
                     (raw.mood.isNotEmpty() && !LocalVaultCrypto.isLatestFormat(raw.mood)) ||
                     (raw.notes.isNotEmpty() && !LocalVaultCrypto.isLatestFormat(raw.notes))
                 if (needsEnc) {
-                    database.dailyCycleLogDao().insertOrUpdate(raw.decryptFromVault().encryptForVault())
+                    val s = LocalVaultCrypto.decryptFieldResult(raw.symptoms, "daily_cycle_logs:symptoms")
+                    val m = LocalVaultCrypto.decryptFieldResult(raw.mood, "daily_cycle_logs:mood")
+                    val n = LocalVaultCrypto.decryptFieldResult(raw.notes, "daily_cycle_logs:notes")
+                    if (s.isSuccess && m.isSuccess && n.isSuccess) {
+                        database.dailyCycleLogDao().insertOrUpdate(
+                            raw.copy(symptoms = s.getOrThrow(), mood = m.getOrThrow(), notes = n.getOrThrow()).encryptForVault()
+                        )
+                    }
                 }
             }
             database.userNoteDao().getAllNotes().firstOrNull()?.forEach { raw ->
                 if (raw.content.isNotEmpty() && !LocalVaultCrypto.isLatestFormat(raw.content)) {
-                    database.userNoteDao().insert(raw.decryptFromVault().encryptForVault())
+                    val dec = LocalVaultCrypto.decryptFieldResult(raw.content, "user_notes:content")
+                    if (dec.isSuccess) {
+                        database.userNoteDao().insert(raw.copy(content = dec.getOrThrow()).encryptForVault())
+                    }
                 }
             }
             database.medicationDao().getAllMedications().firstOrNull()?.forEach { raw ->
@@ -221,14 +258,31 @@ class PhasesRepository(private val database: AppDatabase) {
                     (raw.customReminderMessage.isNotEmpty() && !LocalVaultCrypto.isLatestFormat(raw.customReminderMessage)) ||
                     (raw.instructions.isNotEmpty() && !LocalVaultCrypto.isLatestFormat(raw.instructions))
                 if (needsEnc) {
-                    database.medicationDao().update(raw.decryptFromVault().encryptForVault())
+                    val n = LocalVaultCrypto.decryptFieldResult(raw.name, "medications:name")
+                    val d = LocalVaultCrypto.decryptFieldResult(raw.dosage, "medications:dosage")
+                    val c = LocalVaultCrypto.decryptFieldResult(raw.customReminderMessage, "medications:customReminderMessage")
+                    val i = LocalVaultCrypto.decryptFieldResult(raw.instructions, "medications:instructions")
+                    if (n.isSuccess && d.isSuccess && c.isSuccess && i.isSuccess) {
+                        database.medicationDao().update(
+                            raw.copy(
+                                name = n.getOrThrow(),
+                                dosage = d.getOrThrow(),
+                                customReminderMessage = c.getOrThrow(),
+                                instructions = i.getOrThrow()
+                            ).encryptForVault()
+                        )
+                    }
                 }
             }
             database.shopItemDao().getAllItems().firstOrNull()?.forEach { raw ->
                 val needsEnc = (raw.text.isNotEmpty() && !LocalVaultCrypto.isLatestFormat(raw.text)) ||
                     (raw.notes.isNotEmpty() && !LocalVaultCrypto.isLatestFormat(raw.notes))
                 if (needsEnc) {
-                    database.shopItemDao().update(raw.decryptFromVault().encryptForVault())
+                    val t = LocalVaultCrypto.decryptFieldResult(raw.text, "shop_items:text")
+                    val n = LocalVaultCrypto.decryptFieldResult(raw.notes, "shop_items:notes")
+                    if (t.isSuccess && n.isSuccess) {
+                        database.shopItemDao().update(raw.copy(text = t.getOrThrow(), notes = n.getOrThrow()).encryptForVault())
+                    }
                 }
             }
             database.coupleRoomDao().getAllRooms().firstOrNull()?.forEach { raw ->
@@ -236,11 +290,16 @@ class PhasesRepository(private val database: AppDatabase) {
                     (raw.quizStateJson.isNotEmpty() && !LocalVaultCrypto.isLatestFormat(raw.quizStateJson)) ||
                     (raw.ecdhPrivateKeyB64.isNotEmpty() && !LocalVaultCrypto.isLatestFormat(raw.ecdhPrivateKeyB64))
                 if (needsEnc) {
-                    database.coupleRoomDao().insertOrUpdate(raw.decryptFromVault().encryptForVault())
+                    val code = raw.coupleCode
+                    val checkName = LocalVaultCrypto.decryptFieldResult(raw.myName, "couple_rooms:$code:myName")
+                    val checkPriv = LocalVaultCrypto.decryptFieldResult(raw.ecdhPrivateKeyB64, "couple_rooms:$code:ecdhPrivateKeyB64")
+                    if (checkName.isSuccess && checkPriv.isSuccess) {
+                        database.coupleRoomDao().insertOrUpdate(raw.decryptFromVault().encryptForVault())
+                    }
                 }
             }
         } catch (_: Throwable) {
-            // Non-fatal: future saves still encrypt automatically
+            // Non-fatal: vault remains fail-closed and preserves existing ciphertext
         }
     }
 
@@ -312,6 +371,7 @@ class PhasesRepository(private val database: AppDatabase) {
         viewMode: String,
         sortMode: String
     ) {
+        requireHealthyVaultForWrite()
         val current = getProfileOnce() ?: return
         database.userProfileDao().insertOrUpdate(
             current.copy(
@@ -328,6 +388,7 @@ class PhasesRepository(private val database: AppDatabase) {
         durationDays: Int? = null,
         endDateMillis: Long? = null
     ): Long {
+        requireHealthyVaultForWrite()
         return database.periodLogDao().insert(
             PeriodLog(
                 startDateMillis = startDateMillis,
@@ -339,7 +400,11 @@ class PhasesRepository(private val database: AppDatabase) {
     }
 
     suspend fun endPeriod(id: Long, endDateMillis: Long) {
-        val existing = database.periodLogDao().getById(id)?.decryptFromVault() ?: return
+        requireHealthyVaultForWrite()
+        val raw = database.periodLogDao().getById(id) ?: return
+        val decNotes = LocalVaultCrypto.decryptFieldResult(raw.notes, "period_logs:notes")
+            .getOrElse { throw it }
+        val existing = raw.copy(notes = decNotes)
         val calculatedDuration = kotlin.math.max(
             1,
             kotlin.math.round((endDateMillis - existing.startDateMillis).toDouble() / (24L * 60 * 60 * 1000)).toInt() + 1
@@ -533,6 +598,7 @@ class PhasesRepository(private val database: AppDatabase) {
     }
 
     suspend fun toggleMedication(id: Long, isEnabled: Boolean) {
+        requireHealthyVaultForWrite()
         val existing = getMedicationById(id)
         if (existing != null) {
             database.medicationDao().update(existing.copy(isEnabled = isEnabled).encryptForVault())
@@ -540,6 +606,7 @@ class PhasesRepository(private val database: AppDatabase) {
     }
 
     suspend fun markMedicationTakenToday(id: Long, todayDateString: String, timeString: String = "") {
+        requireHealthyVaultForWrite()
         val existing = getMedicationById(id)
         if (existing != null) {
             database.medicationDao().update(
@@ -687,17 +754,89 @@ class PhasesRepository(private val database: AppDatabase) {
     }
 
     suspend fun saveCoupleRoom(room: CoupleRoomRecord) = withContext(Dispatchers.IO) {
+        requireHealthyVaultForWrite()
         val encrypted = room.copy(updatedAt = System.currentTimeMillis()).encryptForVault()
         database.coupleRoomDao().insertOrUpdate(encrypted)
     }
 
     suspend fun deleteCoupleRoom(code: String) = withContext(Dispatchers.IO) {
         database.coupleRoomDao().deleteByCode(code)
+        database.pendingCoupleTurnDao().deleteByRoom(code)
+    }
+
+    // --- Durable Encrypted Offline Pending Couple Turn Queue ---
+
+    suspend fun enqueuePendingCoupleTurn(
+        coupleCode: String,
+        intent: CoupleActivityIntent
+    ): PendingCoupleTurn = withContext(Dispatchers.IO) {
+        requireHealthyVaultForWrite()
+        val cleanCode = coupleCode.filter { it.isDigit() }.take(6)
+        val existing = database.pendingCoupleTurnDao().getByClientTurnId(intent.clientTurnId)
+        if (existing != null) return@withContext existing
+
+        val aad = "pending_couple_turns:$cleanCode:${intent.clientTurnId}"
+        val encryptedJson = LocalVaultCrypto.encryptField(intent.toJsonString(), aad)
+        val now = System.currentTimeMillis()
+        val record = PendingCoupleTurn(
+            clientTurnId = intent.clientTurnId,
+            coupleCode = cleanCode,
+            actionType = BackendSecurityFirewall.sanitizeField(intent.actionType, 24),
+            encryptedIntentJson = encryptedJson,
+            retryCount = 0,
+            status = "PENDING",
+            lastError = "",
+            createdAt = now,
+            updatedAt = now
+        )
+        val id = database.pendingCoupleTurnDao().insert(record)
+        record.copy(id = if (id > 0) id else 0L)
+    }
+
+    fun decryptPendingIntent(turn: PendingCoupleTurn): Result<CoupleActivityIntent> {
+        val aad = "pending_couple_turns:${turn.coupleCode}:${turn.clientTurnId}"
+        return LocalVaultCrypto.decryptFieldResult(turn.encryptedIntentJson, aad).mapCatching { json ->
+            CoupleActivityIntent.fromJsonString(json)
+                ?: throw IllegalStateException("Corrupted pending turn intent payload.")
+        }
+    }
+
+    suspend fun getPendingTurnsForRoomOnce(coupleCode: String): List<PendingCoupleTurn> = withContext(Dispatchers.IO) {
+        val clean = coupleCode.filter { it.isDigit() }.take(6)
+        database.pendingCoupleTurnDao().getPendingForRoomOnce(clean)
+    }
+
+    suspend fun getAllPendingTurnsOnce(): List<PendingCoupleTurn> = withContext(Dispatchers.IO) {
+        database.pendingCoupleTurnDao().getAllPendingOnce()
+    }
+
+    suspend fun markPendingTurnStatus(
+        turn: PendingCoupleTurn,
+        status: String,
+        retryCount: Int = turn.retryCount,
+        lastError: String = ""
+    ) = withContext(Dispatchers.IO) {
+        database.pendingCoupleTurnDao().update(
+            turn.copy(
+                status = status,
+                retryCount = retryCount,
+                lastError = BackendSecurityFirewall.sanitizeField(lastError, 240),
+                updatedAt = System.currentTimeMillis()
+            )
+        )
+    }
+
+    suspend fun removePendingTurn(clientTurnId: String) = withContext(Dispatchers.IO) {
+        database.pendingCoupleTurnDao().deleteByClientTurnId(clientTurnId)
+    }
+
+    suspend fun clearPendingTurnsForRoom(coupleCode: String) = withContext(Dispatchers.IO) {
+        database.pendingCoupleTurnDao().deleteByRoom(coupleCode.filter { it.isDigit() }.take(6))
     }
 
     /**
-     * Wipes all local tables and performs cryptographic erasure by rotating the AndroidKeyStore
-     * AES-256-GCM vault key before re-seeding clean defaults.
+     * Wipes all local tables and performs explicit cryptographic erasure of the AndroidKeyStore
+     * KEK and wrapped DEK before re-seeding clean defaults.
      */
     suspend fun clearAllData() = withContext(Dispatchers.IO) {
         database.periodLogDao().clearAll()
@@ -709,10 +848,18 @@ class PhasesRepository(private val database: AppDatabase) {
         database.dailyCycleLogDao().clearAll()
         database.gameScoreDao().clearAll()
         database.coupleRoomDao().clearAll()
-        LocalVaultCrypto.rotateVaultKey()
-        database.userProfileDao().insertOrUpdate(UserProfile(id = 1, isOnboarded = false).encryptForVault())
-        checkAndSeedCategoriesIfEmpty()
-        checkAndSeedShopItemsIfEmpty()
-        checkAndSeedMedicineRemindersIfEmpty()
+        database.pendingCoupleTurnDao().clearAll()
+        LocalVaultCrypto.cryptographicEraseAndResetVault()
+        if (LocalVaultCrypto.canSafelyWrite()) {
+            database.userProfileDao().insertOrUpdate(UserProfile(id = 1, isOnboarded = false).encryptForVault())
+            checkAndSeedCategoriesIfEmpty()
+            checkAndSeedShopItemsIfEmpty()
+            checkAndSeedMedicineRemindersIfEmpty()
+        }
     }
+
+    /**
+     * Explicit user-confirmed recovery wipe when AndroidKeyStore KEK is permanently invalidated.
+     */
+    suspend fun resetCorruptedVaultAndClearAllData() = clearAllData()
 }

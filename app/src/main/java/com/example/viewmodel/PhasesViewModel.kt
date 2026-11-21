@@ -15,9 +15,11 @@ import com.example.data.ShopItem
 import com.example.data.TaskCategory
 import com.example.data.UserNote
 import com.example.data.UserProfile
+import com.example.cloud.BlockPublishOutcome
 import com.example.cloud.CoupleCloudRepository
 import com.example.cloud.CoupleCloudRoom
 import com.example.model.CoupleActivitiesDeck
+import com.example.model.CoupleActivityIntent
 import com.example.model.CoupleBlock
 import com.example.model.CoupleBlockchain
 import com.example.model.CoupleEcdhEngine
@@ -33,11 +35,18 @@ import com.example.model.RoundSyncState
 import com.example.model.SpiceLevel
 import com.example.model.TicTacToeSyncState
 import com.example.notifications.NotificationHelper
+import com.example.security.LocalVaultCrypto
+import com.example.security.LocalVaultUnavailableException
+import com.example.security.VaultState
+import com.google.firebase.Firebase
+import com.google.firebase.auth.FirebaseAuthRecentLoginRequiredException
+import com.google.firebase.auth.auth
 import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -120,6 +129,12 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
+    // Fail-closed local vault state & offline queue visibility
+    val vaultState: StateFlow<VaultState> = LocalVaultCrypto.vaultState
+
+    val activePendingTurnCount: StateFlow<Int> = repository.activePendingTurnCount
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
+
     // Live 2-Phone Encrypted Cloud Sync State
     private val _cloudAuthUid = MutableStateFlow<String?>(null)
     val cloudAuthUid: StateFlow<String?> = _cloudAuthUid.asStateFlow()
@@ -139,6 +154,7 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
     private var activeBlocksSyncJob: Job? = null
     private var roomWatcherCoordinatorJob: Job? = null
     private val coupleRoomMutex = Mutex()
+    private val pendingDrainMutex = Mutex()
     private val sentBlockHashes: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
     private val processedBlockHashes: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
     private val rebroadcastedCodes: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
@@ -223,11 +239,15 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
 
     init {
         viewModelScope.launch {
-            repository.checkAndSeedUserProfileIfEmpty()
-            repository.checkAndSeedCategoriesIfEmpty()
-            repository.checkAndSeedShopItemsIfEmpty()
-            repository.checkAndSeedMedicineRemindersIfEmpty()
-            repository.migratePlaintextRecordsToEncryptedVault()
+            if (LocalVaultCrypto.canSafelyWrite()) {
+                runCatching {
+                    repository.checkAndSeedUserProfileIfEmpty()
+                    repository.checkAndSeedCategoriesIfEmpty()
+                    repository.checkAndSeedShopItemsIfEmpty()
+                    repository.checkAndSeedMedicineRemindersIfEmpty()
+                    repository.migratePlaintextRecordsToEncryptedVault()
+                }
+            }
         }
     }
 
@@ -768,12 +788,123 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun retryVaultUnlock() {
+        viewModelScope.launch {
+            val state = withContext(Dispatchers.IO) {
+                LocalVaultCrypto.retryUnlock()
+            }
+            if (state == VaultState.HEALTHY || state == VaultState.TEST_EPHEMERAL) {
+                runCatching {
+                    repository.checkAndSeedUserProfileIfEmpty()
+                    repository.checkAndSeedCategoriesIfEmpty()
+                    repository.checkAndSeedShopItemsIfEmpty()
+                    repository.checkAndSeedMedicineRemindersIfEmpty()
+                    repository.migratePlaintextRecordsToEncryptedVault()
+                }
+                showFeedback("Private vault unlocked 🔒")
+            } else {
+                showFeedback("Encryption key is still unavailable. Unlock your device or reset the local vault.")
+            }
+        }
+    }
+
+    fun confirmResetCorruptedVault() {
+        viewModelScope.launch {
+            detachCloudListeners()
+            cancelAllScheduledRemindersAndNotifications()
+            repository.resetCorruptedVaultAndClearAllData()
+            sentBlockHashes.clear()
+            processedBlockHashes.clear()
+            rebroadcastedCodes.clear()
+            _activeCoupleCode.value = null
+            showFeedback("Local vault reset with a fresh encryption key 🔒")
+        }
+    }
+
+    private suspend fun cancelAllScheduledRemindersAndNotifications() {
+        val meds = runCatching { repository.getMedicationsOnce() }.getOrDefault(medications.value)
+        val notes = runCatching { repository.getAllNotesOnce() }.getOrDefault(userNotes.value)
+        NotificationHelper.cancelAllReminders(
+            context = getApplication(),
+            medicines = meds,
+            notes = notes,
+            cancelPostedNotifications = true
+        )
+    }
+
     fun clearAllData() {
         viewModelScope.launch {
+            detachCloudListeners()
+            cancelAllScheduledRemindersAndNotifications()
             repository.clearAllData()
+            sentBlockHashes.clear()
+            processedBlockHashes.clear()
+            rebroadcastedCodes.clear()
             _activeCoupleCode.value = null
-            showFeedback("All local data cleared")
+            showFeedback("All local data & reminders erased 🔒")
             _showSettingsSheet.value = false
+        }
+    }
+
+    /**
+     * Full account & data deletion:
+     * 1. Tombstones all user Couple Lounge rooms in Firestore (scrubs personal names & public keys
+     *    while keeping non-identifying room-code reservation so retired codes cannot be reused).
+     * 2. Cancels all scheduled alarms and posted notifications.
+     * 3. Wipes all local Room tables and performs cryptographic DEK/KEK erasure.
+     * 4. Deletes the Firebase Auth account (or informs user if recent Google re-authentication is required).
+     */
+    fun deleteAccountAndEraseData() {
+        viewModelScope.launch {
+            _isCloudBusy.value = true
+            try {
+                val signedInUid = _cloudAuthUid.value ?: runCatching { Firebase.auth.currentUser?.uid }.getOrNull()
+                var tombstonedCount = 0
+                if (!signedInUid.isNullOrBlank()) {
+                    val cloudRepo = getCloudRepoOrNull()
+                    if (cloudRepo != null) {
+                        tombstonedCount = cloudRepo.tombstoneAllUserRoomsForAccountDeletion().getOrDefault(0)
+                    }
+                }
+
+                detachCloudListeners()
+                cancelAllScheduledRemindersAndNotifications()
+                repository.clearAllData()
+                sentBlockHashes.clear()
+                processedBlockHashes.clear()
+                rebroadcastedCodes.clear()
+                _activeCoupleCode.value = null
+
+                var authDeletionStatus = "LOCAL_ONLY"
+                val currentUser = runCatching { Firebase.auth.currentUser }.getOrNull()
+                if (currentUser != null) {
+                    try {
+                        currentUser.delete().await()
+                        authDeletionStatus = "DELETED"
+                    } catch (_: FirebaseAuthRecentLoginRequiredException) {
+                        authDeletionStatus = "REAUTH_REQUIRED"
+                        runCatching { Firebase.auth.signOut() }
+                    } catch (_: Exception) {
+                        authDeletionStatus = "SIGNED_OUT_ONLY"
+                        runCatching { Firebase.auth.signOut() }
+                    }
+                }
+
+                _cloudAuthUid.value = null
+                _cloudUserName.value = null
+                _cloudSyncStatus.value = "SIGNED_OUT"
+                _showSettingsSheet.value = false
+
+                val roomNote = if (tombstonedCount > 0) " & $tombstonedCount cloud room(s) scrubbed" else ""
+                when (authDeletionStatus) {
+                    "DELETED" -> showFeedback("Account deleted, local vault erased$roomNote 🔒")
+                    "REAUTH_REQUIRED" -> showFeedback("Local data erased$roomNote. Sign in again briefly to finish deleting your Firebase account.")
+                    "SIGNED_OUT_ONLY" -> showFeedback("Local data erased$roomNote & signed out.")
+                    else -> showFeedback("All local data & reminders erased 🔒")
+                }
+            } finally {
+                _isCloudBusy.value = false
+            }
         }
     }
 
@@ -1013,29 +1144,33 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                             else -> "WAITING"
                         }
 
-                        // Partner 2 was just allowed in by Host -> immediately send encrypted BondHandshake block
+                        // Partner 2 was just allowed in by Host -> enqueue encrypted BondHandshake intent
                         if (wasPendingRequester && cloudRoom.status == "CONNECTED") {
                             val freshLocal = repository.getCoupleRoom(coupleCode)
                             if (freshLocal != null) {
                                 val spice = runCatching { SpiceLevel.valueOf(freshLocal.spiceLevel) }.getOrDefault(SpiceLevel.FLIRTY)
-                                val (packet, block) = withContext(Dispatchers.Default) {
+                                val (packet, _) = withContext(Dispatchers.Default) {
                                     CoupleTurnCodec.encodeBondHandshakeWithBlock(
                                         coupleCode = coupleCode,
                                         senderName = freshLocal.myName,
                                         spiceLevel = spice,
-                                        previousHash = freshLocal.lastBlockHash.ifBlank { CoupleBlockchain.genesisHash(coupleCode) },
+                                        previousHash = freshLocal.lastBlockHash.ifBlank { CoupleBlockchain.createDeterministicGenesisBlock(coupleCode).blockHash },
                                         blockIndex = freshLocal.blockHeight.coerceAtLeast(1),
                                         ecdhSharedSecretB64 = freshLocal.ecdhSharedSecretB64
                                     )
                                 }
-                                sentBlockHashes.add(block.blockHash)
-                                commitOutgoingCoupleBlock(coupleCode, block)
-                                cloudRepo.publishEncryptedBlock(coupleCode, freshLocal.myName, block, packet)
+                                CoupleTurnCodec.extractActivityIntent(
+                                    rawPacket = packet,
+                                    coupleCode = coupleCode,
+                                    ecdhSharedSecretB64 = freshLocal.ecdhSharedSecretB64
+                                ).onSuccess { intent ->
+                                    enqueueAndDrainTurnIntent(coupleCode, intent, triggerCloudDrain = false)
+                                }
                                 showFeedback("Host allowed you in! Connected live ♥")
                             }
                         }
 
-                        // If partner was just approved by Host, rebroadcast any pre-approval local Host moves
+                        // If partner was just approved by Host, enqueue any pre-approval local Host moves
                         val isHostLocal = localBefore?.isHost ?: (cloudRoom.creatorUid == uid)
                         if (cloudRoom.status == "CONNECTED" &&
                             isHostLocal &&
@@ -1044,6 +1179,11 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                         ) {
                             rebroadcastedCodes.add(coupleCode)
                             rebroadcastPendingLocalMoves(cloudRepo, coupleCode)
+                        }
+
+                        // Drain any offline/queued encrypted turns whenever room is CONNECTED
+                        if (cloudRoom.status == "CONNECTED") {
+                            drainPendingTurnsForRoom(coupleCode)
                         }
                     }
                 if (!failed || declinedByPermission) break
@@ -1103,102 +1243,92 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
 
     /**
      * When Phone B is approved into a room where Phone A already made moves while waiting,
-     * rebroadcast Phone A's pending moves with the updated 2-member room membership
-     * so Phone B receives them immediately.
+     * converts any unqueued pre-approval local moves into durable encrypted intents and drains
+     * them atomically with the 2-member ECDH v3 session key.
      */
     private suspend fun rebroadcastPendingLocalMoves(
         cloudRepo: CoupleCloudRepository,
         coupleCode: String
     ) {
+        if (!LocalVaultCrypto.canSafelyWrite()) return
         val local = repository.getCoupleRoom(coupleCode) ?: return
         if (local.isPassAndPlay) return
         val spice = runCatching { SpiceLevel.valueOf(local.spiceLevel) }.getOrDefault(SpiceLevel.FLIRTY)
         val sharedSecret = local.ecdhSharedSecretB64
-        var prevHash = local.lastBlockHash.ifBlank { CoupleBlockchain.genesisHash(coupleCode) }
-        var height = local.blockHeight.coerceAtLeast(1)
+        val prevHash = local.lastBlockHash.ifBlank { CoupleBlockchain.createDeterministicGenesisBlock(coupleCode).blockHash }
+        val height = local.blockHeight.coerceAtLeast(1)
+
+        // If durable pending turns were already queued while WAITING, simply drain them!
+        val alreadyQueued = repository.getPendingTurnsForRoomOnce(coupleCode)
+        if (alreadyQueued.isNotEmpty()) {
+            drainPendingTurnsForRoom(coupleCode)
+            return
+        }
+
+        suspend fun enqueueFromPacket(packet: String) {
+            CoupleTurnCodec.extractActivityIntent(packet, coupleCode, sharedSecret).onSuccess { intent ->
+                enqueueAndDrainTurnIntent(coupleCode, intent, triggerCloudDrain = false)
+            }
+        }
 
         val quizState = CoupleTurnCodec.roundStateFromJson(local.quizStateJson)
         if (quizState.myChoice != null && quizState.partnerChoice == null) {
-            val (pkt, blk) = withContext(Dispatchers.Default) {
+            val (pkt, _) = withContext(Dispatchers.Default) {
                 CoupleTurnCodec.encodeQuizTurnWithBlock(
                     coupleCode, local.myName, quizState.roundIndex, quizState.myChoice, spice, prevHash, height, sharedSecret
                 )
             }
-            sentBlockHashes.add(blk.blockHash)
-            commitOutgoingCoupleBlock(coupleCode, blk)
-            cloudRepo.publishEncryptedBlock(coupleCode, local.myName, blk, pkt)
-            prevHash = blk.blockHash
-            height++
+            enqueueFromPacket(pkt)
         }
 
         val wyrState = CoupleTurnCodec.roundStateFromJson(local.wyrStateJson)
         if (wyrState.myChoice != null && wyrState.partnerChoice == null) {
-            val (pkt, blk) = withContext(Dispatchers.Default) {
+            val (pkt, _) = withContext(Dispatchers.Default) {
                 CoupleTurnCodec.encodeWyrTurnWithBlock(
                     coupleCode, local.myName, wyrState.roundIndex, wyrState.myChoice, spice, prevHash, height, sharedSecret
                 )
             }
-            sentBlockHashes.add(blk.blockHash)
-            commitOutgoingCoupleBlock(coupleCode, blk)
-            cloudRepo.publishEncryptedBlock(coupleCode, local.myName, blk, pkt)
-            prevHash = blk.blockHash
-            height++
+            enqueueFromPacket(pkt)
         }
 
         val strokes = CoupleTurnCodec.strokesFromJsonString(local.doodleStrokesJson)
         if (strokes.isNotEmpty()) {
-            val (pkt, blk) = withContext(Dispatchers.Default) {
+            val (pkt, _) = withContext(Dispatchers.Default) {
                 CoupleTurnCodec.encodeDoodleTurnWithBlock(
                     coupleCode, local.myName, local.doodlePrompt, strokes.takeLast(30), prevHash, height, sharedSecret
                 )
             }
-            sentBlockHashes.add(blk.blockHash)
-            commitOutgoingCoupleBlock(coupleCode, blk)
-            cloudRepo.publishEncryptedBlock(coupleCode, local.myName, blk, pkt)
-            prevHash = blk.blockHash
-            height++
+            enqueueFromPacket(pkt)
         }
 
         val ttt = CoupleTurnCodec.ticTacToeFromJsonString(local.ticTacToeStateJson)
         if (ttt.board.any { it.isNotEmpty() }) {
-            val (pkt, blk) = withContext(Dispatchers.Default) {
+            val (pkt, _) = withContext(Dispatchers.Default) {
                 CoupleTurnCodec.encodeTicTacToeTurnWithBlock(
                     coupleCode, local.myName, ttt, prevHash, height, sharedSecret
                 )
             }
-            sentBlockHashes.add(blk.blockHash)
-            commitOutgoingCoupleBlock(coupleCode, blk)
-            cloudRepo.publishEncryptedBlock(coupleCode, local.myName, blk, pkt)
-            prevHash = blk.blockHash
-            height++
+            enqueueFromPacket(pkt)
         }
 
         val dareState = CoupleActivitiesDeck.dareStateFromJson(local.dareStateJson)
         if (dareState.promptText.isNotBlank() && dareState.status == "PENDING") {
-            val (pkt, blk) = withContext(Dispatchers.Default) {
+            val (pkt, _) = withContext(Dispatchers.Default) {
                 CoupleTurnCodec.encodeDareTurnWithBlock(
                     coupleCode, local.myName, dareState, prevHash, height, sharedSecret
                 )
             }
-            sentBlockHashes.add(blk.blockHash)
-            commitOutgoingCoupleBlock(coupleCode, blk)
-            cloudRepo.publishEncryptedBlock(coupleCode, local.myName, blk, pkt)
-            prevHash = blk.blockHash
-            height++
+            enqueueFromPacket(pkt)
         }
 
         val waveState = CoupleActivitiesDeck.wavelengthStateFromJson(local.wavelengthStateJson)
         if (waveState.clueWord.isNotBlank() && waveState.phase == "GUESS") {
-            val (pkt, blk) = withContext(Dispatchers.Default) {
+            val (pkt, _) = withContext(Dispatchers.Default) {
                 CoupleTurnCodec.encodeWavelengthTurnWithBlock(
                     coupleCode, local.myName, waveState, prevHash, height, sharedSecret
                 )
             }
-            sentBlockHashes.add(blk.blockHash)
-            commitOutgoingCoupleBlock(coupleCode, blk)
-            cloudRepo.publishEncryptedBlock(coupleCode, local.myName, blk, pkt)
-            prevHash = blk.blockHash
-            height++
+            enqueueFromPacket(pkt)
         }
 
         val whisperState = CoupleActivitiesDeck.dateWhisperStateFromJson(local.whisperStateJson)
@@ -1207,18 +1337,19 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         }
         val latestMyDateLike = whisperState.myLikedIds.lastOrNull().orEmpty()
         if (latestMyWhisper != null || latestMyDateLike.isNotBlank()) {
-            val (pkt, blk) = withContext(Dispatchers.Default) {
+            val (pkt, _) = withContext(Dispatchers.Default) {
                 CoupleTurnCodec.encodeWhisperTurnWithBlock(
                     coupleCode, local.myName, latestMyDateLike, latestMyWhisper, prevHash, height, sharedSecret
                 )
             }
-            sentBlockHashes.add(blk.blockHash)
-            commitOutgoingCoupleBlock(coupleCode, blk)
-            cloudRepo.publishEncryptedBlock(coupleCode, local.myName, blk, pkt)
+            enqueueFromPacket(pkt)
         }
+
+        drainPendingTurnsForRoom(coupleCode)
     }
 
     private suspend fun mergeCloudRoomIntoLocal(cloudRoom: CoupleCloudRoom, uid: String): Boolean = coupleRoomMutex.withLock {
+        if (!LocalVaultCrypto.canSafelyWrite()) return@withLock false
         val existing = repository.getCoupleRoom(cloudRoom.coupleCode)
         val isHostLocal = when {
             existing != null -> existing.isHost
@@ -1246,9 +1377,10 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         val peerPubKey = if (isHostLocal) cloudRoom.partnerPublicKey else cloudRoom.creatorPublicKey
+        val cloudSchema = cloudRoom.schemaVersion.coerceAtLeast(1)
 
         if (existing == null) {
-            val genesis = CoupleBlockchain.createGenesisBlock(cloudRoom.coupleCode, resolvedMyName)
+            val genesis = CoupleBlockchain.createDeterministicGenesisBlock(cloudRoom.coupleCode)
             val initialTtt = TicTacToeSyncState(mySymbol = if (isHostLocal) "X" else "O")
             val created = CoupleRoomRecord(
                 coupleCode = cloudRoom.coupleCode,
@@ -1263,8 +1395,12 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                 peerPublicKeyB64 = peerPubKey,
                 ticTacToeStateJson = CoupleTurnCodec.ticTacToeToJsonString(initialTtt),
                 blockchainLedgerJson = CoupleBlockchain.ledgerToJson(listOf(genesis)),
-                lastBlockHash = genesis.blockHash,
-                blockHeight = 1,
+                lastBlockHash = cloudRoom.latestBlockHash.ifBlank { genesis.blockHash },
+                blockHeight = cloudRoom.blockCount.toInt().coerceAtLeast(1),
+                chainSchemaVersion = cloudSchema,
+                minProtocolVersion = CoupleTurnCodec.PROTOCOL_VERSION_LEGACY_V2,
+                migrationAnchorHash = cloudRoom.migrationAnchorHash,
+                migrationAnchorIndex = cloudRoom.migrationAnchorIndex.toInt(),
                 firewallPassedCount = 1,
                 firewallBlockedCount = 0,
                 lastFirewallEvent = "Protected live bond ready"
@@ -1290,13 +1426,32 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                 existing.ecdhSharedSecretB64
             }
 
+            // Protocol version is independent of DB schemaVersion and NEVER downgrades once ECDH v3 is established
+            val resolvedMinProtocol = maxOf(
+                existing.minProtocolVersion,
+                if (resolvedSharedSecret.isNotBlank()) CoupleTurnCodec.PROTOCOL_VERSION_ECDH_V3 else CoupleTurnCodec.PROTOCOL_VERSION_LEGACY_V2
+            )
+            val resolvedSchema = maxOf(existing.chainSchemaVersion, cloudSchema)
+            val resolvedAnchorHash = cloudRoom.migrationAnchorHash.ifBlank { existing.migrationAnchorHash }
+            val resolvedAnchorIndex = if (cloudRoom.migrationAnchorIndex > 0) {
+                cloudRoom.migrationAnchorIndex.toInt()
+            } else {
+                existing.migrationAnchorIndex
+            }
+
             val partnerChanged = resolvedPartnerName.isNotBlank() && resolvedPartnerName != existing.partnerName
             val lockChanged = isLiveConnected && !existing.partnerLocked
             val spiceChanged = cloudRoom.spiceLevel.isNotBlank() && cloudRoom.spiceLevel != existing.spiceLevel
             val statusChanged = resolvedApprovalStatus != existing.approvalStatus
             val pendingChanged = cloudRoom.pendingPartnerName != existing.pendingPartnerName
-            val ecdhChanged = resolvedPeerPub != existing.peerPublicKeyB64 || resolvedSharedSecret != existing.ecdhSharedSecretB64
-            if (partnerChanged || lockChanged || spiceChanged || statusChanged || pendingChanged || ecdhChanged) {
+            val ecdhChanged = resolvedPeerPub != existing.peerPublicKeyB64 ||
+                resolvedSharedSecret != existing.ecdhSharedSecretB64 ||
+                resolvedMinProtocol != existing.minProtocolVersion
+            val metaChanged = resolvedSchema != existing.chainSchemaVersion ||
+                resolvedAnchorHash != existing.migrationAnchorHash ||
+                resolvedAnchorIndex != existing.migrationAnchorIndex
+
+            if (partnerChanged || lockChanged || spiceChanged || statusChanged || pendingChanged || ecdhChanged || metaChanged) {
                 repository.saveCoupleRoom(
                     existing.copy(
                         partnerName = resolvedPartnerName.ifBlank { existing.partnerName },
@@ -1305,7 +1460,11 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                         approvalStatus = resolvedApprovalStatus,
                         pendingPartnerName = cloudRoom.pendingPartnerName,
                         peerPublicKeyB64 = resolvedPeerPub,
-                        ecdhSharedSecretB64 = resolvedSharedSecret
+                        ecdhSharedSecretB64 = resolvedSharedSecret,
+                        chainSchemaVersion = resolvedSchema,
+                        minProtocolVersion = resolvedMinProtocol,
+                        migrationAnchorHash = resolvedAnchorHash,
+                        migrationAnchorIndex = resolvedAnchorIndex
                     )
                 )
                 if (isHostLocal &&
@@ -1361,7 +1520,7 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                 }
 
                 val genesis = withContext(Dispatchers.Default) {
-                    CoupleBlockchain.createGenesisBlock(reservedCode, cleanName)
+                    CoupleBlockchain.createDeterministicGenesisBlock(reservedCode)
                 }
 
                 coupleRoomMutex.withLock {
@@ -1384,6 +1543,8 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                         blockchainLedgerJson = CoupleBlockchain.ledgerToJson(ledger),
                         lastBlockHash = genesis.blockHash,
                         blockHeight = 1,
+                        chainSchemaVersion = CoupleBlockchain.SCHEMA_VERSION_V2,
+                        minProtocolVersion = CoupleTurnCodec.PROTOCOL_VERSION_LEGACY_V2,
                         firewallPassedCount = 1,
                         firewallBlockedCount = 0,
                         lastFirewallEvent = "Unique zero-knowledge E2EE room reserved"
@@ -1505,7 +1666,12 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                 }
 
                 val genesis = withContext(Dispatchers.Default) {
-                    CoupleBlockchain.createGenesisBlock(cleanCode, cleanName)
+                    CoupleBlockchain.createDeterministicGenesisBlock(cleanCode)
+                }
+                val resolvedMinProtocol = if (derivedSharedSecret.isNotBlank()) {
+                    CoupleTurnCodec.PROTOCOL_VERSION_ECDH_V3
+                } else {
+                    CoupleTurnCodec.PROTOCOL_VERSION_LEGACY_V2
                 }
 
                 coupleRoomMutex.withLock {
@@ -1527,9 +1693,10 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                                 ecdhPrivateKeyB64 = localKeyPair.privateKeyB64,
                                 peerPublicKeyB64 = peerPubKey.ifBlank { existing.peerPublicKeyB64 },
                                 ecdhSharedSecretB64 = derivedSharedSecret.ifBlank { existing.ecdhSharedSecretB64 },
+                                minProtocolVersion = maxOf(existing.minProtocolVersion, resolvedMinProtocol),
                                 blockchainLedgerJson = CoupleBlockchain.ledgerToJson(ledger),
                                 lastBlockHash = ledger.last().blockHash,
-                                blockHeight = ledger.size
+                                blockHeight = maxOf(existing.blockHeight, ledger.size)
                             )
                         )
                     } else {
@@ -1551,6 +1718,8 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                                 ecdhPrivateKeyB64 = localKeyPair.privateKeyB64,
                                 peerPublicKeyB64 = peerPubKey,
                                 ecdhSharedSecretB64 = derivedSharedSecret,
+                                chainSchemaVersion = CoupleBlockchain.SCHEMA_VERSION_V2,
+                                minProtocolVersion = resolvedMinProtocol,
                                 ticTacToeStateJson = CoupleTurnCodec.ticTacToeToJsonString(initialTtt),
                                 blockchainLedgerJson = CoupleBlockchain.ledgerToJson(ledger),
                                 lastBlockHash = genesis.blockHash,
@@ -1625,6 +1794,10 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                         } else {
                             fresh.ecdhSharedSecretB64
                         }
+                        val minProto = maxOf(
+                            fresh.minProtocolVersion,
+                            if (sharedSecret.isNotBlank()) CoupleTurnCodec.PROTOCOL_VERSION_ECDH_V3 else fresh.minProtocolVersion
+                        )
                         repository.saveCoupleRoom(
                             fresh.copy(
                                 partnerName = approved.partnerName.ifBlank { fresh.partnerName },
@@ -1632,7 +1805,8 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                                 approvalStatus = "CONNECTED",
                                 pendingPartnerName = "",
                                 peerPublicKeyB64 = partnerPub,
-                                ecdhSharedSecretB64 = sharedSecret
+                                ecdhSharedSecretB64 = sharedSecret,
+                                minProtocolVersion = minProto
                             )
                         )
                     }
@@ -1731,22 +1905,51 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    private suspend fun commitOutgoingCoupleBlock(coupleCode: String, block: CoupleBlock) {
+    private suspend fun commitOutgoingCoupleBlock(
+        coupleCode: String,
+        block: CoupleBlock,
+        newCloudBlockCount: Long? = null,
+        newSchemaVersion: Int? = null,
+        migrationAnchorHash: String? = null,
+        migrationAnchorIndex: Int? = null
+    ) {
         sentBlockHashes.add(block.blockHash)
         coupleRoomMutex.withLock {
+            if (!LocalVaultCrypto.canSafelyWrite()) return
             val freshRoom = repository.getCoupleRoom(coupleCode) ?: return
             val currentLedger = CoupleBlockchain.ledgerFromJson(freshRoom.blockchainLedgerJson)
-                .ifEmpty { listOf(CoupleBlockchain.createGenesisBlock(freshRoom.coupleCode, freshRoom.myName)) }
-            val updatedLedger = if (currentLedger.any { it.blockHash == block.blockHash }) {
+                .ifEmpty { listOf(CoupleBlockchain.createDeterministicGenesisBlock(freshRoom.coupleCode)) }
+            val combined = if (currentLedger.any { it.blockHash == block.blockHash }) {
                 currentLedger
             } else {
-                (currentLedger + block).takeLast(80)
+                currentLedger + block
             }
+            val pruned = CoupleBlockchain.pruneLedgerWindow(
+                blocks = combined,
+                existingPrunedCount = freshRoom.prunedBlockCount,
+                existingPrunedAnchorHash = freshRoom.prunedAnchorHash
+            )
+            val seenTurnIds = CoupleTurnCodec.stringSetFromJson(freshRoom.seenClientTurnIdsJson).apply {
+                if (block.clientTurnId.isNotBlank()) add(block.clientTurnId)
+            }
+            val seenHashes = CoupleTurnCodec.stringSetFromJson(freshRoom.seenReplayHashesJson).apply {
+                add(block.blockHash)
+            }
+            val resolvedHeight = newCloudBlockCount?.toInt()
+                ?: maxOf(freshRoom.blockHeight, block.index + 1, pruned.retainedBlocks.size + pruned.newlyPrunedCount)
             repository.saveCoupleRoom(
                 freshRoom.copy(
-                    blockchainLedgerJson = CoupleBlockchain.ledgerToJson(updatedLedger),
-                    lastBlockHash = updatedLedger.last().blockHash,
-                    blockHeight = updatedLedger.size,
+                    blockchainLedgerJson = CoupleBlockchain.ledgerToJson(pruned.retainedBlocks),
+                    lastBlockHash = block.blockHash,
+                    blockHeight = resolvedHeight,
+                    chainSchemaVersion = newSchemaVersion?.coerceAtLeast(freshRoom.chainSchemaVersion) ?: freshRoom.chainSchemaVersion,
+                    migrationAnchorHash = migrationAnchorHash?.ifBlank { freshRoom.migrationAnchorHash } ?: freshRoom.migrationAnchorHash,
+                    migrationAnchorIndex = migrationAnchorIndex?.takeIf { it > 0 } ?: freshRoom.migrationAnchorIndex,
+                    prunedBlockCount = pruned.newlyPrunedCount,
+                    prunedAnchorHash = pruned.prunedAnchorHash,
+                    lastConfirmedCloudIndex = maxOf(freshRoom.lastConfirmedCloudIndex, block.index),
+                    seenClientTurnIdsJson = CoupleTurnCodec.stringSetToJson(seenTurnIds, maxSize = 512),
+                    seenReplayHashesJson = CoupleTurnCodec.stringSetToJson(seenHashes, maxSize = CoupleBlockchain.MAX_LOCAL_LEDGER_BLOCKS),
                     firewallPassedCount = freshRoom.firewallPassedCount + 1,
                     lastFirewallEvent = "Protected move #${block.index} verified"
                 )
@@ -1754,27 +1957,155 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    private suspend fun enqueueAndDrainTurnIntent(
+        coupleCode: String,
+        intent: CoupleActivityIntent,
+        triggerCloudDrain: Boolean = true
+    ) {
+        if (!LocalVaultCrypto.canSafelyWrite()) return
+        try {
+            repository.enqueuePendingCoupleTurn(coupleCode, intent)
+        } catch (_: LocalVaultUnavailableException) {
+            return
+        }
+        if (triggerCloudDrain) {
+            drainPendingTurnsForRoom(coupleCode)
+        }
+    }
+
     /**
-     * Automatically commits and transmits an encrypted KRIMOON:BCHAIN: block live over Firestore.
-     * Encryption, PoW mining, and 12-layer protection run silently in the background.
+     * Drains all locally persisted, encrypted [com.example.data.PendingCoupleTurn] entries for [coupleCode]
+     * using atomic Firestore transactions. On any [BlockPublishOutcome.HeadConflict], updates the local head
+     * from Firestore and re-encrypts the activity intent with a brand-new 96-bit AES-GCM nonce & AAD.
+     */
+    private suspend fun drainPendingTurnsForRoom(coupleCode: String) {
+        pendingDrainMutex.withLock {
+            if (!LocalVaultCrypto.canSafelyWrite()) return
+            val uid = _cloudAuthUid.value ?: return
+            val cloudRepo = getCloudRepoOrNull() ?: return
+            val initialRoom = repository.getCoupleRoom(coupleCode) ?: return
+            if (initialRoom.isPassAndPlay || initialRoom.approvalStatus != "CONNECTED") return
+
+            val pendingTurns = repository.getPendingTurnsForRoomOnce(coupleCode)
+            if (pendingTurns.isEmpty()) return
+
+            for (pending in pendingTurns) {
+                if (_cloudAuthUid.value != uid) break
+                val intentResult = repository.decryptPendingIntent(pending)
+                if (intentResult.isFailure) {
+                    repository.markPendingTurnStatus(
+                        turn = pending,
+                        status = "FAILED_PERMANENT",
+                        retryCount = pending.retryCount + 1,
+                        lastError = "Unable to decrypt queued intent"
+                    )
+                    continue
+                }
+                val intent = intentResult.getOrThrow()
+
+                var attempt = 0
+                var resolved = false
+                while (attempt < 5 && !resolved && _cloudAuthUid.value == uid) {
+                    attempt++
+                    val currentRoom = repository.getCoupleRoom(coupleCode) ?: break
+                    if (currentRoom.isPassAndPlay || currentRoom.approvalStatus != "CONNECTED") break
+
+                    val prevHash = currentRoom.lastBlockHash.ifBlank {
+                        CoupleBlockchain.createDeterministicGenesisBlock(coupleCode).blockHash
+                    }
+                    val nextIndex = currentRoom.blockHeight.coerceAtLeast(1)
+
+                    // Always generate a fresh 96-bit AES-GCM nonce and fresh AAD for every rebase/send attempt
+                    val (freshPacket, freshBlock) = withContext(Dispatchers.Default) {
+                        CoupleTurnCodec.sealIntentWithFreshNonce(
+                            coupleCode = coupleCode,
+                            intent = intent,
+                            previousHash = prevHash,
+                            blockIndex = nextIndex,
+                            ecdhSharedSecretB64 = currentRoom.ecdhSharedSecretB64
+                        )
+                    }
+                    sentBlockHashes.add(freshBlock.blockHash)
+
+                    when (val outcome = cloudRepo.publishEncryptedBlockAtomic(coupleCode, intent, freshBlock, freshPacket)) {
+                        is BlockPublishOutcome.Committed -> {
+                            commitOutgoingCoupleBlock(
+                                coupleCode = coupleCode,
+                                block = outcome.block,
+                                newCloudBlockCount = outcome.newCloudBlockCount,
+                                newSchemaVersion = outcome.newSchemaVersion,
+                                migrationAnchorHash = outcome.migrationAnchorHash,
+                                migrationAnchorIndex = outcome.migrationAnchorIndex
+                            )
+                            repository.removePendingTurn(intent.clientTurnId)
+                            resolved = true
+                        }
+                        is BlockPublishOutcome.AlreadyCommittedIdempotent -> {
+                            repository.removePendingTurn(intent.clientTurnId)
+                            resolved = true
+                        }
+                        is BlockPublishOutcome.HeadConflict -> {
+                            // Update local authoritative cloud head and loop to re-seal with a brand-new nonce
+                            coupleRoomMutex.withLock {
+                                repository.getCoupleRoom(coupleCode)?.let { r ->
+                                    repository.saveCoupleRoom(
+                                        r.copy(
+                                            lastBlockHash = outcome.currentCloudLatestHash.ifBlank { r.lastBlockHash },
+                                            blockHeight = outcome.currentCloudBlockCount.toInt().coerceAtLeast(1),
+                                            chainSchemaVersion = maxOf(r.chainSchemaVersion, outcome.currentSchemaVersion),
+                                            migrationAnchorHash = outcome.migrationAnchorHash.ifBlank { r.migrationAnchorHash },
+                                            migrationAnchorIndex = outcome.migrationAnchorIndex.takeIf { it > 0 } ?: r.migrationAnchorIndex
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                        is BlockPublishOutcome.RoomRetired -> {
+                            repository.clearPendingTurnsForRoom(coupleCode)
+                            return
+                        }
+                        is BlockPublishOutcome.Failed -> {
+                            repository.markPendingTurnStatus(
+                                turn = pending,
+                                status = "PENDING",
+                                retryCount = pending.retryCount + 1,
+                                lastError = outcome.error.message ?: "Transient network failure"
+                            )
+                            return
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Persists an outgoing couple move encrypted in the local durable pending queue BEFORE
+     * transmitting atomically to Firestore, ensuring offline resilience and fresh-nonce rebasing.
      */
     fun sendLiveEncryptedTurn(packet: String, block: CoupleBlock) {
         val room = activeCoupleRoom.value ?: return
-        sentBlockHashes.add(block.blockHash)
-        val uid = _cloudAuthUid.value
-        val cloudRepo = if (uid != null && !room.isPassAndPlay) getCloudRepoOrNull() else null
         viewModelScope.launch {
-            commitOutgoingCoupleBlock(room.coupleCode, block)
-            if (cloudRepo != null && uid != null) {
-                val result = cloudRepo.publishEncryptedBlock(
+            if (!LocalVaultCrypto.canSafelyWrite()) {
+                showFeedback("Private vault is locked — cannot save or send move")
+                return@launch
+            }
+            if (room.isPassAndPlay) {
+                commitOutgoingCoupleBlock(room.coupleCode, block)
+                return@launch
+            }
+            val intentResult = withContext(Dispatchers.Default) {
+                CoupleTurnCodec.extractActivityIntent(
+                    rawPacket = packet,
                     coupleCode = room.coupleCode,
-                    senderName = room.myName,
-                    block = block,
-                    encryptedPacket = packet
+                    ecdhSharedSecretB64 = room.ecdhSharedSecretB64
                 )
-                if (result.isFailure && _cloudAuthUid.value == uid) {
-                    showFeedback("Connection hiccup — retrying when online")
-                }
+            }
+            intentResult.onSuccess { intent ->
+                enqueueAndDrainTurnIntent(room.coupleCode, intent, triggerCloudDrain = true)
+            }.onFailure {
+                // Fallback if packet could not be extracted: keep local block commit without crashing
+                commitOutgoingCoupleBlock(room.coupleCode, block)
             }
         }
     }
@@ -1926,302 +2257,294 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         fromCloudLive: Boolean = false
     ) {
         coupleRoomMutex.withLock {
+            if (!LocalVaultCrypto.canSafelyWrite()) return@withLock
             val freshRoom = repository.getCoupleRoom(room.coupleCode) ?: room
             val existingLedger = CoupleBlockchain.ledgerFromJson(freshRoom.blockchainLedgerJson)
-                .ifEmpty { listOf(CoupleBlockchain.createGenesisBlock(freshRoom.coupleCode, freshRoom.myName)) }
+                .ifEmpty { listOf(CoupleBlockchain.createDeterministicGenesisBlock(freshRoom.coupleCode)) }
 
-            // Skip quietly if this block hash is already in our ledger
+            val seenTurnIds = CoupleTurnCodec.stringSetFromJson(freshRoom.seenClientTurnIdsJson)
+            val seenHashes = CoupleTurnCodec.stringSetFromJson(freshRoom.seenReplayHashesJson)
+
+            // Skip quietly if this block hash is already in our ledger or replay ring buffer
             if (isAutoSync) {
                 val peekedHash = CoupleTurnCodec.peekBlockHash(rawPacket)
-                if (peekedHash == null || existingLedger.any { it.blockHash == peekedHash }) {
+                if (peekedHash == null ||
+                    peekedHash in seenHashes ||
+                    existingLedger.any { it.blockHash == peekedHash }
+                ) {
                     return@withLock
                 }
             }
 
-        val lockedPartner = if (freshRoom.partnerLocked && freshRoom.partnerName.isNotBlank()) freshRoom.partnerName else ""
-        val decoded = withContext(Dispatchers.Default) {
-            CoupleTurnCodec.decodePacket(
-                rawInput = rawPacket,
-                expectedCoupleCode = freshRoom.coupleCode,
-                existingLedger = existingLedger,
-                lockedPartnerName = lockedPartner,
-                myName = freshRoom.myName,
-                ecdhSharedSecretB64 = freshRoom.ecdhSharedSecretB64
+            val lockedPartner = if (freshRoom.partnerLocked && freshRoom.partnerName.isNotBlank()) freshRoom.partnerName else ""
+            val effectiveMinProtocol = maxOf(
+                freshRoom.minProtocolVersion,
+                if (freshRoom.ecdhSharedSecretB64.isNotBlank()) CoupleTurnCodec.PROTOCOL_VERSION_ECDH_V3 else CoupleTurnCodec.PROTOCOL_VERSION_LEGACY_V2
             )
-        }
+            val minAcceptedIndex = if (fromCloudLive && freshRoom.lastConfirmedCloudIndex > 0) {
+                freshRoom.lastConfirmedCloudIndex + 1
+            } else {
+                0
+            }
 
-        decoded.onFailure { err ->
-            // Always silently record blocked threats in firewall audit counters
-            val reason = err.message ?: "Blocked invalid packet"
-            repository.saveCoupleRoom(
-                freshRoom.copy(
-                    firewallBlockedCount = freshRoom.firewallBlockedCount + 1,
-                    lastFirewallEvent = reason
+            val decoded = withContext(Dispatchers.Default) {
+                CoupleTurnCodec.decodePacket(
+                    rawInput = rawPacket,
+                    expectedCoupleCode = freshRoom.coupleCode,
+                    existingLedger = existingLedger,
+                    lockedPartnerName = lockedPartner,
+                    myName = freshRoom.myName,
+                    ecdhSharedSecretB64 = freshRoom.ecdhSharedSecretB64,
+                    minProtocolVersion = effectiveMinProtocol,
+                    minAcceptedBlockIndex = minAcceptedIndex,
+                    seenClientTurnIds = seenTurnIds,
+                    seenReplayHashes = seenHashes
                 )
-            )
-            if (!isAutoSync && !fromCloudLive) {
-                showFeedback("Could not verify partner move")
-            }
-        }.onSuccess { packet ->
-            // Never apply our own outgoing block as our partner's turn
-            if ((isAutoSync || fromCloudLive) && packet.senderName.equals(freshRoom.myName.trim(), ignoreCase = true)) {
-                return@onSuccess
             }
 
-            val updatedLedger = (existingLedger + packet.block).distinctBy { it.blockHash }.takeLast(80)
-            val newLastHash = updatedLedger.last().blockHash
-            val newHeight = updatedLedger.size
-            val newPassed = freshRoom.firewallPassedCount + 1
-            val auditMsg = "Verified move #${packet.block.index}"
-
-            when (packet) {
-                is DecodedTurnPacket.BondHandshake -> {
-                    repository.saveCoupleRoom(
-                        freshRoom.copy(
-                            partnerName = packet.senderName,
-                            partnerLocked = true,
-                            isBonded = true,
-                            spiceLevel = packet.spiceLevel.name,
-                            blockchainLedgerJson = CoupleBlockchain.ledgerToJson(updatedLedger),
-                            lastBlockHash = newLastHash,
-                            blockHeight = newHeight,
-                            firewallPassedCount = newPassed,
-                            lastFirewallEvent = auditMsg
-                        )
+            decoded.onFailure { err ->
+                // Always silently record blocked threats in firewall audit counters
+                val reason = err.message ?: "Blocked invalid packet"
+                repository.saveCoupleRoom(
+                    freshRoom.copy(
+                        firewallBlockedCount = freshRoom.firewallBlockedCount + 1,
+                        lastFirewallEvent = reason
                     )
-                    showFeedback("Connected live with ${packet.senderName} ♥")
+                )
+                if (!isAutoSync && !fromCloudLive) {
+                    showFeedback("Could not verify partner move")
                 }
-                is DecodedTurnPacket.UnpairNotice -> {
-                    repository.deleteCoupleRoom(freshRoom.coupleCode)
-                    if (_activeCoupleCode.value == freshRoom.coupleCode) {
-                        _activeCoupleCode.value = null
+            }.onSuccess { packet ->
+                // Never apply our own outgoing block as our partner's turn
+                if ((isAutoSync || fromCloudLive) && packet.senderName.equals(freshRoom.myName.trim(), ignoreCase = true)) {
+                    return@onSuccess
+                }
+
+                val combined = (existingLedger + packet.block).distinctBy { it.blockHash }
+                val pruned = CoupleBlockchain.pruneLedgerWindow(
+                    blocks = combined,
+                    existingPrunedCount = freshRoom.prunedBlockCount,
+                    existingPrunedAnchorHash = freshRoom.prunedAnchorHash
+                )
+                if (packet.block.clientTurnId.isNotBlank()) {
+                    seenTurnIds.add(packet.block.clientTurnId)
+                }
+                seenHashes.add(packet.block.blockHash)
+
+                val newLastHash = pruned.retainedBlocks.last().blockHash
+                val newHeight = maxOf(
+                    freshRoom.blockHeight,
+                    packet.block.index + 1,
+                    pruned.retainedBlocks.size + pruned.newlyPrunedCount
+                )
+                val newLastConfirmedIdx = maxOf(freshRoom.lastConfirmedCloudIndex, packet.block.index)
+                val newPassed = freshRoom.firewallPassedCount + 1
+                val auditMsg = "Verified move #${packet.block.index}"
+
+                val baseUpdatedRoom = freshRoom.copy(
+                    blockchainLedgerJson = CoupleBlockchain.ledgerToJson(pruned.retainedBlocks),
+                    lastBlockHash = newLastHash,
+                    blockHeight = newHeight,
+                    prunedBlockCount = pruned.newlyPrunedCount,
+                    prunedAnchorHash = pruned.prunedAnchorHash,
+                    lastConfirmedCloudIndex = newLastConfirmedIdx,
+                    seenClientTurnIdsJson = CoupleTurnCodec.stringSetToJson(seenTurnIds, maxSize = 512),
+                    seenReplayHashesJson = CoupleTurnCodec.stringSetToJson(seenHashes, maxSize = CoupleBlockchain.MAX_LOCAL_LEDGER_BLOCKS),
+                    firewallPassedCount = newPassed,
+                    lastFirewallEvent = auditMsg
+                )
+
+                when (packet) {
+                    is DecodedTurnPacket.BondHandshake -> {
+                        repository.saveCoupleRoom(
+                            baseUpdatedRoom.copy(
+                                partnerName = packet.senderName,
+                                partnerLocked = true,
+                                isBonded = true,
+                                spiceLevel = packet.spiceLevel.name
+                            )
+                        )
+                        showFeedback("Connected live with ${packet.senderName} ♥")
                     }
-                    userProfile.value?.let { profile ->
-                        if (profile.activeCoupleCode == freshRoom.coupleCode) {
-                            repository.saveProfile(profile.copy(activeCoupleCode = ""))
+                    is DecodedTurnPacket.UnpairNotice -> {
+                        repository.deleteCoupleRoom(freshRoom.coupleCode)
+                        if (_activeCoupleCode.value == freshRoom.coupleCode) {
+                            _activeCoupleCode.value = null
+                        }
+                        userProfile.value?.let { profile ->
+                            if (profile.activeCoupleCode == freshRoom.coupleCode) {
+                                repository.saveProfile(profile.copy(activeCoupleCode = ""))
+                            }
+                        }
+                        showFeedback("${packet.senderName} ended the couple room")
+                    }
+                    is DecodedTurnPacket.QuizTurn -> {
+                        val current = CoupleTurnCodec.roundStateFromJson(freshRoom.quizStateJson)
+                        if (packet.roundIndex < current.roundIndex) {
+                            repository.saveCoupleRoom(baseUpdatedRoom)
+                            return@onSuccess
+                        }
+                        val updated = if (current.roundIndex == packet.roundIndex) {
+                            current.copy(partnerChoice = packet.choiceIndex, partnerName = packet.senderName)
+                        } else {
+                            RoundSyncState(
+                                roundIndex = packet.roundIndex,
+                                myChoice = null,
+                                partnerChoice = packet.choiceIndex,
+                                partnerName = packet.senderName,
+                                history = current.history
+                            )
+                        }
+                        val newlyRevealed = current.partnerChoice == null &&
+                            updated.myChoice != null &&
+                            updated.partnerChoice != null
+                        val isMatch = newlyRevealed && updated.myChoice == updated.partnerChoice
+                        repository.saveCoupleRoom(
+                            baseUpdatedRoom.copy(
+                                partnerName = packet.senderName,
+                                partnerLocked = true,
+                                isBonded = true,
+                                spiceLevel = packet.spiceLevel.name,
+                                quizStateJson = CoupleTurnCodec.roundStateToJson(updated),
+                                matchCount = freshRoom.matchCount + if (isMatch) 1 else 0,
+                                streakCount = freshRoom.streakCount + if (isMatch) 1 else 0
+                            )
+                        )
+                        showFeedback("${packet.senderName} answered Couple Quiz 💋")
+                    }
+                    is DecodedTurnPacket.WyrTurn -> {
+                        val current = CoupleTurnCodec.roundStateFromJson(freshRoom.wyrStateJson)
+                        if (packet.roundIndex < current.roundIndex) {
+                            repository.saveCoupleRoom(baseUpdatedRoom)
+                            return@onSuccess
+                        }
+                        val updated = if (current.roundIndex == packet.roundIndex) {
+                            current.copy(partnerChoice = packet.choiceIndex, partnerName = packet.senderName)
+                        } else {
+                            RoundSyncState(
+                                roundIndex = packet.roundIndex,
+                                myChoice = null,
+                                partnerChoice = packet.choiceIndex,
+                                partnerName = packet.senderName,
+                                history = current.history
+                            )
+                        }
+                        val newlyRevealed = current.partnerChoice == null &&
+                            updated.myChoice != null &&
+                            updated.partnerChoice != null
+                        val isMatch = newlyRevealed && updated.myChoice == updated.partnerChoice
+                        repository.saveCoupleRoom(
+                            baseUpdatedRoom.copy(
+                                partnerName = packet.senderName,
+                                partnerLocked = true,
+                                isBonded = true,
+                                spiceLevel = packet.spiceLevel.name,
+                                wyrStateJson = CoupleTurnCodec.roundStateToJson(updated),
+                                matchCount = freshRoom.matchCount + if (isMatch) 1 else 0,
+                                streakCount = freshRoom.streakCount + if (isMatch) 1 else 0
+                            )
+                        )
+                        showFeedback("${packet.senderName} picked Would You Rather 🔥")
+                    }
+                    is DecodedTurnPacket.DoodleTurn -> {
+                        val existing = CoupleTurnCodec.strokesFromJsonString(freshRoom.doodleStrokesJson)
+                        val merged = (existing + packet.strokes).distinct().takeLast(120)
+                        repository.saveCoupleRoom(
+                            baseUpdatedRoom.copy(
+                                partnerName = packet.senderName,
+                                partnerLocked = true,
+                                isBonded = true,
+                                doodlePrompt = packet.prompt.ifBlank { freshRoom.doodlePrompt },
+                                doodleStrokesJson = CoupleTurnCodec.strokesToJsonString(merged)
+                            )
+                        )
+                        if (!fromCloudLive) {
+                            showFeedback("New doodle from ${packet.senderName} 🎨")
                         }
                     }
-                    showFeedback("${packet.senderName} ended the couple room")
-                }
-                is DecodedTurnPacket.QuizTurn -> {
-                    val current = CoupleTurnCodec.roundStateFromJson(freshRoom.quizStateJson)
-                    // Never rewind to an older completed round if a delayed block arrives
-                    if (packet.roundIndex < current.roundIndex) {
+                    is DecodedTurnPacket.TicTacToeTurn -> {
+                        val flippedSymbol = if (packet.state.mySymbol == "X") "O" else "X"
+                        val synced = packet.state.copy(mySymbol = flippedSymbol)
                         repository.saveCoupleRoom(
-                            freshRoom.copy(
-                                blockchainLedgerJson = CoupleBlockchain.ledgerToJson(updatedLedger),
-                                lastBlockHash = newLastHash,
-                                blockHeight = newHeight,
-                                firewallPassedCount = newPassed,
-                                lastFirewallEvent = auditMsg
+                            baseUpdatedRoom.copy(
+                                partnerName = packet.senderName,
+                                partnerLocked = true,
+                                isBonded = true,
+                                ticTacToeStateJson = CoupleTurnCodec.ticTacToeToJsonString(synced)
                             )
                         )
-                        return@onSuccess
+                        showFeedback("${packet.senderName} played Tic-Tac-Toe ⚡")
                     }
-                    val updated = if (current.roundIndex == packet.roundIndex) {
-                        current.copy(partnerChoice = packet.choiceIndex, partnerName = packet.senderName)
-                    } else {
-                        RoundSyncState(
-                            roundIndex = packet.roundIndex,
-                            myChoice = null,
-                            partnerChoice = packet.choiceIndex,
-                            partnerName = packet.senderName,
-                            history = current.history
-                        )
-                    }
-                    val newlyRevealed = current.partnerChoice == null &&
-                        updated.myChoice != null &&
-                        updated.partnerChoice != null
-                    val isMatch = newlyRevealed && updated.myChoice == updated.partnerChoice
-                    repository.saveCoupleRoom(
-                        freshRoom.copy(
-                            partnerName = packet.senderName,
-                            partnerLocked = true,
-                            isBonded = true,
-                            spiceLevel = packet.spiceLevel.name,
-                            quizStateJson = CoupleTurnCodec.roundStateToJson(updated),
-                            matchCount = freshRoom.matchCount + if (isMatch) 1 else 0,
-                            streakCount = freshRoom.streakCount + if (isMatch) 1 else 0,
-                            blockchainLedgerJson = CoupleBlockchain.ledgerToJson(updatedLedger),
-                            lastBlockHash = newLastHash,
-                            blockHeight = newHeight,
-                            firewallPassedCount = newPassed,
-                            lastFirewallEvent = auditMsg
-                        )
-                    )
-                    showFeedback("${packet.senderName} answered Couple Quiz 💋")
-                }
-                is DecodedTurnPacket.WyrTurn -> {
-                    val current = CoupleTurnCodec.roundStateFromJson(freshRoom.wyrStateJson)
-                    if (packet.roundIndex < current.roundIndex) {
+                    is DecodedTurnPacket.DareTurn -> {
+                        val prev = CoupleActivitiesDeck.dareStateFromJson(freshRoom.dareStateJson)
+                        val newlyCompleted = packet.state.status == "COMPLETED" && prev.status != "COMPLETED"
                         repository.saveCoupleRoom(
-                            freshRoom.copy(
-                                blockchainLedgerJson = CoupleBlockchain.ledgerToJson(updatedLedger),
-                                lastBlockHash = newLastHash,
-                                blockHeight = newHeight,
-                                firewallPassedCount = newPassed,
-                                lastFirewallEvent = auditMsg
+                            baseUpdatedRoom.copy(
+                                partnerName = packet.senderName,
+                                partnerLocked = true,
+                                isBonded = true,
+                                dareStateJson = CoupleActivitiesDeck.dareStateToJson(packet.state),
+                                streakCount = freshRoom.streakCount + if (newlyCompleted) 1 else 0
                             )
                         )
-                        return@onSuccess
+                        val verb = if (packet.state.status == "COMPLETED") "completed the challenge" else "sent a Truth or Dare"
+                        showFeedback("${packet.senderName} $verb 🎲")
                     }
-                    val updated = if (current.roundIndex == packet.roundIndex) {
-                        current.copy(partnerChoice = packet.choiceIndex, partnerName = packet.senderName)
-                    } else {
-                        RoundSyncState(
-                            roundIndex = packet.roundIndex,
-                            myChoice = null,
-                            partnerChoice = packet.choiceIndex,
-                            partnerName = packet.senderName,
-                            history = current.history
+                    is DecodedTurnPacket.WavelengthTurn -> {
+                        val prev = CoupleActivitiesDeck.wavelengthStateFromJson(freshRoom.wavelengthStateJson)
+                        val newlyMatched = packet.state.phase == "REVEAL" &&
+                            prev.phase != "REVEAL" &&
+                            packet.state.lastScore >= 60
+                        repository.saveCoupleRoom(
+                            baseUpdatedRoom.copy(
+                                partnerName = packet.senderName,
+                                partnerLocked = true,
+                                isBonded = true,
+                                wavelengthStateJson = CoupleActivitiesDeck.wavelengthStateToJson(packet.state),
+                                matchCount = freshRoom.matchCount + if (newlyMatched) 1 else 0,
+                                streakCount = freshRoom.streakCount + if (newlyMatched) 1 else 0
+                            )
                         )
+                        showFeedback("${packet.senderName} updated Heart Wavelength 🌊")
                     }
-                    val newlyRevealed = current.partnerChoice == null &&
-                        updated.myChoice != null &&
-                        updated.partnerChoice != null
-                    val isMatch = newlyRevealed && updated.myChoice == updated.partnerChoice
-                    repository.saveCoupleRoom(
-                        freshRoom.copy(
-                            partnerName = packet.senderName,
-                            partnerLocked = true,
-                            isBonded = true,
-                            spiceLevel = packet.spiceLevel.name,
-                            wyrStateJson = CoupleTurnCodec.roundStateToJson(updated),
-                            matchCount = freshRoom.matchCount + if (isMatch) 1 else 0,
-                            streakCount = freshRoom.streakCount + if (isMatch) 1 else 0,
-                            blockchainLedgerJson = CoupleBlockchain.ledgerToJson(updatedLedger),
-                            lastBlockHash = newLastHash,
-                            blockHeight = newHeight,
-                            firewallPassedCount = newPassed,
-                            lastFirewallEvent = auditMsg
+                    is DecodedTurnPacket.WhisperTurn -> {
+                        val current = CoupleActivitiesDeck.dateWhisperStateFromJson(freshRoom.whisperStateJson)
+                        val updatedPartnerLikes = if (packet.likedDateId.isNotBlank()) {
+                            current.partnerLikedIds + packet.likedDateId
+                        } else {
+                            current.partnerLikedIds
+                        }
+                        val isNewDateMatch = packet.likedDateId.isNotBlank() &&
+                            packet.likedDateId in current.myLikedIds &&
+                            packet.likedDateId !in current.partnerLikedIds
+                        val incomingNote = packet.whisperNote
+                        val updatedWhispers = if (incomingNote != null && current.whispers.none { it.id == incomingNote.id }) {
+                            (current.whispers + incomingNote.copy(isRevealed = false)).takeLast(24)
+                        } else {
+                            current.whispers
+                        }
+                        val merged = current.copy(
+                            partnerLikedIds = updatedPartnerLikes,
+                            whispers = updatedWhispers
                         )
-                    )
-                    showFeedback("${packet.senderName} picked Would You Rather 🔥")
-                }
-                is DecodedTurnPacket.DoodleTurn -> {
-                    val existing = CoupleTurnCodec.strokesFromJsonString(freshRoom.doodleStrokesJson)
-                    val merged = (existing + packet.strokes).distinct().takeLast(120)
-                    repository.saveCoupleRoom(
-                        freshRoom.copy(
-                            partnerName = packet.senderName,
-                            partnerLocked = true,
-                            isBonded = true,
-                            doodlePrompt = packet.prompt.ifBlank { freshRoom.doodlePrompt },
-                            doodleStrokesJson = CoupleTurnCodec.strokesToJsonString(merged),
-                            blockchainLedgerJson = CoupleBlockchain.ledgerToJson(updatedLedger),
-                            lastBlockHash = newLastHash,
-                            blockHeight = newHeight,
-                            firewallPassedCount = newPassed,
-                            lastFirewallEvent = auditMsg
+                        repository.saveCoupleRoom(
+                            baseUpdatedRoom.copy(
+                                partnerName = packet.senderName,
+                                partnerLocked = true,
+                                isBonded = true,
+                                whisperStateJson = CoupleActivitiesDeck.dateWhisperStateToJson(merged),
+                                matchCount = freshRoom.matchCount + if (isNewDateMatch) 1 else 0,
+                                streakCount = freshRoom.streakCount + if (isNewDateMatch) 1 else 0
+                            )
                         )
-                    )
-                    if (!fromCloudLive) {
-                        showFeedback("New doodle from ${packet.senderName} 🎨")
-                    }
-                }
-                is DecodedTurnPacket.TicTacToeTurn -> {
-                    val flippedSymbol = if (packet.state.mySymbol == "X") "O" else "X"
-                    val synced = packet.state.copy(mySymbol = flippedSymbol)
-                    repository.saveCoupleRoom(
-                        freshRoom.copy(
-                            partnerName = packet.senderName,
-                            partnerLocked = true,
-                            isBonded = true,
-                            ticTacToeStateJson = CoupleTurnCodec.ticTacToeToJsonString(synced),
-                            blockchainLedgerJson = CoupleBlockchain.ledgerToJson(updatedLedger),
-                            lastBlockHash = newLastHash,
-                            blockHeight = newHeight,
-                            firewallPassedCount = newPassed,
-                            lastFirewallEvent = auditMsg
-                        )
-                    )
-                    showFeedback("${packet.senderName} played Tic-Tac-Toe ⚡")
-                }
-                is DecodedTurnPacket.DareTurn -> {
-                    val prev = CoupleActivitiesDeck.dareStateFromJson(freshRoom.dareStateJson)
-                    val newlyCompleted = packet.state.status == "COMPLETED" && prev.status != "COMPLETED"
-                    repository.saveCoupleRoom(
-                        freshRoom.copy(
-                            partnerName = packet.senderName,
-                            partnerLocked = true,
-                            isBonded = true,
-                            dareStateJson = CoupleActivitiesDeck.dareStateToJson(packet.state),
-                            streakCount = freshRoom.streakCount + if (newlyCompleted) 1 else 0,
-                            blockchainLedgerJson = CoupleBlockchain.ledgerToJson(updatedLedger),
-                            lastBlockHash = newLastHash,
-                            blockHeight = newHeight,
-                            firewallPassedCount = newPassed,
-                            lastFirewallEvent = auditMsg
-                        )
-                    )
-                    val verb = if (packet.state.status == "COMPLETED") "completed the challenge" else "sent a Truth or Dare"
-                    showFeedback("${packet.senderName} $verb 🎲")
-                }
-                is DecodedTurnPacket.WavelengthTurn -> {
-                    val prev = CoupleActivitiesDeck.wavelengthStateFromJson(freshRoom.wavelengthStateJson)
-                    val newlyMatched = packet.state.phase == "REVEAL" &&
-                        prev.phase != "REVEAL" &&
-                        packet.state.lastScore >= 60
-                    repository.saveCoupleRoom(
-                        freshRoom.copy(
-                            partnerName = packet.senderName,
-                            partnerLocked = true,
-                            isBonded = true,
-                            wavelengthStateJson = CoupleActivitiesDeck.wavelengthStateToJson(packet.state),
-                            matchCount = freshRoom.matchCount + if (newlyMatched) 1 else 0,
-                            streakCount = freshRoom.streakCount + if (newlyMatched) 1 else 0,
-                            blockchainLedgerJson = CoupleBlockchain.ledgerToJson(updatedLedger),
-                            lastBlockHash = newLastHash,
-                            blockHeight = newHeight,
-                            firewallPassedCount = newPassed,
-                            lastFirewallEvent = auditMsg
-                        )
-                    )
-                    showFeedback("${packet.senderName} updated Heart Wavelength 🌊")
-                }
-                is DecodedTurnPacket.WhisperTurn -> {
-                    val current = CoupleActivitiesDeck.dateWhisperStateFromJson(freshRoom.whisperStateJson)
-                    val updatedPartnerLikes = if (packet.likedDateId.isNotBlank()) {
-                        current.partnerLikedIds + packet.likedDateId
-                    } else {
-                        current.partnerLikedIds
-                    }
-                    val isNewDateMatch = packet.likedDateId.isNotBlank() &&
-                        packet.likedDateId in current.myLikedIds &&
-                        packet.likedDateId !in current.partnerLikedIds
-                    val incomingNote = packet.whisperNote
-                    val updatedWhispers = if (incomingNote != null && current.whispers.none { it.id == incomingNote.id }) {
-                        (current.whispers + incomingNote.copy(isRevealed = false)).takeLast(24)
-                    } else {
-                        current.whispers
-                    }
-                    val merged = current.copy(
-                        partnerLikedIds = updatedPartnerLikes,
-                        whispers = updatedWhispers
-                    )
-                    repository.saveCoupleRoom(
-                        freshRoom.copy(
-                            partnerName = packet.senderName,
-                            partnerLocked = true,
-                            isBonded = true,
-                            whisperStateJson = CoupleActivitiesDeck.dateWhisperStateToJson(merged),
-                            matchCount = freshRoom.matchCount + if (isNewDateMatch) 1 else 0,
-                            streakCount = freshRoom.streakCount + if (isNewDateMatch) 1 else 0,
-                            blockchainLedgerJson = CoupleBlockchain.ledgerToJson(updatedLedger),
-                            lastBlockHash = newLastHash,
-                            blockHeight = newHeight,
-                            firewallPassedCount = newPassed,
-                            lastFirewallEvent = auditMsg
-                        )
-                    )
-                    when {
-                        isNewDateMatch -> showFeedback("It's a Date Night Match with ${packet.senderName} 💞")
-                        incomingNote != null -> showFeedback("New Secret Whisper from ${packet.senderName} 💌")
-                        else -> showFeedback("${packet.senderName} voted on a Date Night ✨")
+                        when {
+                            isNewDateMatch -> showFeedback("It's a Date Night Match with ${packet.senderName} 💞")
+                            incomingNote != null -> showFeedback("New Secret Whisper from ${packet.senderName} 💌")
+                            else -> showFeedback("${packet.senderName} voted on a Date Night ✨")
+                        }
                     }
                 }
             }
-        }
         }
     }
 
