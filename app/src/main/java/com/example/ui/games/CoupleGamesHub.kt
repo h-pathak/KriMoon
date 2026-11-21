@@ -1,16 +1,20 @@
 package com.example.ui.games
 
+import android.content.ClipData
+import android.content.ClipDescription
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
+import android.os.Build
+import android.os.PersistableBundle
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -20,6 +24,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreHoriz
@@ -42,6 +48,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -54,11 +61,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -73,8 +78,8 @@ import com.example.cloud.signOutGoogle
 import com.example.data.CoupleRoomRecord
 import com.example.model.CoupleTurnCodec
 import com.example.model.SpiceLevel
+import com.example.ui.components.AestheticHaptics
 import com.example.ui.components.cute3DCard
-import com.example.ui.components.cuteBouncyClick
 import com.example.ui.theme.PhasesPlum
 import com.example.ui.theme.PhasesRose
 import com.example.ui.theme.PhasesSage
@@ -93,6 +98,34 @@ private val VelvetTextMuted = Color(0xFFD8B8C8)
 private val LiveEmerald = Color(0xFF34D399)
 private val WaitingAmber = Color(0xFFFBBF24)
 
+// Gate silent CredentialManager auto-sign-in to at most once per app process launch
+private var hasAttemptedSessionAutoSignIn = false
+
+@Immutable
+data class CoupleLoungeUiState(
+    val coupleRooms: List<CoupleRoomRecord> = emptyList(),
+    val activeRoom: CoupleRoomRecord? = null,
+    val cloudAuthUid: String? = null,
+    val cloudSyncStatus: String = "SIGNED_OUT",
+    val isCloudBusy: Boolean = false
+)
+
+@Immutable
+data class CoupleLoungeActions(
+    val onCloudUserChanged: (uid: String?, displayName: String?) -> Unit = { _, _ -> },
+    val onDetachCloudListeners: () -> Unit = {},
+    val onRetryCloudSync: () -> Unit = {},
+    val onCreateUniqueRoom: (name: String) -> Unit = {},
+    val onRequestJoinRoom: (name: String, code: String) -> Unit = { _, _ -> },
+    val onApprovePendingPartner: (code: String) -> Unit = {},
+    val onDeclinePendingPartner: (code: String) -> Unit = {},
+    val onSelectRoom: (code: String) -> Unit = {},
+    val onDeleteRoom: (code: String) -> Unit = {},
+    val onUpdateSpiceLevel: (SpiceLevel) -> Unit = {},
+    val onTogglePassAndPlay: (Boolean) -> Unit = {},
+    val onShowFeedback: (String) -> Unit = {}
+)
+
 enum class CoupleGameType(
     val title: String,
     val emoji: String,
@@ -102,43 +135,41 @@ enum class CoupleGameType(
     DOODLE("Co-op Doodle", "🎨", "Draw together live on one canvas", PhasesRose),
     QUIZ("Couple Quiz", "💋", "Lock your answers, reveal together", PhasesPlum),
     WYR("Would You Rather", "🔥", "Playful & steamy dilemmas", Color(0xFFE11D68)),
-    TIC_TAC_TOE("Tic-Tac-Toe+", "⚡", "Classic & 3-piece Bolt showdown", PhasesSage)
+    TIC_TAC_TOE("Tic-Tac-Toe+", "⚡", "Classic & 3-piece Bolt showdown", PhasesSage),
+    TRUTH_OR_DARE("Truth or Dare", "🎲", "Velvet prompts matched to your vibe", Color(0xFFEC4899)),
+    WAVELENGTH("Heart Wavelength", "🌊", "Tune the dial to read each other's mind", Color(0xFFA855F7)),
+    DATE_WHISPERS("Date & Whispers", "💌", "Match date ideas & unlock sealed notes", Color(0xFFF43F5E))
 }
 
 @Composable
 fun CoupleGamesHub(
     defaultUserName: String,
-    coupleRooms: List<CoupleRoomRecord>,
-    activeRoom: CoupleRoomRecord?,
-    cloudAuthUid: String?,
-    cloudSyncStatus: String,
-    isCloudBusy: Boolean,
-    onCloudUserChanged: (uid: String?, displayName: String?) -> Unit,
-    onDetachCloudListeners: () -> Unit,
-    onRetryCloudSync: () -> Unit = {},
-    onCreateOrJoinRoom: (name: String, code: String) -> Unit,
-    onSelectRoom: (code: String) -> Unit,
-    onDeleteRoom: (code: String) -> Unit,
-    onUpdateSpiceLevel: (SpiceLevel) -> Unit,
-    onTogglePassAndPlay: (Boolean) -> Unit,
-    onShowFeedback: (String) -> Unit,
+    loungeState: CoupleLoungeUiState,
+    actions: CoupleLoungeActions,
     onLaunchCoupleGame: (CoupleGameType) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    showActivityGrid: Boolean = true
 ) {
     val context = LocalContext.current
-    val clipboard = LocalClipboardManager.current
     val haptic = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
-    val credentialManager = remember(context) { CredentialManager.create(context) }
+    // Lazily instantiate CredentialManager only when an auth call is actually invoked
+    val credentialManagerHolder = remember(context) { arrayOfNulls<CredentialManager>(1) }
+    fun getCredentialManager(): CredentialManager {
+        return credentialManagerHolder[0] ?: CredentialManager.create(context).also {
+            credentialManagerHolder[0] = it
+        }
+    }
 
-    val isSignedIn = !cloudAuthUid.isNullOrBlank()
-    val firebaseDisplayName = remember(cloudAuthUid) {
-        runCatching { Firebase.auth.currentUser?.displayName }.getOrNull()
+    val activeRoom = loungeState.activeRoom
+    val isSignedIn = !loungeState.cloudAuthUid.isNullOrBlank()
+    val firebaseDisplayName = remember(loungeState.cloudAuthUid) {
+        if (loungeState.cloudAuthUid.isNullOrBlank()) null
+        else runCatching { Firebase.auth.currentUser?.displayName }.getOrNull()
     }
 
     var isSigningIn by remember { mutableStateOf(false) }
     var bypassAuthForLocalPlay by remember { mutableStateOf(false) }
-    var showOverflowMenu by remember { mutableStateOf(false) }
     var showRemovePartnerDialog by remember { mutableStateOf(false) }
 
     LaunchedEffect(isSignedIn) {
@@ -147,14 +178,17 @@ fun CoupleGamesHub(
         }
     }
 
-    // Attempt silent auto sign-in once when unauthenticated
+    val isAuthGated = !isSignedIn && !bypassAuthForLocalPlay && activeRoom?.isPassAndPlay != true
+
+    // Attempt silent auto sign-in at most once per app launch to avoid repeated CredMan IPC
     LaunchedEffect(Unit) {
-        if (!isSignedIn) {
+        if (!isSignedIn && !hasAttemptedSessionAutoSignIn) {
+            hasAttemptedSessionAutoSignIn = true
             attemptAutoSignIn(
                 context = context,
-                credentialManager = credentialManager,
+                credentialManager = getCredentialManager(),
                 onAuthSuccess = { user ->
-                    onCloudUserChanged(user?.uid, user?.displayName)
+                    actions.onCloudUserChanged(user?.uid, user?.displayName)
                 },
                 onUnauthenticated = { },
                 scope = scope
@@ -162,8 +196,8 @@ fun CoupleGamesHub(
         }
     }
 
-    // If user is not signed in and not explicitly using local Pass & Play, show sleek Velvet Auth Gate
-    if (!isSignedIn && !bypassAuthForLocalPlay && activeRoom?.isPassAndPlay != true) {
+    // Sleek Velvet Auth Gate if not signed in and not using local Pass & Play
+    if (isAuthGated) {
         CoupleAuthGateCard(
             isSigningIn = isSigningIn,
             hasLocalRoom = activeRoom != null,
@@ -171,15 +205,15 @@ fun CoupleGamesHub(
                 isSigningIn = true
                 onGoogleSignInClicked(
                     context = context,
-                    credentialManager = credentialManager,
+                    credentialManager = getCredentialManager(),
                     onAuthSuccess = { user ->
                         isSigningIn = false
-                        onCloudUserChanged(user?.uid, user?.displayName)
-                        onShowFeedback("Signed in — ready to connect live ♥")
+                        actions.onCloudUserChanged(user?.uid, user?.displayName)
+                        actions.onShowFeedback("Signed in — ready to connect live ♥")
                     },
                     onAuthError = { err ->
                         isSigningIn = false
-                        onShowFeedback(err)
+                        actions.onShowFeedback(err)
                     },
                     onAuthCancelled = {
                         isSigningIn = false
@@ -190,7 +224,7 @@ fun CoupleGamesHub(
             onPlayOfflineSinglePhone = {
                 bypassAuthForLocalPlay = true
                 if (activeRoom != null) {
-                    onTogglePassAndPlay(true)
+                    actions.onTogglePassAndPlay(true)
                 }
             },
             modifier = modifier
@@ -202,433 +236,611 @@ fun CoupleGamesHub(
         CouplePairingCard(
             defaultUserName = firebaseDisplayName?.substringBefore(" ")?.takeIf { it.isNotBlank() }
                 ?: defaultUserName,
-            existingRooms = coupleRooms,
+            existingRooms = loungeState.coupleRooms,
             isSignedIn = isSignedIn,
-            isBusy = isCloudBusy,
-            onCreateOrJoin = { name, code ->
-                onCreateOrJoinRoom(name, code)
-            },
-            onSelectRoom = onSelectRoom,
+            isBusy = loungeState.isCloudBusy,
+            onCreateUniqueRoom = actions.onCreateUniqueRoom,
+            onRequestJoinRoom = actions.onRequestJoinRoom,
+            onSelectRoom = actions.onSelectRoom,
             modifier = modifier
         )
         return
     }
 
-    val currentSpice = runCatching { SpiceLevel.valueOf(activeRoom.spiceLevel) }.getOrDefault(SpiceLevel.FLIRTY)
-    val isLive = !activeRoom.isPassAndPlay && isSignedIn && cloudSyncStatus == "LIVE"
-    val isOffline = !activeRoom.isPassAndPlay && isSignedIn && cloudSyncStatus == "OFFLINE"
-    val isConnecting = !activeRoom.isPassAndPlay && isSignedIn && cloudSyncStatus == "CONNECTING"
-    val partnerDisplay = activeRoom.partnerName.takeIf { it.isNotBlank() }
+    // Secondary Confirmation Gate: Partner 2 waits here until the Room Host explicitly taps Allow
+    if (!activeRoom.isPassAndPlay && activeRoom.approvalStatus == "PENDING_HOST_APPROVAL") {
+        WaitingForHostApprovalCard(
+            room = activeRoom,
+            isBusy = loungeState.isCloudBusy,
+            onCancelRequest = {
+                AestheticHaptics.softTick(context, haptic)
+                actions.onDeclinePendingPartner(activeRoom.coupleCode)
+            },
+            modifier = modifier
+        )
+        return
+    }
+
+    val hasPendingHostApproval = !activeRoom.isPassAndPlay &&
+        activeRoom.approvalStatus == "AWAITING_MY_APPROVAL" &&
+        activeRoom.pendingPartnerName.isNotBlank()
 
     Column(
         modifier = modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // Midnight Rose Velvet Header Card — clean, hot & minimal
-        Card(
-            shape = RoundedCornerShape(28.dp),
-            colors = CardDefaults.cardColors(containerColor = VelvetBgTop),
-            border = BorderStroke(1.dp, VelvetBorder),
-            modifier = Modifier
-                .fillMaxWidth()
-                .cute3DCard(maxTilt = 2.5f, cornerRadius = 28.dp)
-                .testTag("couple_room_header")
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(
-                        Brush.verticalGradient(listOf(VelvetBgTop, VelvetBgBottom))
-                    )
-                    .background(
-                        Brush.radialGradient(
-                            colors = listOf(VelvetRoseGlow.copy(alpha = 0.22f), Color.Transparent),
-                            radius = 520f
-                        )
-                    )
-                    .padding(horizontal = 20.dp, vertical = 18.dp)
-            ) {
-                Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                    // Top Row: Live Presence Dot + Tiny Lock Badge + Overflow Menu
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            // Presence pill
-                            val dotColor = when {
-                                activeRoom.isPassAndPlay -> Color(0xFFF472B6)
-                                isLive -> LiveEmerald
-                                isOffline -> Color(0xFFFB7185)
-                                else -> WaitingAmber
-                            }
-                            val statusLabel = when {
-                                activeRoom.isPassAndPlay -> "1 Phone"
-                                isLive -> "Live"
-                                !isSignedIn -> "Sign in to sync"
-                                isOffline -> "Offline · Retry"
-                                isConnecting -> "Connecting…"
-                                else -> "Waiting"
-                            }
-                            val pillActionable = (!isSignedIn && !activeRoom.isPassAndPlay) || isOffline
-                            Surface(
-                                shape = RoundedCornerShape(100.dp),
-                                color = Color.White.copy(alpha = 0.08f),
-                                border = BorderStroke(0.8.dp, dotColor.copy(alpha = 0.45f)),
-                                modifier = Modifier.clickable(enabled = pillActionable) {
-                                    if (!isSignedIn) {
-                                        bypassAuthForLocalPlay = false
-                                    } else if (isOffline) {
-                                        onRetryCloudSync()
-                                    }
-                                }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(7.dp)
-                                            .clip(CircleShape)
-                                            .background(dotColor)
-                                    )
-                                    Text(
-                                        text = statusLabel,
-                                        style = MaterialTheme.typography.labelSmall.copy(
-                                            fontWeight = FontWeight.SemiBold,
-                                            letterSpacing = 0.3.sp
-                                        ),
-                                        color = VelvetTextPrimary
-                                    )
-                                }
-                            }
-
-                            // Tiny silent lock badge (always-on protection, zero clutter)
-                            Surface(
-                                shape = CircleShape,
-                                color = Color.White.copy(alpha = 0.08f),
-                                border = BorderStroke(0.8.dp, VelvetBorder),
-                                modifier = Modifier
-                                    .size(26.dp)
-                                    .testTag("silent_lock_badge")
-                            ) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Icon(
-                                        imageVector = Icons.Default.Lock,
-                                        contentDescription = "Always-on private protection",
-                                        tint = Color(0xFFF9A8D4),
-                                        modifier = Modifier.size(13.dp)
-                                    )
-                                }
-                            }
-                        }
-
-                        // Discrete overflow menu
-                        Box {
-                            IconButton(
-                                onClick = { showOverflowMenu = true },
-                                modifier = Modifier
-                                    .size(36.dp)
-                                    .testTag("couple_room_menu_btn")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.MoreHoriz,
-                                    contentDescription = "Room options",
-                                    tint = VelvetTextMuted
-                                )
-                            }
-                            DropdownMenu(
-                                expanded = showOverflowMenu,
-                                onDismissRequest = { showOverflowMenu = false }
-                            ) {
-                                DropdownMenuItem(
-                                    text = {
-                                        Text(
-                                            if (activeRoom.isPassAndPlay) "Switch to 2-Phone Live"
-                                            else "Switch to Pass & Play (1 Phone)"
-                                        )
-                                    },
-                                    onClick = {
-                                        showOverflowMenu = false
-                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                        onTogglePassAndPlay(!activeRoom.isPassAndPlay)
-                                    },
-                                    modifier = Modifier.testTag("pass_and_play_switch")
-                                )
-                                if (isSignedIn) {
-                                    DropdownMenuItem(
-                                        text = { Text("Sign Out Google") },
-                                        onClick = {
-                                            showOverflowMenu = false
-                                            signOutGoogle(
-                                                credentialManager = credentialManager,
-                                                scope = scope,
-                                                onBeforeSignOut = onDetachCloudListeners,
-                                                onSignOutComplete = {
-                                                    onCloudUserChanged(null, null)
-                                                    onShowFeedback("Signed out")
-                                                }
-                                            )
-                                        }
-                                    )
-                                } else {
-                                    DropdownMenuItem(
-                                        text = { Text("Sign In for 2-Phone Live") },
-                                        onClick = {
-                                            showOverflowMenu = false
-                                            bypassAuthForLocalPlay = false
-                                        }
-                                    )
-                                }
-                                DropdownMenuItem(
-                                    text = { Text("End Couple Room", color = MaterialTheme.colorScheme.error) },
-                                    onClick = {
-                                        showOverflowMenu = false
-                                        showRemovePartnerDialog = true
-                                    },
-                                    modifier = Modifier.testTag("leave_room_button")
-                                )
-                            }
-                        }
+        CoupleActiveRoomHeaderCard(
+            activeRoom = activeRoom,
+            isSignedIn = isSignedIn,
+            cloudSyncStatus = loungeState.cloudSyncStatus,
+            hasPendingHostApproval = hasPendingHostApproval,
+            onRequireSignIn = { bypassAuthForLocalPlay = false },
+            onRetryCloudSync = actions.onRetryCloudSync,
+            onTogglePassAndPlay = actions.onTogglePassAndPlay,
+            onSignOut = {
+                signOutGoogle(
+                    credentialManager = getCredentialManager(),
+                    scope = scope,
+                    onBeforeSignOut = actions.onDetachCloudListeners,
+                    onSignOutComplete = {
+                        actions.onCloudUserChanged(null, null)
+                        actions.onShowFeedback("Signed out")
                     }
+                )
+            },
+            onRequestEndRoom = { showRemovePartnerDialog = true },
+            onUpdateSpiceLevel = actions.onUpdateSpiceLevel,
+            onShowFeedback = actions.onShowFeedback
+        )
 
-                    // Hero Couple Names & Minimal Stats
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Text(
-                                text = activeRoom.myName.ifBlank { "Me" },
-                                style = MaterialTheme.typography.headlineSmall.copy(
-                                    fontWeight = FontWeight.Bold,
-                                    fontFamily = FontFamily.Serif
-                                ),
-                                color = VelvetTextPrimary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                text = "♥",
-                                fontSize = 18.sp,
-                                color = VelvetRoseGlow
-                            )
-                            Text(
-                                text = partnerDisplay ?: "Waiting…",
-                                style = MaterialTheme.typography.headlineSmall.copy(
-                                    fontWeight = if (partnerDisplay != null) FontWeight.Bold else FontWeight.Medium,
-                                    fontFamily = FontFamily.Serif
-                                ),
-                                color = if (partnerDisplay != null) VelvetTextPrimary else VelvetTextMuted.copy(alpha = 0.7f),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f, fill = false)
-                            )
-                        }
-
-                        Text(
-                            text = "🔥 ${activeRoom.streakCount} streak   ·   💞 ${activeRoom.matchCount} matches",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = VelvetTextMuted
-                        )
-                    }
-
-                    // Clean Room Code Pill with Copy & Share
-                    Surface(
-                        shape = RoundedCornerShape(16.dp),
-                        color = Color.White.copy(alpha = 0.07f),
-                        border = BorderStroke(0.8.dp, Color.White.copy(alpha = 0.12f)),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(start = 14.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column {
-                                Text(
-                                    text = "ROOM CODE",
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        fontSize = 9.sp,
-                                        letterSpacing = 1.4.sp,
-                                        fontWeight = FontWeight.SemiBold
-                                    ),
-                                    color = VelvetTextMuted.copy(alpha = 0.75f)
-                                )
-                                Text(
-                                    text = "#${activeRoom.coupleCode}",
-                                    style = MaterialTheme.typography.titleMedium.copy(
-                                        fontWeight = FontWeight.Bold,
-                                        letterSpacing = 1.6.sp
-                                    ),
-                                    color = VelvetTextPrimary
-                                )
-                            }
-
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                IconButton(
-                                    onClick = {
-                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                        clipboard.setText(AnnotatedString(activeRoom.coupleCode))
-                                        onShowFeedback("Copied code #${activeRoom.coupleCode}")
-                                    },
-                                    modifier = Modifier.testTag("copy_couple_code_btn")
-                                ) {
-                                    Icon(
-                                        Icons.Default.ContentCopy,
-                                        contentDescription = "Copy Room Code",
-                                        tint = VelvetTextMuted,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                }
-                                IconButton(
-                                    onClick = {
-                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        val inviteText = "Join me in KriMoon Couple Lounge ♥\n" +
-                                            "Open Play → Couple Lounge and enter code: #${activeRoom.coupleCode}"
-                                        val sendIntent = Intent(Intent.ACTION_SEND).apply {
-                                            type = "text/plain"
-                                            putExtra(Intent.EXTRA_TEXT, inviteText)
-                                        }
-                                        runCatching {
-                                            context.startActivity(Intent.createChooser(sendIntent, "Invite Partner"))
-                                        }.onFailure {
-                                            onShowFeedback("Couldn't open share sheet — code copied instead")
-                                            clipboard.setText(AnnotatedString(activeRoom.coupleCode))
-                                        }
-                                    },
-                                    modifier = Modifier.testTag("share_couple_invite_btn")
-                                ) {
-                                    Icon(
-                                        Icons.Default.Share,
-                                        contentDescription = "Share Room Code",
-                                        tint = Color(0xFFF472B6),
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    // Unified Segmented Vibe Pill Bar (Sweet · Flirty · After-Dark)
-                    Surface(
-                        shape = RoundedCornerShape(100.dp),
-                        color = VelvetTrack,
-                        border = BorderStroke(0.8.dp, Color.White.copy(alpha = 0.08f)),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(4.dp),
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
-                            SpiceLevel.entries.forEach { level ->
-                                val selected = currentSpice == level
-                                val activeBg = when (level) {
-                                    SpiceLevel.SWEET -> Color(0xFF9D4EDD)
-                                    SpiceLevel.FLIRTY -> VelvetRoseGlow
-                                    SpiceLevel.BOLD -> Color(0xFFBE123C)
-                                }
-                                Surface(
-                                    shape = RoundedCornerShape(100.dp),
-                                    color = if (selected) activeBg else Color.Transparent,
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .clip(RoundedCornerShape(100.dp))
-                                        .clickable {
-                                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                            onUpdateSpiceLevel(level)
-                                        }
-                                        .testTag("spice_${level.name.lowercase()}")
-                                ) {
-                                    Text(
-                                        text = "${level.emoji} ${level.title}",
-                                        style = MaterialTheme.typography.labelMedium.copy(
-                                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                                            fontSize = 11.5.sp
-                                        ),
-                                        color = if (selected) Color.White else VelvetTextMuted,
-                                        textAlign = TextAlign.Center,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.padding(vertical = 9.dp, horizontal = 4.dp)
-                                    )
-                                }
-                            }
-                        }
-                    }
+        if (hasPendingHostApproval) {
+            HostApprovalBannerCard(
+                coupleCode = activeRoom.coupleCode,
+                requesterName = activeRoom.pendingPartnerName,
+                isBusy = loungeState.isCloudBusy,
+                onAllow = {
+                    AestheticHaptics.warmConfirm(context, haptic)
+                    actions.onApprovePendingPartner(activeRoom.coupleCode)
+                },
+                onDecline = {
+                    AestheticHaptics.softTick(context, haptic)
+                    actions.onDeclinePendingPartner(activeRoom.coupleCode)
                 }
-            }
+            )
         }
 
-        // 4 Equal-Height Couple Game Cards (2x2 grid)
-        val rows = CoupleGameType.entries.chunked(2)
-        rows.forEach { pair ->
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(IntrinsicSize.Max),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                pair.forEach { game ->
-                    CoupleGameLauncherCard(
-                        game = game,
-                        onClick = { onLaunchCoupleGame(game) },
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxHeight()
-                    )
-                }
-            }
+        if (showActivityGrid) {
+            CoupleActivityGrid(onLaunchCoupleGame = onLaunchCoupleGame)
         }
     }
 
     if (showRemovePartnerDialog) {
-        AlertDialog(
-            onDismissRequest = { showRemovePartnerDialog = false },
-            title = {
-                Text(
-                    "End Couple Room?",
-                    style = MaterialTheme.typography.titleMedium.copy(
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Serif
-                    )
-                )
-            },
-            text = {
-                Text(
-                    "This disconnects Room #${activeRoom.coupleCode} for both phones. You can create a new room code anytime.",
-                    style = MaterialTheme.typography.bodySmall
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        showRemovePartnerDialog = false
-                        onDeleteRoom(activeRoom.coupleCode)
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                    modifier = Modifier.testTag("confirm_remove_partner_btn")
-                ) {
-                    Text("End Room")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showRemovePartnerDialog = false }) {
-                    Text("Keep Connected ♥")
-                }
+        EndCoupleRoomDialog(
+            coupleCode = activeRoom.coupleCode,
+            onDismiss = { showRemovePartnerDialog = false },
+            onConfirmEnd = {
+                showRemovePartnerDialog = false
+                actions.onDeleteRoom(activeRoom.coupleCode)
             }
         )
     }
+}
+
+@Composable
+private fun CoupleActiveRoomHeaderCard(
+    activeRoom: CoupleRoomRecord,
+    isSignedIn: Boolean,
+    cloudSyncStatus: String,
+    hasPendingHostApproval: Boolean,
+    onRequireSignIn: () -> Unit,
+    onRetryCloudSync: () -> Unit,
+    onTogglePassAndPlay: (Boolean) -> Unit,
+    onSignOut: () -> Unit,
+    onRequestEndRoom: () -> Unit,
+    onUpdateSpiceLevel: (SpiceLevel) -> Unit,
+    onShowFeedback: (String) -> Unit
+) {
+    val currentSpice = remember(activeRoom.spiceLevel) {
+        runCatching { SpiceLevel.valueOf(activeRoom.spiceLevel) }.getOrDefault(SpiceLevel.FLIRTY)
+    }
+    val isLive = !activeRoom.isPassAndPlay && isSignedIn && cloudSyncStatus == "LIVE"
+    val isOffline = !activeRoom.isPassAndPlay && isSignedIn && cloudSyncStatus == "OFFLINE"
+    val isConnecting = !activeRoom.isPassAndPlay && isSignedIn && cloudSyncStatus == "CONNECTING"
+    val partnerDisplay = activeRoom.partnerName.takeIf { it.isNotBlank() }
+
+    Card(
+        shape = RoundedCornerShape(28.dp),
+        colors = CardDefaults.cardColors(containerColor = VelvetBgTop),
+        border = BorderStroke(1.dp, VelvetBorder),
+        modifier = Modifier
+            .fillMaxWidth()
+            .cute3DCard(maxTilt = 2.5f, cornerRadius = 28.dp)
+            .testTag("couple_room_header")
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Brush.verticalGradient(listOf(VelvetBgTop, VelvetBgBottom)))
+                .background(
+                    Brush.radialGradient(
+                        colors = listOf(VelvetRoseGlow.copy(alpha = 0.22f), Color.Transparent),
+                        radius = 520f
+                    )
+                )
+                .padding(horizontal = 20.dp, vertical = 18.dp)
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                CoupleRoomPresenceAndMenuRow(
+                    isPassAndPlay = activeRoom.isPassAndPlay,
+                    isSignedIn = isSignedIn,
+                    isLive = isLive,
+                    isOffline = isOffline,
+                    isConnecting = isConnecting,
+                    hasPendingHostApproval = hasPendingHostApproval,
+                    onRequireSignIn = onRequireSignIn,
+                    onRetryCloudSync = onRetryCloudSync,
+                    onTogglePassAndPlay = { onTogglePassAndPlay(!activeRoom.isPassAndPlay) },
+                    onSignOut = onSignOut,
+                    onRequestEndRoom = onRequestEndRoom
+                )
+
+                CoupleHeroNamesBlock(
+                    myName = activeRoom.myName.ifBlank { "Me" },
+                    partnerDisplay = partnerDisplay,
+                    streakCount = activeRoom.streakCount,
+                    matchCount = activeRoom.matchCount
+                )
+
+                CoupleRoomCodeBar(
+                    coupleCode = activeRoom.coupleCode,
+                    onShowFeedback = onShowFeedback
+                )
+
+                CoupleSpiceSelectorBar(
+                    currentSpice = currentSpice,
+                    onSelectSpice = onUpdateSpiceLevel
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CoupleRoomPresenceAndMenuRow(
+    isPassAndPlay: Boolean,
+    isSignedIn: Boolean,
+    isLive: Boolean,
+    isOffline: Boolean,
+    isConnecting: Boolean,
+    hasPendingHostApproval: Boolean,
+    onRequireSignIn: () -> Unit,
+    onRetryCloudSync: () -> Unit,
+    onTogglePassAndPlay: () -> Unit,
+    onSignOut: () -> Unit,
+    onRequestEndRoom: () -> Unit
+) {
+    val haptic = LocalHapticFeedback.current
+    var showOverflowMenu by remember { mutableStateOf(false) }
+
+    val dotColor = when {
+        isPassAndPlay -> Color(0xFFF472B6)
+        isLive -> LiveEmerald
+        isOffline -> Color(0xFFFB7185)
+        else -> WaitingAmber
+    }
+    val statusLabel = when {
+        isPassAndPlay -> "1 Phone"
+        isLive -> "Live"
+        hasPendingHostApproval -> "Request pending"
+        !isSignedIn -> "Sign in to sync"
+        isOffline -> "Offline · Retry"
+        isConnecting -> "Connecting…"
+        else -> "Waiting"
+    }
+    val pillActionable = (!isSignedIn && !isPassAndPlay) || isOffline
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Surface(
+                shape = RoundedCornerShape(100.dp),
+                color = Color.White.copy(alpha = 0.08f),
+                border = BorderStroke(0.8.dp, dotColor.copy(alpha = 0.45f)),
+                modifier = Modifier.clickable(enabled = pillActionable) {
+                    if (!isSignedIn) onRequireSignIn()
+                    else if (isOffline) onRetryCloudSync()
+                }
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(7.dp)
+                            .clip(CircleShape)
+                            .background(dotColor)
+                    )
+                    Text(
+                        text = statusLabel,
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontWeight = FontWeight.SemiBold,
+                            letterSpacing = 0.3.sp
+                        ),
+                        color = VelvetTextPrimary
+                    )
+                }
+            }
+
+            Surface(
+                shape = CircleShape,
+                color = Color.White.copy(alpha = 0.08f),
+                border = BorderStroke(0.8.dp, VelvetBorder),
+                modifier = Modifier
+                    .size(26.dp)
+                    .testTag("silent_lock_badge")
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = Icons.Default.Lock,
+                        contentDescription = "Always-on private protection",
+                        tint = Color(0xFFF9A8D4),
+                        modifier = Modifier.size(13.dp)
+                    )
+                }
+            }
+        }
+
+        Box {
+            IconButton(
+                onClick = { showOverflowMenu = true },
+                modifier = Modifier
+                    .size(36.dp)
+                    .testTag("couple_room_menu_btn")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.MoreHoriz,
+                    contentDescription = "Room options",
+                    tint = VelvetTextMuted
+                )
+            }
+            DropdownMenu(
+                expanded = showOverflowMenu,
+                onDismissRequest = { showOverflowMenu = false }
+            ) {
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            if (isPassAndPlay) "Switch to 2-Phone Live"
+                            else "Switch to Pass & Play (1 Phone)"
+                        )
+                    },
+                    onClick = {
+                        showOverflowMenu = false
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onTogglePassAndPlay()
+                    },
+                    modifier = Modifier.testTag("pass_and_play_switch")
+                )
+                if (isSignedIn) {
+                    DropdownMenuItem(
+                        text = { Text("Sign Out Google") },
+                        onClick = {
+                            showOverflowMenu = false
+                            onSignOut()
+                        }
+                    )
+                } else {
+                    DropdownMenuItem(
+                        text = { Text("Sign In for 2-Phone Live") },
+                        onClick = {
+                            showOverflowMenu = false
+                            onRequireSignIn()
+                        }
+                    )
+                }
+                DropdownMenuItem(
+                    text = { Text("End Couple Room", color = MaterialTheme.colorScheme.error) },
+                    onClick = {
+                        showOverflowMenu = false
+                        onRequestEndRoom()
+                    },
+                    modifier = Modifier.testTag("leave_room_button")
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CoupleHeroNamesBlock(
+    myName: String,
+    partnerDisplay: String?,
+    streakCount: Int,
+    matchCount: Int
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = myName,
+                style = MaterialTheme.typography.headlineSmall.copy(
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Serif
+                ),
+                color = VelvetTextPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(text = "♥", fontSize = 18.sp, color = VelvetRoseGlow)
+            Text(
+                text = partnerDisplay ?: "Waiting…",
+                style = MaterialTheme.typography.headlineSmall.copy(
+                    fontWeight = if (partnerDisplay != null) FontWeight.Bold else FontWeight.Medium,
+                    fontFamily = FontFamily.Serif
+                ),
+                color = if (partnerDisplay != null) VelvetTextPrimary else VelvetTextMuted.copy(alpha = 0.7f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false)
+            )
+        }
+
+        Text(
+            text = "🔥 $streakCount streak   ·   💞 $matchCount matches",
+            style = MaterialTheme.typography.labelMedium,
+            color = VelvetTextMuted
+        )
+    }
+}
+
+@Composable
+private fun CoupleRoomCodeBar(
+    coupleCode: String,
+    onShowFeedback: (String) -> Unit
+) {
+    val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
+
+    fun copySensitiveRoomCode() {
+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        val clip = ClipData.newPlainText("Couple Room Code", coupleCode).apply {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                description.extras = PersistableBundle().apply {
+                    putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+                }
+            }
+        }
+        cm?.setPrimaryClip(clip)
+    }
+
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = Color.White.copy(alpha = 0.07f),
+        border = BorderStroke(0.8.dp, Color.White.copy(alpha = 0.12f)),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 14.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column {
+                Text(
+                    text = "ROOM CODE",
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontSize = 9.sp,
+                        letterSpacing = 1.4.sp,
+                        fontWeight = FontWeight.SemiBold
+                    ),
+                    color = VelvetTextMuted.copy(alpha = 0.75f)
+                )
+                Text(
+                    text = "#$coupleCode",
+                    style = MaterialTheme.typography.titleMedium.copy(
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.6.sp
+                    ),
+                    color = VelvetTextPrimary
+                )
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        copySensitiveRoomCode()
+                        onShowFeedback("Copied private code #$coupleCode")
+                    },
+                    modifier = Modifier.testTag("copy_couple_code_btn")
+                ) {
+                    Icon(
+                        Icons.Default.ContentCopy,
+                        contentDescription = "Copy Room Code",
+                        tint = VelvetTextMuted,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+                IconButton(
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        val inviteText = "Join me in KriMoon Couple Lounge ♥\n" +
+                            "Open Play → Couple Lounge and enter code: #$coupleCode"
+                        val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_TEXT, inviteText)
+                        }
+                        runCatching {
+                            context.startActivity(Intent.createChooser(sendIntent, "Invite Partner"))
+                        }.onFailure {
+                            onShowFeedback("Couldn't open share sheet — code copied instead")
+                            copySensitiveRoomCode()
+                        }
+                    },
+                    modifier = Modifier.testTag("share_couple_invite_btn")
+                ) {
+                    Icon(
+                        Icons.Default.Share,
+                        contentDescription = "Share Room Code",
+                        tint = Color(0xFFF472B6),
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CoupleSpiceSelectorBar(
+    currentSpice: SpiceLevel,
+    onSelectSpice: (SpiceLevel) -> Unit
+) {
+    val haptic = LocalHapticFeedback.current
+    Surface(
+        shape = RoundedCornerShape(100.dp),
+        color = VelvetTrack,
+        border = BorderStroke(0.8.dp, Color.White.copy(alpha = 0.08f)),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            SpiceLevel.entries.forEach { level ->
+                val selected = currentSpice == level
+                val activeBg = when (level) {
+                    SpiceLevel.SWEET -> Color(0xFF9D4EDD)
+                    SpiceLevel.FLIRTY -> VelvetRoseGlow
+                    SpiceLevel.BOLD -> Color(0xFFBE123C)
+                }
+                Surface(
+                    shape = RoundedCornerShape(100.dp),
+                    color = if (selected) activeBg else Color.Transparent,
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(100.dp))
+                        .clickable {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onSelectSpice(level)
+                        }
+                        .testTag("spice_${level.name.lowercase()}")
+                ) {
+                    Text(
+                        text = "${level.emoji} ${level.title}",
+                        style = MaterialTheme.typography.labelMedium.copy(
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                            fontSize = 11.5.sp
+                        ),
+                        color = if (selected) Color.White else VelvetTextMuted,
+                        textAlign = TextAlign.Center,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(vertical = 9.dp, horizontal = 4.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun CoupleActivityRowItem(
+    pair: List<CoupleGameType>,
+    onLaunchCoupleGame: (CoupleGameType) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    if (pair.size == 1) {
+        val game = pair.first()
+        CoupleGameLauncherCard(
+            game = game,
+            onClick = { onLaunchCoupleGame(game) },
+            modifier = modifier
+                .fillMaxWidth()
+                .height(136.dp)
+        )
+    } else {
+        Row(
+            modifier = modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            pair.forEach { game ->
+                CoupleGameLauncherCard(
+                    game = game,
+                    onClick = { onLaunchCoupleGame(game) },
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(148.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CoupleActivityGrid(
+    onLaunchCoupleGame: (CoupleGameType) -> Unit
+) {
+    val rows = remember { CoupleGameType.entries.chunked(2) }
+    rows.forEach { pair ->
+        CoupleActivityRowItem(
+            pair = pair,
+            onLaunchCoupleGame = onLaunchCoupleGame
+        )
+    }
+}
+
+@Composable
+private fun EndCoupleRoomDialog(
+    coupleCode: String,
+    onDismiss: () -> Unit,
+    onConfirmEnd: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                "End Couple Room?",
+                style = MaterialTheme.typography.titleMedium.copy(
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Serif
+                )
+            )
+        },
+        text = {
+            Text(
+                "This disconnects Room #$coupleCode for both phones. You can create a new room code anytime.",
+                style = MaterialTheme.typography.bodySmall
+            )
+        },
+        confirmButton = {
+            Button(
+                onClick = onConfirmEnd,
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                modifier = Modifier.testTag("confirm_remove_partner_btn")
+            ) {
+                Text("End Room")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Keep Connected ♥")
+            }
+        }
+    )
 }
 
 @Composable
@@ -744,28 +956,237 @@ private fun CoupleAuthGateCard(
 }
 
 @Composable
+private fun HostApprovalBannerCard(
+    coupleCode: String,
+    requesterName: String,
+    isBusy: Boolean,
+    onAllow: () -> Unit,
+    onDecline: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = VelvetBgTop),
+        border = BorderStroke(1.5.dp, VelvetRoseGlow.copy(alpha = 0.85f)),
+        modifier = modifier
+            .fillMaxWidth()
+            .cute3DCard(maxTilt = 2.5f, cornerRadius = 24.dp)
+            .testTag("host_approval_banner")
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(
+                    Brush.verticalGradient(
+                        listOf(VelvetRoseGlow.copy(alpha = 0.22f), VelvetBgBottom)
+                    )
+                )
+                .padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Surface(
+                    shape = CircleShape,
+                    color = VelvetRoseGlow.copy(alpha = 0.24f),
+                    border = BorderStroke(1.dp, VelvetBorder),
+                    modifier = Modifier.size(38.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Default.Lock,
+                            contentDescription = "Host confirmation required",
+                            tint = Color(0xFFF9A8D4),
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Confirm Partner Entry",
+                        style = MaterialTheme.typography.titleSmall.copy(
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Serif
+                        ),
+                        color = VelvetTextPrimary
+                    )
+                    Text(
+                        text = "$requesterName wants to join Room #$coupleCode",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = VelvetTextMuted
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onDecline,
+                    enabled = !isBusy,
+                    border = BorderStroke(1.dp, VelvetBorder),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                        .testTag("decline_partner_btn")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = "Decline",
+                        tint = VelvetTextMuted,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Decline", color = VelvetTextMuted, fontWeight = FontWeight.SemiBold)
+                }
+
+                Button(
+                    onClick = onAllow,
+                    enabled = !isBusy,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = VelvetRoseGlow,
+                        contentColor = Color.White
+                    ),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .weight(1.3f)
+                        .height(48.dp)
+                        .testTag("allow_partner_btn")
+                ) {
+                    if (isBusy) {
+                        CircularProgressIndicator(
+                            color = Color.White,
+                            strokeWidth = 2.dp,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.Check,
+                            contentDescription = "Allow",
+                            modifier = Modifier.size(17.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Allow ♥", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun WaitingForHostApprovalCard(
+    room: CoupleRoomRecord,
+    isBusy: Boolean,
+    onCancelRequest: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        shape = RoundedCornerShape(28.dp),
+        colors = CardDefaults.cardColors(containerColor = VelvetBgTop),
+        border = BorderStroke(1.2.dp, WaitingAmber.copy(alpha = 0.6f)),
+        modifier = modifier
+            .fillMaxWidth()
+            .cute3DCard(maxTilt = 2.5f, cornerRadius = 28.dp)
+            .testTag("waiting_host_approval_card")
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Brush.verticalGradient(listOf(VelvetBgTop, VelvetBgBottom)))
+                .padding(24.dp)
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Surface(
+                    shape = CircleShape,
+                    color = WaitingAmber.copy(alpha = 0.16f),
+                    border = BorderStroke(1.dp, WaitingAmber.copy(alpha = 0.5f)),
+                    modifier = Modifier.size(56.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Default.Lock,
+                            contentDescription = "Waiting for Host approval",
+                            tint = WaitingAmber,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                }
+
+                Text(
+                    text = "Awaiting Host Confirmation",
+                    style = MaterialTheme.typography.headlineSmall.copy(
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Serif
+                    ),
+                    color = VelvetTextPrimary,
+                    textAlign = TextAlign.Center
+                )
+
+                Text(
+                    text = "You requested access to Room #${room.coupleCode}. ${room.partnerName.ifBlank { "The room creator" }} must tap Allow on their phone to unlock the lounge.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = VelvetTextMuted,
+                    textAlign = TextAlign.Center,
+                    lineHeight = 19.sp
+                )
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.padding(vertical = 4.dp)
+                ) {
+                    CircularProgressIndicator(
+                        color = Color(0xFFF472B6),
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text(
+                        text = "Listening live for approval…",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color(0xFFF9A8D4)
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = onCancelRequest,
+                    enabled = !isBusy,
+                    border = BorderStroke(1.dp, VelvetBorder),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("cancel_join_request_btn")
+                ) {
+                    Text("Cancel Request", color = VelvetTextMuted, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun CouplePairingCard(
     defaultUserName: String,
     existingRooms: List<CoupleRoomRecord>,
     isSignedIn: Boolean,
     isBusy: Boolean,
-    onCreateOrJoin: (name: String, code: String) -> Unit,
+    onCreateUniqueRoom: (name: String) -> Unit,
+    onRequestJoinRoom: (name: String, code: String) -> Unit,
     onSelectRoom: (code: String) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val haptic = LocalHapticFeedback.current
     var nameInput by remember(defaultUserName) { mutableStateOf(defaultUserName.ifBlank { "" }) }
     var codeInput by remember { mutableStateOf("") }
-
-    val fieldColors = OutlinedTextFieldDefaults.colors(
-        focusedTextColor = VelvetTextPrimary,
-        unfocusedTextColor = VelvetTextPrimary,
-        focusedBorderColor = Color(0xFFF472B6),
-        unfocusedBorderColor = Color.White.copy(alpha = 0.22f),
-        focusedLabelColor = Color(0xFFF9A8D4),
-        unfocusedLabelColor = VelvetTextMuted,
-        cursorColor = VelvetRoseGlow
-    )
+    var isJoinMode by remember { mutableStateOf(false) }
 
     Card(
         shape = RoundedCornerShape(28.dp),
@@ -793,32 +1214,7 @@ private fun CouplePairingCard(
                 verticalArrangement = Arrangement.spacedBy(14.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = if (isSignedIn) "● Ready to connect live" else "● Pass & Play",
-                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                        color = if (isSignedIn) LiveEmerald else Color(0xFFF472B6)
-                    )
-                    Surface(
-                        shape = CircleShape,
-                        color = Color.White.copy(alpha = 0.08f),
-                        border = BorderStroke(0.8.dp, VelvetBorder),
-                        modifier = Modifier.size(26.dp)
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(
-                                imageVector = Icons.Default.Lock,
-                                contentDescription = "Always-on private protection",
-                                tint = Color(0xFFF9A8D4),
-                                modifier = Modifier.size(13.dp)
-                            )
-                        }
-                    }
-                }
+                PairingHeaderRow(isSignedIn = isSignedIn)
 
                 Text(
                     text = "Two Phones, One Private Space",
@@ -830,109 +1226,266 @@ private fun CouplePairingCard(
                     textAlign = TextAlign.Center
                 )
 
-                Text(
-                    text = "Create a 6-digit code or enter your partner's code to start playing live.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = VelvetTextMuted,
-                    textAlign = TextAlign.Center
+                PairingModeToggleBar(
+                    isJoinMode = isJoinMode,
+                    onModeChange = { isJoinMode = it }
                 )
 
-                OutlinedTextField(
-                    value = nameInput,
-                    onValueChange = { nameInput = it },
-                    label = { Text("Your Name") },
-                    placeholder = { Text("e.g. Hariom", color = VelvetTextMuted.copy(alpha = 0.5f)) },
-                    singleLine = true,
-                    colors = fieldColors,
-                    shape = RoundedCornerShape(16.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("couple_name_input")
+                PairingFormFields(
+                    nameInput = nameInput,
+                    onNameChange = { nameInput = it },
+                    codeInput = codeInput,
+                    onCodeChange = { codeInput = CoupleTurnCodec.normalizeCode(it) },
+                    isJoinMode = isJoinMode,
+                    isBusy = isBusy,
+                    onCreateUniqueRoom = { onCreateUniqueRoom(nameInput) },
+                    onRequestJoinRoom = { onRequestJoinRoom(nameInput, codeInput) }
                 )
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    OutlinedTextField(
-                        value = codeInput,
-                        onValueChange = { raw -> codeInput = CoupleTurnCodec.normalizeCode(raw) },
-                        label = { Text("6-Digit Code") },
-                        placeholder = { Text("482913", color = VelvetTextMuted.copy(alpha = 0.5f)) },
-                        singleLine = true,
-                        colors = fieldColors,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        shape = RoundedCornerShape(16.dp),
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("couple_code_input")
-                    )
-
-                    OutlinedButton(
-                        onClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            codeInput = CoupleTurnCodec.generateUniqueCode(existingRooms.map { it.coupleCode }.toSet())
-                        },
-                        border = BorderStroke(1.dp, VelvetBorder),
-                        shape = RoundedCornerShape(16.dp),
-                        modifier = Modifier
-                            .height(54.dp)
-                            .testTag("generate_couple_code_btn")
-                    ) {
-                        Text("New", color = Color(0xFFF9A8D4), fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                    }
-                }
-
-                Button(
-                    onClick = { onCreateOrJoin(nameInput, codeInput) },
-                    enabled = !isBusy,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = VelvetRoseGlow,
-                        contentColor = Color.White
-                    ),
-                    shape = RoundedCornerShape(16.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(50.dp)
-                        .testTag("couple_join_button")
-                ) {
-                    if (isBusy) {
-                        CircularProgressIndicator(
-                            color = Color.White,
-                            strokeWidth = 2.dp,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    } else {
-                        Text(
-                            text = "Connect Room ♥",
-                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
-                        )
-                    }
-                }
 
                 if (existingRooms.isNotEmpty()) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)
-                    ) {
-                        existingRooms.take(3).forEach { room ->
-                            Surface(
-                                shape = RoundedCornerShape(100.dp),
-                                color = Color.White.copy(alpha = 0.08f),
-                                border = BorderStroke(0.8.dp, VelvetBorder),
-                                modifier = Modifier.clickable { onSelectRoom(room.coupleCode) }
-                            ) {
-                                Text(
-                                    text = "#${room.coupleCode}",
-                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                                    color = VelvetTextPrimary,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-                                )
-                            }
-                        }
-                    }
+                    PairingRecentRoomsRow(
+                        existingRooms = existingRooms,
+                        onSelectRoom = onSelectRoom
+                    )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PairingHeaderRow(isSignedIn: Boolean) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = if (isSignedIn) "● Ready to connect live" else "● Pass & Play",
+            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+            color = if (isSignedIn) LiveEmerald else Color(0xFFF472B6)
+        )
+        Surface(
+            shape = CircleShape,
+            color = Color.White.copy(alpha = 0.08f),
+            border = BorderStroke(0.8.dp, VelvetBorder),
+            modifier = Modifier.size(26.dp)
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    imageVector = Icons.Default.Lock,
+                    contentDescription = "Always-on private protection",
+                    tint = Color(0xFFF9A8D4),
+                    modifier = Modifier.size(13.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PairingModeToggleBar(
+    isJoinMode: Boolean,
+    onModeChange: (Boolean) -> Unit
+) {
+    val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
+
+    Surface(
+        shape = RoundedCornerShape(100.dp),
+        color = VelvetTrack,
+        border = BorderStroke(0.8.dp, Color.White.copy(alpha = 0.1f)),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            listOf("Create Room" to false, "Join Partner" to true).forEach { (label, joinFlag) ->
+                val selected = isJoinMode == joinFlag
+                Surface(
+                    shape = RoundedCornerShape(100.dp),
+                    color = if (selected) VelvetRoseGlow else Color.Transparent,
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(100.dp))
+                        .clickable {
+                            AestheticHaptics.softTick(context, haptic)
+                            onModeChange(joinFlag)
+                        }
+                        .testTag(if (joinFlag) "pairing_mode_join" else "pairing_mode_create")
+                ) {
+                    Text(
+                        text = label,
+                        style = MaterialTheme.typography.labelLarge.copy(
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+                        ),
+                        color = if (selected) Color.White else VelvetTextMuted,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(vertical = 10.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PairingFormFields(
+    nameInput: String,
+    onNameChange: (String) -> Unit,
+    codeInput: String,
+    onCodeChange: (String) -> Unit,
+    isJoinMode: Boolean,
+    isBusy: Boolean,
+    onCreateUniqueRoom: () -> Unit,
+    onRequestJoinRoom: () -> Unit
+) {
+    val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
+    val fieldColors = OutlinedTextFieldDefaults.colors(
+        focusedTextColor = VelvetTextPrimary,
+        unfocusedTextColor = VelvetTextPrimary,
+        focusedBorderColor = Color(0xFFF472B6),
+        unfocusedBorderColor = Color.White.copy(alpha = 0.22f),
+        focusedLabelColor = Color(0xFFF9A8D4),
+        unfocusedLabelColor = VelvetTextMuted,
+        cursorColor = VelvetRoseGlow
+    )
+
+    OutlinedTextField(
+        value = nameInput,
+        onValueChange = onNameChange,
+        label = { Text("Your Name") },
+        placeholder = { Text("e.g. Hariom", color = VelvetTextMuted.copy(alpha = 0.5f)) },
+        singleLine = true,
+        colors = fieldColors,
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("couple_name_input")
+    )
+
+    if (isJoinMode) {
+        OutlinedTextField(
+            value = codeInput,
+            onValueChange = onCodeChange,
+            label = { Text("Partner's 6-Digit Code") },
+            placeholder = { Text("482913", color = VelvetTextMuted.copy(alpha = 0.5f)) },
+            singleLine = true,
+            colors = fieldColors,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            shape = RoundedCornerShape(16.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("couple_code_input")
+        )
+
+        Text(
+            text = "The room creator must tap Allow on their phone before you enter.",
+            style = MaterialTheme.typography.labelSmall,
+            color = VelvetTextMuted,
+            textAlign = TextAlign.Center
+        )
+
+        Button(
+            onClick = {
+                AestheticHaptics.crispClick(context, haptic)
+                onRequestJoinRoom()
+            },
+            enabled = !isBusy,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = VelvetRoseGlow,
+                contentColor = Color.White
+            ),
+            shape = RoundedCornerShape(16.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(50.dp)
+                .testTag("couple_join_button")
+        ) {
+            if (isBusy) {
+                CircularProgressIndicator(
+                    color = Color.White,
+                    strokeWidth = 2.dp,
+                    modifier = Modifier.size(20.dp)
+                )
+            } else {
+                Text(
+                    text = "Request to Join ♥",
+                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
+                )
+            }
+        }
+    } else {
+        Text(
+            text = "Generates a permanently unique 6-digit code exclusively for you two — no other couple can ever claim it.",
+            style = MaterialTheme.typography.labelSmall,
+            color = VelvetTextMuted,
+            textAlign = TextAlign.Center
+        )
+
+        Button(
+            onClick = {
+                AestheticHaptics.warmConfirm(context, haptic)
+                onCreateUniqueRoom()
+            },
+            enabled = !isBusy,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = VelvetRoseGlow,
+                contentColor = Color.White
+            ),
+            shape = RoundedCornerShape(16.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(50.dp)
+                .testTag("generate_couple_code_btn")
+        ) {
+            if (isBusy) {
+                CircularProgressIndicator(
+                    color = Color.White,
+                    strokeWidth = 2.dp,
+                    modifier = Modifier.size(20.dp)
+                )
+            } else {
+                Text(
+                    text = "Generate Unique Room ♥",
+                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PairingRecentRoomsRow(
+    existingRooms: List<CoupleRoomRecord>,
+    onSelectRoom: (String) -> Unit
+) {
+    val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)
+    ) {
+        existingRooms.take(3).forEach { room ->
+            Surface(
+                shape = RoundedCornerShape(100.dp),
+                color = Color.White.copy(alpha = 0.08f),
+                border = BorderStroke(0.8.dp, VelvetBorder),
+                modifier = Modifier.clickable {
+                    AestheticHaptics.softTick(context, haptic)
+                    onSelectRoom(room.coupleCode)
+                }
+            ) {
+                Text(
+                    text = "#${room.coupleCode}",
+                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                    color = VelvetTextPrimary,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                )
             }
         }
     }
@@ -949,8 +1502,12 @@ private fun CoupleGameLauncherCard(
         colors = CardDefaults.cardColors(containerColor = VelvetSurface),
         border = BorderStroke(1.dp, game.accentColor.copy(alpha = 0.38f)),
         modifier = modifier
-            .cute3DCard(maxTilt = 3.5f, cornerRadius = 24.dp)
-            .cuteBouncyClick(onClick = onClick)
+            .cute3DCard(
+                maxTilt = 3.2f,
+                cornerRadius = 24.dp,
+                accentColor = game.accentColor,
+                onClick = onClick
+            )
             .testTag("couple_game_${game.name.lowercase()}")
     ) {
         Column(

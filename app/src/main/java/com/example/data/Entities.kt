@@ -1,9 +1,11 @@
 package com.example.data
 
+import androidx.compose.runtime.Immutable
 import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
 
+@Immutable
 @Entity(tableName = "user_profile")
 data class UserProfile(
     @PrimaryKey val id: Int = 1,
@@ -124,6 +126,7 @@ data class GameScoreRecord(
     val lastPlayedAt: Long = System.currentTimeMillis()
 )
 
+@Immutable
 @Entity(tableName = "couple_rooms")
 data class CoupleRoomRecord(
     @PrimaryKey val coupleCode: String, // Unique 6-digit room code per couple
@@ -146,6 +149,16 @@ data class CoupleRoomRecord(
     val firewallPassedCount: Int = 0,
     val firewallBlockedCount: Int = 0,
     val lastFirewallEvent: String = "Firewall Active · AES-256-GCM + PoW Chain",
-    val updatedAt: Long = System.currentTimeMillis()
+    val updatedAt: Long = System.currentTimeMillis(),
+    val isHost: Boolean = true,
+    val approvalStatus: String = "WAITING", // "WAITING", "PENDING_HOST_APPROVAL", "AWAITING_MY_APPROVAL", "CONNECTED"
+    val pendingPartnerName: String = "",
+    val dareStateJson: String = "{}",
+    val wavelengthStateJson: String = "{}",
+    val whisperStateJson: String = "{}",
+    val ecdhPublicKeyB64: String = "",
+    val ecdhPrivateKeyB64: String = "",
+    val peerPublicKeyB64: String = "",
+    val ecdhSharedSecretB64: String = ""
 )
 

@@ -23,7 +23,7 @@ import kotlinx.coroutines.launch
         GameScoreRecord::class,
         CoupleRoomRecord::class
     ],
-    version = 12,
+    version = 14,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -246,6 +246,16 @@ abstract class AppDatabase : RoomDatabase() {
                     "`firewallBlockedCount` INTEGER NOT NULL DEFAULT 0, " +
                     "`lastFirewallEvent` TEXT NOT NULL DEFAULT 'Firewall Active · AES-256-GCM + PoW Chain', " +
                     "`updatedAt` INTEGER NOT NULL, " +
+                    "`isHost` INTEGER NOT NULL DEFAULT 1, " +
+                    "`approvalStatus` TEXT NOT NULL DEFAULT 'WAITING', " +
+                    "`pendingPartnerName` TEXT NOT NULL DEFAULT '', " +
+                    "`dareStateJson` TEXT NOT NULL DEFAULT '{}', " +
+                    "`wavelengthStateJson` TEXT NOT NULL DEFAULT '{}', " +
+                    "`whisperStateJson` TEXT NOT NULL DEFAULT '{}', " +
+                    "`ecdhPublicKeyB64` TEXT NOT NULL DEFAULT '', " +
+                    "`ecdhPrivateKeyB64` TEXT NOT NULL DEFAULT '', " +
+                    "`peerPublicKeyB64` TEXT NOT NULL DEFAULT '', " +
+                    "`ecdhSharedSecretB64` TEXT NOT NULL DEFAULT '', " +
                     "PRIMARY KEY(`coupleCode`))"
             )
             addColumnIfNotExists(db, "couple_rooms", "isBonded", "INTEGER NOT NULL DEFAULT 1")
@@ -256,6 +266,16 @@ abstract class AppDatabase : RoomDatabase() {
             addColumnIfNotExists(db, "couple_rooms", "firewallPassedCount", "INTEGER NOT NULL DEFAULT 0")
             addColumnIfNotExists(db, "couple_rooms", "firewallBlockedCount", "INTEGER NOT NULL DEFAULT 0")
             addColumnIfNotExists(db, "couple_rooms", "lastFirewallEvent", "TEXT NOT NULL DEFAULT 'Firewall Active · AES-256-GCM + PoW Chain'")
+            addColumnIfNotExists(db, "couple_rooms", "isHost", "INTEGER NOT NULL DEFAULT 1")
+            addColumnIfNotExists(db, "couple_rooms", "approvalStatus", "TEXT NOT NULL DEFAULT 'WAITING'")
+            addColumnIfNotExists(db, "couple_rooms", "pendingPartnerName", "TEXT NOT NULL DEFAULT ''")
+            addColumnIfNotExists(db, "couple_rooms", "dareStateJson", "TEXT NOT NULL DEFAULT '{}'")
+            addColumnIfNotExists(db, "couple_rooms", "wavelengthStateJson", "TEXT NOT NULL DEFAULT '{}'")
+            addColumnIfNotExists(db, "couple_rooms", "whisperStateJson", "TEXT NOT NULL DEFAULT '{}'")
+            addColumnIfNotExists(db, "couple_rooms", "ecdhPublicKeyB64", "TEXT NOT NULL DEFAULT ''")
+            addColumnIfNotExists(db, "couple_rooms", "ecdhPrivateKeyB64", "TEXT NOT NULL DEFAULT ''")
+            addColumnIfNotExists(db, "couple_rooms", "peerPublicKeyB64", "TEXT NOT NULL DEFAULT ''")
+            addColumnIfNotExists(db, "couple_rooms", "ecdhSharedSecretB64", "TEXT NOT NULL DEFAULT ''")
         }
 
         private val MIGRATION_1_2 = object : Migration(1, 2) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
@@ -294,11 +314,21 @@ abstract class AppDatabase : RoomDatabase() {
         private val MIGRATION_11_12 = object : Migration(11, 12) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
         private val MIGRATION_10_12 = object : Migration(10, 12) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
         private val MIGRATION_1_12 = object : Migration(1, 12) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_12_13 = object : Migration(12, 13) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_11_13 = object : Migration(11, 13) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_10_13 = object : Migration(10, 13) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_1_13 = object : Migration(1, 13) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_13_14 = object : Migration(13, 14) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_12_14 = object : Migration(12, 14) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_11_14 = object : Migration(11, 14) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_10_14 = object : Migration(10, 14) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_1_14 = object : Migration(1, 14) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
 
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 val dbName = "phases_local.db"
                 val appContext = context.applicationContext
+                com.example.security.LocalVaultCrypto.init(appContext)
 
                 val builder = Room.databaseBuilder(
                     appContext,
@@ -342,7 +372,16 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_1_11,
                     MIGRATION_11_12,
                     MIGRATION_10_12,
-                    MIGRATION_1_12
+                    MIGRATION_1_12,
+                    MIGRATION_12_13,
+                    MIGRATION_11_13,
+                    MIGRATION_10_13,
+                    MIGRATION_1_13,
+                    MIGRATION_13_14,
+                    MIGRATION_12_14,
+                    MIGRATION_11_14,
+                    MIGRATION_10_14,
+                    MIGRATION_1_14
                 ).fallbackToDestructiveMigration(dropAllTables = true)
                 .addCallback(object : Callback() {
                     override fun onOpen(db: SupportSQLiteDatabase) {

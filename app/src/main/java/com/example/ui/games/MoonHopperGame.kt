@@ -28,6 +28,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
@@ -99,6 +100,8 @@ fun MoonHopperGame(
 
     var widthPx by remember { mutableFloatStateOf(0f) }
     var heightPx by remember { mutableFloatStateOf(0f) }
+    val latestSoundEnabled by rememberUpdatedState(soundEnabled)
+    val latestOnScoreSaved by rememberUpdatedState(onScoreSaved)
 
     fun jumpOrStart() {
         if (isGameOver) return
@@ -109,7 +112,7 @@ fun MoonHopperGame(
             playerVy = with(density) { 540.dp.toPx() }
             jumpsLeft--
             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-            if (soundEnabled) SoundHelper.playSound(context, SoundHelper.SOUND_SWEET_BUBBLE, 0.7f)
+            if (latestSoundEnabled) SoundHelper.playSound(context, SoundHelper.SOUND_SWEET_BUBBLE, 0.7f)
         }
     }
 
@@ -128,13 +131,17 @@ fun MoonHopperGame(
 
     LaunchedEffect(isStarted, isGameOver, widthPx, heightPx) {
         if (!isStarted || isGameOver || widthPx <= 0f || heightPx <= 0f) return@LaunchedEffect
-        var lastNano = System.nanoTime()
+        var lastNano = 0L
         val gravity = with(density) { 1550.dp.toPx() }
         val playerX = widthPx * 0.2f
         val playerSize = with(density) { 36.dp.toPx() }
 
         while (isActive && isStarted && !isGameOver) {
             withFrameNanos { now ->
+                if (lastNano == 0L) {
+                    lastNano = now
+                    return@withFrameNanos
+                }
                 val dt = ((now - lastNano) / 1_000_000_000f).coerceIn(0.002f, 0.032f)
                 lastNano = now
 
@@ -178,7 +185,7 @@ fun MoonHopperGame(
 
                 if (collectedStar) {
                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                    if (soundEnabled) SoundHelper.playCuteChime(context)
+                    if (latestSoundEnabled) SoundHelper.playCuteChime(context)
                     particleController.spawn(playerX, heightPx * 0.55f, listOf("⭐", "✨", "🌙"), 8)
                 }
 
@@ -203,7 +210,7 @@ fun MoonHopperGame(
                 if (hitHazard) {
                     isGameOver = true
                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                    onScoreSaved(score, starsCollected)
+                    latestOnScoreSaved(score, starsCollected)
                 }
             }
         }
@@ -249,9 +256,19 @@ fun MoonHopperGame(
                 }
                 .testTag("moon_hopper_canvas")
         ) {
-            widthPx = constraints.maxWidth.toFloat()
-            heightPx = constraints.maxHeight.toFloat()
-            val groundY = heightPx * 0.80f
+            val maxW = constraints.maxWidth.toFloat()
+            val maxH = constraints.maxHeight.toFloat()
+            LaunchedEffect(maxW, maxH) {
+                widthPx = maxW
+                heightPx = maxH
+            }
+            val groundY = maxH * 0.80f
+            val moonMeasured = remember(textMeasurer) {
+                textMeasurer.measure("🌙", style = TextStyle(fontSize = 32.sp))
+            }
+            val starMeasured = remember(textMeasurer) {
+                textMeasurer.measure("⭐", style = TextStyle(fontSize = 24.sp))
+            }
 
             Canvas(modifier = Modifier.fillMaxSize()) {
                 val tick = frameTick
@@ -274,7 +291,6 @@ fun MoonHopperGame(
                 // Player Crescent Moon
                 val playerX = size.width * 0.2f
                 val pSize = 36.dp.toPx()
-                val moonMeasured = textMeasurer.measure("🌙", style = TextStyle(fontSize = 32.sp))
                 drawText(
                     moonMeasured,
                     topLeft = Offset(playerX, groundY - pSize - playerY)
@@ -283,7 +299,6 @@ fun MoonHopperGame(
                 // Obstacles & Star Shards
                 obstacles.forEach { ob ->
                     if (ob.isStarShard) {
-                        val starMeasured = textMeasurer.measure("⭐", style = TextStyle(fontSize = 24.sp))
                         drawText(starMeasured, topLeft = Offset(ob.x, groundY - ob.height - ob.yOffsetFromGround))
                     } else {
                         drawRoundRect(

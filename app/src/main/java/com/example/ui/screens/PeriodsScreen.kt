@@ -58,6 +58,7 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.DailyCycleLog
@@ -81,7 +82,7 @@ import java.util.Locale
 enum class PeriodsViewTab(val label: String, val emoji: String) {
     CALENDAR("Calendar", "📅"),
     TRENDS("Trends", "📊"),
-    HISTORY("Logs & Stats", "📋")
+    HISTORY("Logs", "📋")
 }
 
 @Composable
@@ -205,7 +206,6 @@ fun PeriodsScreen(
                 val chosenTime = c.timeInMillis
                 if (targetId != null) {
                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                    SoundHelper.playCuteChime(context)
                     onEndPeriodOnDate(targetId, chosenTime)
                     particleController.spawn(
                         centerX = 500f,
@@ -245,21 +245,22 @@ fun PeriodsScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = "Period & Cycle Tracker",
                         style = MaterialTheme.typography.headlineSmall.copy(
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Serif
+                            fontWeight = FontWeight.Bold
                         ),
                         color = MaterialTheme.colorScheme.onBackground
                     )
                     Text(
-                        text = "Visual phase calendar with colored tracking dots.",
+                        text = "Visual phase calendar with cycle insights.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+
+                Spacer(modifier = Modifier.width(8.dp))
 
                 IconButton(
                     onClick = onOpenSettings,
@@ -305,18 +306,21 @@ fun PeriodsScreen(
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(vertical = 8.dp),
+                                    .padding(horizontal = 6.dp, vertical = 9.dp),
                                 horizontalArrangement = Arrangement.Center,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text(text = tab.emoji, fontSize = 16.sp)
-                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(text = tab.emoji, fontSize = 14.sp)
+                                Spacer(modifier = Modifier.width(4.dp))
                                 Text(
                                     text = tab.label,
                                     style = MaterialTheme.typography.labelMedium.copy(
                                         fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
                                     ),
-                                    color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    softWrap = false,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                             }
                         }
@@ -366,6 +370,7 @@ fun PeriodsScreen(
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Row(
+                                modifier = Modifier.weight(1f),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
@@ -378,7 +383,7 @@ fun PeriodsScreen(
                                 ) {
                                     Text(text = "📊", fontSize = 20.sp)
                                 }
-                                Column {
+                                Column(modifier = Modifier.weight(1f)) {
                                     Text(
                                         text = "6-Month Health Dashboard",
                                         style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
@@ -391,6 +396,8 @@ fun PeriodsScreen(
                                     )
                                 }
                             }
+
+                            Spacer(modifier = Modifier.width(8.dp))
 
                             Surface(
                                 shape = RoundedCornerShape(100.dp),
@@ -550,7 +557,6 @@ fun PeriodsScreen(
                                 Button(
                                     onClick = {
                                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        SoundHelper.playCuteChime(context)
                                         onEndPeriodToday()
                                         particleController.spawn(
                                             centerX = 500f,
@@ -837,8 +843,7 @@ fun PeriodsScreen(
     }
 
     // Edit Period Dialog
-    if (editingPeriodItem != null) {
-        val itemToEdit = editingPeriodItem!!
+    editingPeriodItem?.let { itemToEdit ->
         EditPeriodDialog(
             item = itemToEdit,
             onDismiss = { editingPeriodItem = null },

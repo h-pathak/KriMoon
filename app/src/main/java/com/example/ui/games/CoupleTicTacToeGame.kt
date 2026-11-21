@@ -103,6 +103,7 @@ fun CoupleTicTacToeGame(
         val sender = room.myName
         val prevHash = room.lastBlockHash.ifBlank { CoupleBlockchain.genesisHash(code) }
         val nextIndex = room.blockHeight
+        val sharedSecret = room.ecdhSharedSecretB64
         scope.launch {
             val (packet, block) = withContext(Dispatchers.Default) {
                 CoupleTurnCodec.encodeTicTacToeTurnWithBlock(
@@ -110,7 +111,8 @@ fun CoupleTicTacToeGame(
                     senderName = sender,
                     state = updatedState,
                     previousHash = prevHash,
-                    blockIndex = nextIndex
+                    blockIndex = nextIndex,
+                    ecdhSharedSecretB64 = sharedSecret
                 )
             }
             onSendLiveBlock(packet, block)

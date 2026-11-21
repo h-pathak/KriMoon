@@ -137,155 +137,48 @@ class ParticleController {
 val LocalParticleController = compositionLocalOf { ParticleController() }
 
 /**
- * 3D Ambient floating petals and sparkles drifting across the background with parallax depth.
+ * Subtle ambient watercolor light orbs (blush, lilac, and soft cream) creating a calm editorial atmosphere
+ * without floating emojis cluttering or overlapping foreground typography.
  */
 @Composable
 fun FloatingPetalsBackground(
     parallaxOffset: Offset = Offset.Zero,
     modifier: Modifier = Modifier
 ) {
-    val infiniteTransition = rememberInfiniteTransition(label = "petals_drift")
+    val blush = com.example.ui.theme.PhasesRose.copy(alpha = 0.08f)
+    val lilac = com.example.ui.theme.PhasesLavender.copy(alpha = 0.07f)
+    val sage = com.example.ui.theme.PhasesSage.copy(alpha = 0.06f)
 
-    // Drifts for 4 decorative ambient petals
-    val drift1 by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(7500, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "drift_1"
-    )
-
-    val drift2 by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(9200, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "drift_2"
-    )
-
-    val drift3 by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(8400, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "drift_3"
-    )
-
-    val drift4 by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(10600, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "drift_4"
-    )
-
-    BoxWithConstraints(
-        modifier = modifier
-            .fillMaxSize()
-            .graphicsLayer {
-                translationX = parallaxOffset.x * 0.6f
-                translationY = parallaxOffset.y * 0.6f
-            }
+    androidx.compose.foundation.Canvas(
+        modifier = modifier.fillMaxSize()
     ) {
-        val widthPx = constraints.maxWidth.toFloat()
-        val heightPx = constraints.maxHeight.toFloat()
-
-        if (widthPx > 0 && heightPx > 0) {
-            // Petal 1 (🌸)
-            val p1Y = (1f - drift1) * heightPx * 0.85f + heightPx * 0.15f
-            val p1X = widthPx * 0.12f + sin(drift1 * 6f) * 28f
-            val p1Alpha = when {
-                drift1 < 0.15f -> drift1 / 0.15f
-                drift1 > 0.85f -> (1f - drift1) / 0.15f
-                else -> 0.75f
-            }
-            Text(
-                text = "🌸",
-                fontSize = 18.sp,
-                modifier = Modifier
-                    .offset { IntOffset(p1X.roundToInt(), p1Y.roundToInt()) }
-                    .graphicsLayer {
-                        rotationZ = drift1 * 360f
-                        rotationY = drift1 * 180f
-                        alpha = p1Alpha * 0.7f
-                        scaleX = 0.9f
-                        scaleY = 0.9f
-                    }
-            )
-
-            // Petal 2 (✨)
-            val p2Y = (1f - drift2) * heightPx * 0.75f + heightPx * 0.2f
-            val p2X = widthPx * 0.78f - cos(drift2 * 5f) * 35f
-            val p2Alpha = when {
-                drift2 < 0.15f -> drift2 / 0.15f
-                drift2 > 0.85f -> (1f - drift2) / 0.15f
-                else -> 0.65f
-            }
-            Text(
-                text = "✨",
-                fontSize = 16.sp,
-                modifier = Modifier
-                    .offset { IntOffset(p2X.roundToInt(), p2Y.roundToInt()) }
-                    .graphicsLayer {
-                        rotationZ = -drift2 * 280f
-                        rotationX = drift2 * 140f
-                        alpha = p2Alpha * 0.65f
-                        scaleX = 0.8f
-                        scaleY = 0.8f
-                    }
-            )
-
-            // Petal 3 (🌸)
-            val p3Y = (1f - drift3) * heightPx * 0.9f + heightPx * 0.05f
-            val p3X = widthPx * 0.45f + sin(drift3 * 7f) * 30f
-            val p3Alpha = when {
-                drift3 < 0.15f -> drift3 / 0.15f
-                drift3 > 0.85f -> (1f - drift3) / 0.15f
-                else -> 0.8f
-            }
-            Text(
-                text = "🌸",
-                fontSize = 20.sp,
-                modifier = Modifier
-                    .offset { IntOffset(p3X.roundToInt(), p3Y.roundToInt()) }
-                    .graphicsLayer {
-                        rotationZ = drift3 * 240f
-                        rotationY = -drift3 * 160f
-                        alpha = p3Alpha * 0.65f
-                        scaleX = 0.95f
-                        scaleY = 0.95f
-                    }
-            )
-
-            // Petal 4 (💫)
-            val p4Y = (1f - drift4) * heightPx * 0.8f + heightPx * 0.1f
-            val p4X = widthPx * 0.26f + cos(drift4 * 6f) * 36f
-            val p4Alpha = when {
-                drift4 < 0.15f -> drift4 / 0.15f
-                drift4 > 0.85f -> (1f - drift4) / 0.15f
-                else -> 0.7f
-            }
-            Text(
-                text = "💫",
-                fontSize = 17.sp,
-                modifier = Modifier
-                    .offset { IntOffset(p4X.roundToInt(), p4Y.roundToInt()) }
-                    .graphicsLayer {
-                        rotationZ = -drift4 * 320f
-                        alpha = p4Alpha * 0.6f
-                        scaleX = 0.85f
-                        scaleY = 0.85f
-                    }
-            )
-        }
+        drawCircle(
+            brush = androidx.compose.ui.graphics.Brush.radialGradient(
+                colors = listOf(blush, Color.Transparent),
+                center = Offset(size.width * 0.88f, size.height * 0.10f),
+                radius = size.minDimension * 0.65f
+            ),
+            radius = size.minDimension * 0.65f,
+            center = Offset(size.width * 0.88f, size.height * 0.10f)
+        )
+        drawCircle(
+            brush = androidx.compose.ui.graphics.Brush.radialGradient(
+                colors = listOf(lilac, Color.Transparent),
+                center = Offset(size.width * 0.12f, size.height * 0.48f),
+                radius = size.minDimension * 0.58f
+            ),
+            radius = size.minDimension * 0.58f,
+            center = Offset(size.width * 0.12f, size.height * 0.48f)
+        )
+        drawCircle(
+            brush = androidx.compose.ui.graphics.Brush.radialGradient(
+                colors = listOf(sage, Color.Transparent),
+                center = Offset(size.width * 0.82f, size.height * 0.86f),
+                radius = size.minDimension * 0.52f
+            ),
+            radius = size.minDimension * 0.52f,
+            center = Offset(size.width * 0.82f, size.height * 0.86f)
+        )
     }
 }
 
@@ -359,23 +252,29 @@ private fun SingleParticleView(
         onFinished()
     }
 
-    val p = progress.value
-    val curX = particle.startX + particle.targetDx * p
-    val curY = particle.startY + particle.targetDy * p
-    val alpha = when {
-        p < 0.15f -> p / 0.15f
-        p > 0.65f -> (1f - p) / 0.35f
-        else -> 1f
-    }
-    val scale = if (p < 0.2f) (p / 0.2f) * particle.maxScale else particle.maxScale * (1f - (p - 0.2f) * 0.35f)
-    val rotation = particle.targetRot * p
-
     Text(
         text = particle.emoji,
         fontSize = 24.sp,
         modifier = Modifier
-            .offset { IntOffset(curX.roundToInt(), curY.roundToInt()) }
+            .offset {
+                val p = progress.value
+                val curX = particle.startX + particle.targetDx * p
+                val curY = particle.startY + particle.targetDy * p
+                IntOffset(curX.roundToInt(), curY.roundToInt())
+            }
             .graphicsLayer {
+                val p = progress.value
+                val alpha = when {
+                    p < 0.15f -> p / 0.15f
+                    p > 0.65f -> (1f - p) / 0.35f
+                    else -> 1f
+                }
+                val scale = if (p < 0.2f) {
+                    (p / 0.2f) * particle.maxScale
+                } else {
+                    particle.maxScale * (1f - (p - 0.2f) * 0.35f)
+                }
+                val rotation = particle.targetRot * p
                 this.alpha = alpha.coerceIn(0f, 1f)
                 this.scaleX = scale
                 this.scaleY = scale

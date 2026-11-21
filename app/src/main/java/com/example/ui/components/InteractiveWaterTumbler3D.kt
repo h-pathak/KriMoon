@@ -214,7 +214,6 @@ fun InteractiveWaterTumbler3D(
                             onTap = {
                                 val next = count + 1
                                 onLogSip()
-                                SoundHelper.playSound(context, SoundHelper.SOUND_SWEET_BUBBLE)
                                 tactile.onDropSip(next >= goal && count < goal)
 
                                 // Trigger slosh ripple physics

@@ -874,17 +874,16 @@ fun PeriodDateRangeCalendarPicker(
                 Spacer(modifier = Modifier.height(14.dp))
 
                 // Action Buttons (Save New or Update Existing)
-                if (editingPeriodId != null) {
+                val currentEditingId = editingPeriodId
+                if (currentEditingId != null) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         OutlinedButton(
                             onClick = {
-                                val id = editingPeriodId!!
-                                onDeletePeriod(id)
+                                onDeletePeriod(currentEditingId)
                                 cancelEditing()
-                                SoundHelper.playCuteChime(context)
                                 particleController.showToast(coroutineScope, "Period deleted 🗑️", "🌸")
                             },
                             shape = RoundedCornerShape(14.dp),
@@ -902,10 +901,8 @@ fun PeriodDateRangeCalendarPicker(
 
                         Button(
                             onClick = {
-                                val id = editingPeriodId!!
-                                onUpdatePeriod(id, selectedStartMillis, selectedEndMillis, periodNote)
+                                onUpdatePeriod(currentEditingId, selectedStartMillis, selectedEndMillis, periodNote)
                                 cancelEditing()
-                                SoundHelper.playCuteChime(context)
                                 particleController.spawn(
                                     centerX = 500f,
                                     centerY = 500f,
@@ -933,7 +930,6 @@ fun PeriodDateRangeCalendarPicker(
                         sparkleEmoji = "🌸",
                         onClick = {
                             onSaveNewPeriod(selectedStartMillis, selectedEndMillis, periodNote, durationDays)
-                            SoundHelper.playCuteChime(context)
                             particleController.spawn(
                                 centerX = 500f,
                                 centerY = 600f,

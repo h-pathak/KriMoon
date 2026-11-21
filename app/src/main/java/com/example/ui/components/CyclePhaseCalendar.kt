@@ -442,8 +442,7 @@ fun CyclePhaseCalendar(
     }
 
     // Phase Information Dialog
-    if (showPhaseInfoDialog != null) {
-        val phase = showPhaseInfoDialog!!
+    showPhaseInfoDialog?.let { phase ->
         androidx.compose.material3.AlertDialog(
             onDismissRequest = { showPhaseInfoDialog = null },
             title = {

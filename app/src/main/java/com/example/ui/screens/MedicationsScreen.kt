@@ -250,18 +250,20 @@ fun MedicationsScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = "Daily Schedule",
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                             color = MaterialTheme.colorScheme.onBackground
                         )
                         Text(
-                            text = "Audible chimes & cute personalized reminders",
+                            text = "Silent check-offs · audible chimes only at alarm time",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
+
+                    Spacer(modifier = Modifier.width(12.dp))
 
                     Button(
                         onClick = {
@@ -335,7 +337,9 @@ fun MedicationsScreen(
                         isTakenToday = isTakenToday,
                         onMarkTaken = {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            SoundHelper.playSound(context, med.customSound)
+                            if (totalActive > 0 && takenCount + 1 >= totalActive) {
+                                SoundHelper.playCelebration(context)
+                            }
                             onMarkTaken(med.id)
                             particleController.spawn(
                                 centerX = if (cardCenter != Offset.Zero) cardCenter.x else 500f,
@@ -377,37 +381,24 @@ fun MedicationsScreen(
             }
 
             item {
-                Spacer(modifier = Modifier.height(80.dp))
+                Spacer(modifier = Modifier.height(28.dp))
             }
         }
-
-        // Ultra-cute 3D Floating Action Button
-        CuteAddFab(
-            onClick = {
-                editingMedication = null
-                showAddEditDialog = true
-            },
-            icon = "💊",
-            haloColor = PhasesRose,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(20.dp),
-            testTag = "fab_add_medication"
-        )
     }
 
     // Add / Edit Dialog
     if (showAddEditDialog) {
+        val currentEditing = editingMedication
         AddEditMedicationDialog(
-            existing = editingMedication,
+            existing = currentEditing,
             userName = userProfile?.name ?: "Krishi",
             onDismiss = { showAddEditDialog = false },
             onSave = { name, dosage, hour, min, emoji, daysOfWeek, sound, message, instructions, colorHex ->
-                if (editingMedication == null) {
+                if (currentEditing == null) {
                     onAddMedication(name, dosage, hour, min, emoji, daysOfWeek, sound, message, instructions, colorHex)
                 } else {
                     onUpdateMedication(
-                        editingMedication!!.copy(
+                        currentEditing.copy(
                             name = name,
                             dosage = dosage,
                             hour = hour,
@@ -427,8 +418,7 @@ fun MedicationsScreen(
     }
 
     // Delete Confirmation Dialog
-    if (medicationToDelete != null) {
-        val med = medicationToDelete!!
+    medicationToDelete?.let { med ->
         AlertDialog(
             onDismissRequest = { medicationToDelete = null },
             title = {
@@ -569,7 +559,7 @@ fun MedicationCard(
                     border = BorderStroke(1.dp, PhasesPlum.copy(alpha = 0.3f)),
                     modifier = Modifier.clickable {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        SoundHelper.playSound(context, medication.customSound)
+                        SoundHelper.playAlarmOrPreview(context, medication.customSound)
                     }
                 ) {
                     Row(
@@ -1108,7 +1098,7 @@ fun AddEditMedicationDialog(
                                     .clickable {
                                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                         selectedSound = opt.key
-                                        SoundHelper.playSound(context, opt.key)
+                                        SoundHelper.playAlarmOrPreview(context, opt.key)
                                     }
                             ) {
                                 Row(
@@ -1118,7 +1108,10 @@ fun AddEditMedicationDialog(
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.weight(1f)
+                                    ) {
                                         Text(text = opt.emoji, fontSize = 18.sp)
                                         Spacer(modifier = Modifier.width(8.dp))
                                         Text(
@@ -1128,9 +1121,11 @@ fun AddEditMedicationDialog(
                                         )
                                     }
 
+                                    Spacer(modifier = Modifier.width(8.dp))
+
                                     Button(
                                         onClick = {
-                                            SoundHelper.playSound(context, opt.key)
+                                            SoundHelper.playAlarmOrPreview(context, opt.key)
                                         },
                                         shape = RoundedCornerShape(100.dp),
                                         colors = ButtonDefaults.buttonColors(

@@ -124,6 +124,7 @@ fun CoupleDoodleGame(
         val sender = currentRoom.myName
         val prevHash = currentRoom.lastBlockHash.ifBlank { CoupleBlockchain.genesisHash(code) }
         val nextIndex = currentRoom.blockHeight
+        val sharedSecret = currentRoom.ecdhSharedSecretB64
         scope.launch {
             val (packet, block) = withContext(Dispatchers.Default) {
                 CoupleTurnCodec.encodeDoodleTurnWithBlock(
@@ -132,7 +133,8 @@ fun CoupleDoodleGame(
                     prompt = currentPrompt,
                     strokes = strokesToSend,
                     previousHash = prevHash,
-                    blockIndex = nextIndex
+                    blockIndex = nextIndex,
+                    ecdhSharedSecretB64 = sharedSecret
                 )
             }
             latestOnSendLiveBlock(packet, block)

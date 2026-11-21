@@ -345,8 +345,8 @@ object NotificationHelper {
         medicineName: String = "Daily Multivitamin / Iron",
         medicineDosage: String = "1 capsule"
     ) {
-        // Play the distinctive sound immediately so user hears it directly
-        SoundHelper.playSound(context, customSound)
+        // Play the distinctive alert sound at clear alarm level
+        SoundHelper.playAlarmOrPreview(context, customSound)
 
         val timeOfDay = getTimeOfDay()
 
@@ -540,12 +540,10 @@ object NotificationHelper {
         }
 
         val intent = Intent(context, NotificationReceiver::class.java).apply {
+            setPackage(context.packageName)
             action = ACTION_MEDICINE_REMINDER
+            // Zero-plaintext IPC: pass only the database ID; receiver decrypts fresh from encrypted local vault
             putExtra(EXTRA_MEDICINE_ID, med.id)
-            putExtra(EXTRA_MEDICINE_NAME, med.name)
-            putExtra(EXTRA_MEDICINE_DOSAGE, med.dosage)
-            putExtra(EXTRA_MEDICINE_CUSTOM_SOUND, med.customSound)
-            putExtra(EXTRA_MEDICINE_CUSTOM_MESSAGE, med.customReminderMessage)
         }
 
         val requestCode = (NOTIFICATION_ID_MEDICINE_BASE + med.id).toInt()
@@ -670,13 +668,11 @@ object NotificationHelper {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        // Snooze 1 hour Action
+        // Snooze 1 hour Action (ID-only; never embed plaintext note content in broadcast extras)
         val snoozeIntent = Intent(context, NotificationReceiver::class.java).apply {
             setPackage(context.packageName)
             action = ACTION_SNOOZE_NOTE_REMINDER
             putExtra(EXTRA_NOTE_ID, noteId)
-            putExtra(EXTRA_NOTE_CONTENT, content)
-            putExtra(EXTRA_NOTE_TAG, note.tag)
         }
         val snoozePending = PendingIntent.getBroadcast(
             context,
@@ -756,11 +752,10 @@ object NotificationHelper {
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
 
         val intent = Intent(context, NotificationReceiver::class.java).apply {
+            setPackage(context.packageName)
             action = ACTION_NOTE_REMINDER
+            // Zero-plaintext IPC: pass only noteId; receiver decrypts fresh from encrypted local vault
             putExtra(EXTRA_NOTE_ID, note.id)
-            putExtra(EXTRA_NOTE_CONTENT, note.content)
-            putExtra(EXTRA_NOTE_TAG, note.tag)
-            putExtra(EXTRA_NOTE_TIMESTAMP, note.timestampMillis)
         }
 
         val requestCode = (NOTIFICATION_ID_NOTE_BASE + note.id).toInt()

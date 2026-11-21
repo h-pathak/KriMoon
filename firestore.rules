@@ -12,14 +12,6 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    function incoming() {
-      return request.resource.data;
-    }
-
-    function existing() {
-      return resource.data;
-    }
-
     function isValidId(id) {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
@@ -28,186 +20,271 @@ service cloud.firestore {
       return code is string && code.size() == 6 && code.matches('^[0-9]{6}$');
     }
 
-    function isValidSpiceLevel(level) {
-      return level in ['SWEET', 'FLIRTY', 'BOLD'];
-    }
-
-    function isValidRoomStatus(status) {
-      return status in ['WAITING', 'CONNECTED', 'UNPAIRED'];
-    }
-
-    function isValidBlockAction(action) {
-      return action in ['GENESIS_BOND', 'HANDSHAKE', 'QUIZ', 'WYR', 'DOODLE', 'TTT', 'UNPAIR'];
+    function isValidPublicKey(k) {
+      return k is string && k.size() <= 256 && k.matches('^[A-Za-z0-9+/=\\-_]*$');
     }
 
     function isValidMemberUids(uids) {
       return uids is list &&
              uids.size() >= 1 &&
              uids.size() <= 2 &&
-             uids[0] is string &&
-             uids[0].size() >= 1 &&
-             uids[0].size() <= 128 &&
+             uids[0] is string && uids[0].size() >= 1 && uids[0].size() <= 128 &&
              (uids.size() == 1 || (uids[1] is string && uids[1].size() >= 1 && uids[1].size() <= 128 && uids[1] != uids[0]));
     }
 
-    // --- Entity Validation Blueprints (Anti-Update-Gap) ---
-    function isValidCoupleRoom(data) {
-      return isValidCoupleCode(data.coupleCode) &&
-             data.creatorUid is string && data.creatorUid.size() >= 1 && data.creatorUid.size() <= 128 &&
-             data.creatorName is string && data.creatorName.size() >= 1 && data.creatorName.size() <= 32 &&
-             data.partnerUid is string && data.partnerUid.size() <= 128 &&
-             data.partnerName is string && data.partnerName.size() <= 32 &&
-             isValidMemberUids(data.memberUids) &&
-             isValidSpiceLevel(data.spiceLevel) &&
-             isValidRoomStatus(data.status) &&
-             data.blockCount is int && data.blockCount >= 0 && data.blockCount <= 100000 &&
-             data.latestBlockHash is string && data.latestBlockHash.size() <= 128 &&
-             data.createdAt is timestamp &&
-             data.updatedAt is timestamp;
+    // --- Entity Validation Blueprints (Anti-Update-Gap + ECDH Public Key Validation) ---
+    function isValidCoupleRoom(d) {
+      return isValidCoupleCode(d.coupleCode) &&
+             d.creatorUid is string && d.creatorUid.size() >= 1 && d.creatorUid.size() <= 128 &&
+             d.creatorName is string && d.creatorName.size() >= 1 && d.creatorName.size() <= 32 &&
+             isValidPublicKey(d.creatorPublicKey) &&
+             d.partnerUid is string && d.partnerUid.size() <= 128 &&
+             d.partnerName is string && d.partnerName.size() <= 32 &&
+             isValidPublicKey(d.partnerPublicKey) &&
+             d.pendingPartnerUid is string && d.pendingPartnerUid.size() <= 128 &&
+             d.pendingPartnerName is string && d.pendingPartnerName.size() <= 32 &&
+             isValidPublicKey(d.pendingPartnerPublicKey) &&
+             isValidMemberUids(d.memberUids) &&
+             d.spiceLevel in ['SWEET', 'FLIRTY', 'BOLD'] &&
+             d.status in ['WAITING', 'PENDING_APPROVAL', 'CONNECTED', 'UNPAIRED'] &&
+             d.blockCount is int && d.blockCount >= 0 && d.blockCount <= 100000 &&
+             d.latestBlockHash is string && d.latestBlockHash.size() <= 128 &&
+             d.createdAt is timestamp &&
+             d.updatedAt is timestamp;
     }
 
-    function isValidCoupleBlock(data, expectedCoupleCode) {
-      return data.coupleCode is string &&
-             data.coupleCode == expectedCoupleCode &&
-             data.senderUid is string && data.senderUid.size() >= 1 && data.senderUid.size() <= 128 &&
-             data.senderName is string && data.senderName.size() >= 1 && data.senderName.size() <= 32 &&
-             isValidMemberUids(data.memberUids) &&
-             data.blockIndex is int && data.blockIndex >= 0 && data.blockIndex <= 100000 &&
-             isValidBlockAction(data.actionType) &&
-             data.blockHash is string && data.blockHash.size() >= 8 && data.blockHash.size() <= 128 &&
-             data.encryptedPacket is string &&
-             data.encryptedPacket.size() >= 20 &&
-             data.encryptedPacket.size() <= 65536 &&
-             data.encryptedPacket.matches('^KRIMOON:BCHAIN:[A-Za-z0-9+/=\\-_]+$') &&
-             data.createdAt is timestamp;
+    function isValidCoupleBlock(d, expectedCoupleCode) {
+      return d.coupleCode is string &&
+             d.coupleCode == expectedCoupleCode &&
+             d.senderUid is string && d.senderUid.size() >= 1 && d.senderUid.size() <= 128 &&
+             d.senderName is string && d.senderName.size() >= 1 && d.senderName.size() <= 32 &&
+             isValidMemberUids(d.memberUids) &&
+             d.blockIndex is int && d.blockIndex >= 0 && d.blockIndex <= 100000 &&
+             d.actionType in [
+               'GENESIS_BOND', 'HANDSHAKE', 'QUIZ', 'WYR', 'DOODLE', 'TTT',
+               'DARE', 'WAVELENGTH', 'WHISPER', 'UNPAIR'
+             ] &&
+             d.blockHash is string && d.blockHash.size() >= 8 && d.blockHash.size() <= 128 &&
+             d.encryptedPacket is string &&
+             d.encryptedPacket.size() >= 20 &&
+             d.encryptedPacket.size() <= 65536 &&
+             d.encryptedPacket.matches('^KRIMOON:BCHAIN:[A-Za-z0-9+/=\\-_]+$') &&
+             d.createdAt is timestamp;
+    }
+
+    // Concise transition checks preventing MITM key substitution, self-approval, and rollback
+    function canRequestJoin(ext, inc, changed) {
+      return ext.status == 'WAITING' &&
+             ext.memberUids.size() == 1 &&
+             ext.partnerUid == '' &&
+             ext.pendingPartnerUid == '' &&
+             inc.memberUids == ext.memberUids &&
+             inc.partnerUid == '' &&
+             inc.partnerName == ext.partnerName &&
+             inc.partnerPublicKey == ext.get('partnerPublicKey', '') &&
+             inc.pendingPartnerUid == request.auth.uid &&
+             inc.pendingPartnerName.size() >= 1 &&
+             inc.status == 'PENDING_APPROVAL' &&
+             changed.hasOnly([
+               'pendingPartnerUid', 'pendingPartnerName', 'pendingPartnerPublicKey', 'status', 'updatedAt'
+             ]);
+    }
+
+    function canApprovePending(ext, inc, changed) {
+      return request.auth.uid == ext.creatorUid &&
+             ext.status == 'PENDING_APPROVAL' &&
+             ext.pendingPartnerUid != '' &&
+             ext.pendingPartnerName.size() >= 1 &&
+             ext.memberUids.size() == 1 &&
+             inc.pendingPartnerUid == '' &&
+             inc.pendingPartnerName == '' &&
+             inc.pendingPartnerPublicKey == '' &&
+             inc.partnerName == ext.pendingPartnerName &&
+             inc.partnerPublicKey == ext.get('pendingPartnerPublicKey', '') &&
+             inc.status == 'CONNECTED' &&
+             (
+               (ext.pendingPartnerUid != ext.creatorUid &&
+                inc.partnerUid == ext.pendingPartnerUid &&
+                inc.memberUids.size() == 2 &&
+                inc.memberUids[0] == ext.creatorUid &&
+                inc.memberUids[1] == ext.pendingPartnerUid) ||
+               (ext.pendingPartnerUid == ext.creatorUid &&
+                inc.partnerUid == '' &&
+                inc.memberUids == ext.memberUids)
+             ) &&
+             changed.hasOnly([
+               'partnerUid', 'partnerName', 'partnerPublicKey', 'memberUids',
+               'pendingPartnerUid', 'pendingPartnerName', 'pendingPartnerPublicKey',
+               'status', 'updatedAt'
+             ]);
+    }
+
+    function canDeclineOrCancel(ext, inc, changed) {
+      return (request.auth.uid == ext.creatorUid || request.auth.uid == ext.pendingPartnerUid) &&
+             ext.status == 'PENDING_APPROVAL' &&
+             inc.memberUids == ext.memberUids &&
+             inc.partnerUid == ext.partnerUid &&
+             inc.partnerName == ext.partnerName &&
+             inc.partnerPublicKey == ext.get('partnerPublicKey', '') &&
+             inc.pendingPartnerUid == '' &&
+             inc.pendingPartnerName == '' &&
+             inc.pendingPartnerPublicKey == '' &&
+             inc.status == 'WAITING' &&
+             changed.hasOnly([
+               'pendingPartnerUid', 'pendingPartnerName', 'pendingPartnerPublicKey', 'status', 'updatedAt'
+             ]);
+    }
+
+    function canSyncRoomMeta(ext, inc, changed) {
+      return request.auth.uid in ext.memberUids &&
+             inc.memberUids == ext.memberUids &&
+             inc.partnerUid == ext.partnerUid &&
+             inc.partnerName == ext.partnerName &&
+             inc.partnerPublicKey == ext.get('partnerPublicKey', '') &&
+             inc.pendingPartnerUid == ext.pendingPartnerUid &&
+             inc.pendingPartnerName == ext.pendingPartnerName &&
+             inc.pendingPartnerPublicKey == ext.get('pendingPartnerPublicKey', '') &&
+             inc.status == ext.status &&
+             inc.blockCount >= ext.blockCount &&
+             changed.hasOnly([
+               'spiceLevel', 'blockCount', 'latestBlockHash', 'updatedAt'
+             ]);
+    }
+
+    function canUnpairRoom(ext, inc, changed) {
+      return request.auth.uid in ext.memberUids &&
+             inc.memberUids == ext.memberUids &&
+             inc.partnerUid == ext.partnerUid &&
+             inc.partnerName == ext.partnerName &&
+             inc.partnerPublicKey == ext.get('partnerPublicKey', '') &&
+             inc.pendingPartnerUid == '' &&
+             inc.pendingPartnerName == '' &&
+             inc.pendingPartnerPublicKey == '' &&
+             inc.status == 'UNPAIRED' &&
+             changed.hasOnly([
+               'status', 'pendingPartnerUid', 'pendingPartnerName', 'pendingPartnerPublicKey', 'updatedAt'
+             ]);
+    }
+
+    function canUpdateRoom(coupleCode) {
+      let ext = resource.data;
+      let inc = request.resource.data;
+      let changed = inc.diff(ext).affectedKeys();
+      return isSignedIn() &&
+             isValidCoupleCode(coupleCode) &&
+             ext.status != 'UNPAIRED' &&
+             inc.coupleCode == ext.coupleCode &&
+             inc.creatorUid == ext.creatorUid &&
+             inc.creatorName == ext.creatorName &&
+             inc.creatorPublicKey == ext.get('creatorPublicKey', '') &&
+             inc.createdAt == ext.createdAt &&
+             inc.updatedAt <= request.time &&
+             isValidCoupleRoom(inc) && (
+               canRequestJoin(ext, inc, changed) ||
+               canApprovePending(ext, inc, changed) ||
+               canDeclineOrCancel(ext, inc, changed) ||
+               canSyncRoomMeta(ext, inc, changed) ||
+               canUnpairRoom(ext, inc, changed)
+             );
+    }
+
+    function parentRoomAllowsBlock(coupleCode, blockMemberUids) {
+      let roomDoc = get(/databases/$(database)/documents/coupleRooms/$(coupleCode));
+      return roomDoc != null &&
+             roomDoc.data.status != 'UNPAIRED' &&
+             request.auth.uid in roomDoc.data.memberUids &&
+             blockMemberUids == roomDoc.data.memberUids;
     }
 
     // --- Couple Rooms Collection ---
     match /coupleRooms/{coupleCode} {
       // Allow single-doc get for:
-      // 1) Non-existent room lookup (checking code availability)
+      // 1) Non-existent room lookup (verifying global code availability)
       // 2) Bonded members of this room
-      // 3) An authenticated partner joining an open WAITING 1-member room by exact 6-digit code
+      // 3) Pending partner observing whether Host approved or declined their request
+      // 4) Authenticated partner looking up an open WAITING 1-member room by exact 6-digit code
       allow get: if isSignedIn() &&
                     isValidCoupleCode(coupleCode) && (
                       resource == null ||
-                      request.auth.uid in existing().memberUids ||
-                      (existing().status == 'WAITING' && existing().memberUids.size() == 1)
+                      request.auth.uid in resource.data.memberUids ||
+                      request.auth.uid == resource.data.pendingPartnerUid ||
+                      (resource.data.status == 'WAITING' && resource.data.memberUids.size() == 1)
                     );
 
-      // List strictly scoped to rooms where the caller is a bonded member
-      allow list: if isSignedIn() && request.auth.uid in existing().memberUids;
+      // List strictly scoped to rooms where caller is a bonded member or pending requester
+      allow list: if isSignedIn() && (
+        request.auth.uid in resource.data.memberUids ||
+        request.auth.uid == resource.data.pendingPartnerUid
+      );
 
-      // Create: authenticated creator initializes a 1-member WAITING room
+      // Create: authenticated Host reserves a globally unique, never-before-used 6-digit code
+      // and pins their immutable ECDH P-256 public key.
       allow create: if isSignedIn() &&
                        isValidCoupleCode(coupleCode) &&
-                       incoming().keys().hasAll([
-                         'coupleCode', 'creatorUid', 'creatorName', 'partnerUid', 'partnerName',
+                       request.resource.data.keys().hasAll([
+                         'coupleCode', 'creatorUid', 'creatorName', 'creatorPublicKey',
+                         'partnerUid', 'partnerName', 'partnerPublicKey',
+                         'pendingPartnerUid', 'pendingPartnerName', 'pendingPartnerPublicKey',
                          'memberUids', 'spiceLevel', 'status', 'blockCount', 'latestBlockHash',
                          'createdAt', 'updatedAt'
                        ]) &&
-                       incoming().keys().hasOnly([
-                         'coupleCode', 'creatorUid', 'creatorName', 'partnerUid', 'partnerName',
+                       request.resource.data.keys().hasOnly([
+                         'coupleCode', 'creatorUid', 'creatorName', 'creatorPublicKey',
+                         'partnerUid', 'partnerName', 'partnerPublicKey',
+                         'pendingPartnerUid', 'pendingPartnerName', 'pendingPartnerPublicKey',
                          'memberUids', 'spiceLevel', 'status', 'blockCount', 'latestBlockHash',
                          'createdAt', 'updatedAt'
                        ]) &&
-                       isValidCoupleRoom(incoming()) &&
-                       incoming().coupleCode == coupleCode &&
-                       incoming().creatorUid == request.auth.uid &&
-                       incoming().partnerUid == '' &&
-                       incoming().memberUids.size() == 1 &&
-                       incoming().memberUids[0] == request.auth.uid &&
-                       incoming().status == 'WAITING' &&
-                       incoming().createdAt <= request.time &&
-                       incoming().updatedAt <= request.time;
+                       isValidCoupleRoom(request.resource.data) &&
+                       request.resource.data.coupleCode == coupleCode &&
+                       request.resource.data.creatorUid == request.auth.uid &&
+                       request.resource.data.partnerUid == '' &&
+                       request.resource.data.partnerName == '' &&
+                       request.resource.data.partnerPublicKey == '' &&
+                       request.resource.data.pendingPartnerUid == '' &&
+                       request.resource.data.pendingPartnerName == '' &&
+                       request.resource.data.pendingPartnerPublicKey == '' &&
+                       request.resource.data.memberUids.size() == 1 &&
+                       request.resource.data.memberUids[0] == request.auth.uid &&
+                       request.resource.data.status == 'WAITING' &&
+                       request.resource.data.createdAt <= request.time &&
+                       request.resource.data.updatedAt <= request.time;
 
-      // Action-Based Updates: validation helper wraps entire update; terminal UNPAIRED state locked
-      allow update: if isSignedIn() &&
-                       isValidCoupleCode(coupleCode) &&
-                       isValidCoupleRoom(incoming()) &&
-                       existing().status != 'UNPAIRED' &&
-                       incoming().coupleCode == existing().coupleCode &&
-                       incoming().creatorUid == existing().creatorUid &&
-                       incoming().createdAt == existing().createdAt &&
-                       incoming().updatedAt <= request.time && (
-                         // Action 1: Partner joins open 1-member room (locks room to 2 members)
-                         (
-                           existing().status == 'WAITING' &&
-                           existing().memberUids.size() == 1 &&
-                           existing().partnerUid == '' &&
-                           !(request.auth.uid in existing().memberUids) &&
-                           incoming().partnerUid == request.auth.uid &&
-                           incoming().memberUids.size() == 2 &&
-                           incoming().memberUids[0] == existing().creatorUid &&
-                           incoming().memberUids[1] == request.auth.uid &&
-                           incoming().status == 'CONNECTED' &&
-                           incoming().diff(existing()).affectedKeys().hasOnly([
-                             'partnerUid', 'partnerName', 'memberUids', 'status', 'updatedAt'
-                           ])
-                         ) ||
-                         // Action 2: Bonded member syncs vibe, partner name, or blockchain head
-                         (
-                           request.auth.uid in existing().memberUids &&
-                           incoming().memberUids == existing().memberUids &&
-                           incoming().partnerUid == existing().partnerUid &&
-                           (incoming().status == existing().status || (existing().status == 'WAITING' && incoming().status == 'CONNECTED')) &&
-                           incoming().diff(existing()).affectedKeys().hasOnly([
-                             'creatorName', 'partnerName', 'spiceLevel', 'status', 'blockCount', 'latestBlockHash', 'updatedAt'
-                           ])
-                         ) ||
-                         // Action 3: Bonded member breaks bond (terminal UNPAIRED lock)
-                         (
-                           request.auth.uid in existing().memberUids &&
-                           incoming().memberUids == existing().memberUids &&
-                           incoming().partnerUid == existing().partnerUid &&
-                           incoming().status == 'UNPAIRED' &&
-                           incoming().diff(existing()).affectedKeys().hasOnly([
-                             'status', 'updatedAt'
-                           ])
-                         )
-                       );
+      allow update: if canUpdateRoom(coupleCode);
 
-      allow delete: if isSignedIn() &&
-                       isValidCoupleCode(coupleCode) &&
-                       request.auth.uid in existing().memberUids;
+      // NEVER allow deleting a room document so a generated 6-digit code can never be reused.
+      allow delete: if false;
 
-      // --- Append-Only Encrypted Blockchain Blocks Subcollection ---
+      // --- Truly Immutable, Append-Only Encrypted Blockchain Blocks Subcollection ---
       match /blocks/{blockId} {
         allow get: if isSignedIn() &&
                       isValidCoupleCode(coupleCode) &&
                       isValidId(blockId) &&
-                      request.auth.uid in existing().memberUids;
+                      request.auth.uid in resource.data.memberUids;
 
         // Client MUST query with .whereArrayContains("memberUids", uid)
-        allow list: if isSignedIn() && request.auth.uid in existing().memberUids;
+        allow list: if isSignedIn() && request.auth.uid in resource.data.memberUids;
 
         allow create: if isSignedIn() &&
                          isValidCoupleCode(coupleCode) &&
                          isValidId(blockId) &&
-                         incoming().keys().hasAll([
+                         request.resource.data.keys().hasAll([
                            'coupleCode', 'senderUid', 'senderName', 'memberUids',
                            'blockIndex', 'actionType', 'blockHash', 'encryptedPacket', 'createdAt'
                          ]) &&
-                         incoming().keys().hasOnly([
+                         request.resource.data.keys().hasOnly([
                            'coupleCode', 'senderUid', 'senderName', 'memberUids',
                            'blockIndex', 'actionType', 'blockHash', 'encryptedPacket', 'createdAt'
                          ]) &&
-                         isValidCoupleBlock(incoming(), coupleCode) &&
-                         incoming().senderUid == request.auth.uid &&
-                         request.auth.uid in incoming().memberUids &&
-                         incoming().createdAt <= request.time &&
-                         exists(/databases/$(database)/documents/coupleRooms/$(coupleCode)) &&
-                         request.auth.uid in get(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.memberUids &&
-                         get(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.status != 'UNPAIRED' &&
-                         incoming().memberUids == get(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.memberUids;
+                         isValidCoupleBlock(request.resource.data, coupleCode) &&
+                         request.resource.data.senderUid == request.auth.uid &&
+                         request.auth.uid in request.resource.data.memberUids &&
+                         request.resource.data.createdAt <= request.time &&
+                         parentRoomAllowsBlock(coupleCode, request.resource.data.memberUids);
 
-        // Immutable blockchain blocks cannot be mutated
+        // Immutable blockchain blocks cannot be mutated or deleted
         allow update: if false;
-
-        allow delete: if isSignedIn() &&
-                         isValidCoupleCode(coupleCode) &&
-                         isValidId(blockId) &&
-                         request.auth.uid in existing().memberUids;
+        allow delete: if false;
       }
     }
   }

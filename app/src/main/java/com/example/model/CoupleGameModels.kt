@@ -4,15 +4,20 @@ import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 import java.nio.charset.StandardCharsets
+import java.security.KeyFactory
+import java.security.KeyPairGenerator
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.security.spec.ECGenParameterSpec
+import java.security.spec.PKCS8EncodedKeySpec
+import java.security.spec.X509EncodedKeySpec
 import javax.crypto.Cipher
+import javax.crypto.KeyAgreement
 import javax.crypto.Mac
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.SecretKeySpec
-import kotlin.random.Random
 
 enum class SpiceLevel(
     val title: String,
@@ -49,7 +54,8 @@ data class RoundSyncState(
     val roundIndex: Int = 0,
     val myChoice: Int? = null,
     val partnerChoice: Int? = null,
-    val partnerName: String = ""
+    val partnerName: String = "",
+    val history: List<RoundOutcome> = emptyList()
 )
 
 data class TicTacToeSyncState(
@@ -139,6 +145,28 @@ sealed class DecodedTurnPacket {
         override val block: CoupleBlock
     ) : DecodedTurnPacket()
 
+    data class DareTurn(
+        override val coupleCode: String,
+        override val senderName: String,
+        val state: DareSyncState,
+        override val block: CoupleBlock
+    ) : DecodedTurnPacket()
+
+    data class WavelengthTurn(
+        override val coupleCode: String,
+        override val senderName: String,
+        val state: WavelengthSyncState,
+        override val block: CoupleBlock
+    ) : DecodedTurnPacket()
+
+    data class WhisperTurn(
+        override val coupleCode: String,
+        override val senderName: String,
+        val likedDateId: String,
+        val whisperNote: SecretWhisperNote?,
+        override val block: CoupleBlock
+    ) : DecodedTurnPacket()
+
     data class UnpairNotice(
         override val coupleCode: String,
         override val senderName: String,
@@ -146,10 +174,125 @@ sealed class DecodedTurnPacket {
     ) : DecodedTurnPacket()
 }
 
+data class CoupleEcdhKeyPair(
+    val publicKeyB64: String,
+    val privateKeyB64: String
+)
+
+/**
+ * True Zero-Knowledge Elliptic-Curve Diffie-Hellman (P-256 / secp256r1) + RFC 5869 HKDF-SHA256.
+ * Private keys are generated on-device and stored encrypted via Android Keystore — they never leave the phone.
+ * Only X.509 SPKI public keys are exchanged in Firestore, making Couple Lounge payloads unreadable
+ * to Firebase servers or anyone who knows the 6-digit room code.
+ */
+object CoupleEcdhEngine {
+    private const val CURVE_NAME = "secp256r1"
+
+    fun generateKeyPair(): CoupleEcdhKeyPair {
+        val kpg = KeyPairGenerator.getInstance("EC")
+        kpg.initialize(ECGenParameterSpec(CURVE_NAME), SecureRandom())
+        val kp = kpg.generateKeyPair()
+        val pubB64 = Base64.encodeToString(kp.public.encoded, Base64.NO_WRAP)
+        val privB64 = Base64.encodeToString(kp.private.encoded, Base64.NO_WRAP)
+        return CoupleEcdhKeyPair(publicKeyB64 = pubB64, privateKeyB64 = privB64)
+    }
+
+    fun isValidPublicKeyB64(publicKeyB64: String): Boolean {
+        if (publicKeyB64.length !in 80..256) return false
+        return try {
+            val bytes = Base64.decode(publicKeyB64, Base64.NO_WRAP)
+            KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(bytes))
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * Derives a 256-bit zero-knowledge shared master secret (Base64) from local private key + peer public key,
+     * bound via HKDF-SHA256 to the room code and lexicographically sorted public keys (transcript binding).
+     */
+    fun deriveSharedSecretB64(
+        myPrivateKeyB64: String,
+        peerPublicKeyB64: String,
+        coupleCode: String,
+        myPublicKeyB64: String
+    ): String? {
+        if (myPrivateKeyB64.isBlank() || peerPublicKeyB64.isBlank()) return null
+        return try {
+            val keyFactory = KeyFactory.getInstance("EC")
+            val privKey = keyFactory.generatePrivate(
+                PKCS8EncodedKeySpec(Base64.decode(myPrivateKeyB64, Base64.NO_WRAP))
+            )
+            val peerPub = keyFactory.generatePublic(
+                X509EncodedKeySpec(Base64.decode(peerPublicKeyB64, Base64.NO_WRAP))
+            )
+            val agreement = KeyAgreement.getInstance("ECDH")
+            agreement.init(privKey)
+            agreement.doPhase(peerPub, true)
+            val rawSecret = agreement.generateSecret()
+
+            val sortedPubs = listOf(myPublicKeyB64.trim(), peerPublicKeyB64.trim()).sorted()
+            val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
+            val saltInput = "KriMoon_ECDH_Salt_v3|$cleanCode|${sortedPubs[0]}|${sortedPubs[1]}"
+            val salt = MessageDigest.getInstance("SHA-256")
+                .digest(saltInput.toByteArray(StandardCharsets.UTF_8))
+
+            val prk = hkdfExtract(salt = salt, ikm = rawSecret)
+            val masterSecret = hkdfExpand(
+                prk = prk,
+                info = "KriMoon_MasterSecret_v3|$cleanCode".toByteArray(StandardCharsets.UTF_8),
+                length = 32
+            )
+            Base64.encodeToString(masterSecret, Base64.NO_WRAP)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    fun hkdfExtract(salt: ByteArray, ikm: ByteArray): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(salt, "HmacSHA256"))
+        return mac.doFinal(ikm)
+    }
+
+    fun hkdfExpand(prk: ByteArray, info: ByteArray, length: Int): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(prk, "HmacSHA256"))
+        val output = ByteArray(length)
+        var t = ByteArray(0)
+        var offset = 0
+        var counter = 1
+        while (offset < length) {
+            mac.reset()
+            mac.update(t)
+            mac.update(info)
+            mac.update(counter.toByte())
+            t = mac.doFinal()
+            val copyLen = minOf(t.size, length - offset)
+            System.arraycopy(t, 0, output, offset, copyLen)
+            offset += copyLen
+            counter++
+        }
+        return output
+    }
+
+    /**
+     * Generates a human-verifiable 16-character safety fingerprint from both public keys
+     * so partners can verify zero man-in-the-middle tampering.
+     */
+    fun safetyFingerprint(pubKeyA: String, pubKeyB: String, coupleCode: String): String {
+        if (pubKeyA.isBlank() || pubKeyB.isBlank()) return CoupleCryptoEngine.keyFingerprint(coupleCode)
+        val sorted = listOf(pubKeyA.trim(), pubKeyB.trim()).sorted()
+        val hash = CoupleCryptoEngine.sha256Hex("KriMoon_ECDH_FP_v3|$coupleCode|${sorted[0]}|${sorted[1]}").uppercase()
+        return "${hash.substring(0, 4)}-${hash.substring(4, 8)}-${hash.substring(8, 12)}-${hash.substring(12, 16)}"
+    }
+}
+
 /**
  * End-to-End Authenticated Encryption Engine for Couple Lounge.
- * Uses PBKDF2WithHmacSHA256 key derivation, AES-256-GCM authenticated encryption
- * with 96-bit SecureRandom IV and 128-bit GCM auth tag, plus separated HMAC-SHA256 signing.
+ * - Protocol v3 (Zero-Knowledge Connected): ECDH P-256 + HKDF-SHA256 derived AES-256-GCM + HMAC-SHA256 keys.
+ * - Protocol v2 (Pass & Play / Pre-ECDH legacy fallback): PBKDF2-HMAC-SHA256 derived keys.
  */
 object CoupleCryptoEngine {
     private const val PBKDF2_ITERATIONS = 4096
@@ -164,15 +307,23 @@ object CoupleCryptoEngine {
         return bytes.joinToString("") { "%02x".format(it) }
     }
 
-    fun deriveAesKey(coupleCode: String): SecretKeySpec {
+    fun deriveAesKey(coupleCode: String, ecdhSharedSecretB64: String = ""): SecretKeySpec {
         val normalized = CoupleTurnCodec.normalizeCode(coupleCode)
+        if (ecdhSharedSecretB64.isNotBlank()) {
+            val master = Base64.decode(ecdhSharedSecretB64, Base64.NO_WRAP)
+            val aesBytes = CoupleEcdhEngine.hkdfExpand(
+                prk = master,
+                info = "KriMoon_AES256GCM_v3|$normalized".toByteArray(StandardCharsets.UTF_8),
+                length = 32
+            )
+            return SecretKeySpec(aesBytes, "AES")
+        }
         val salt = "KriMoon_AES256_Vault_Salt_v2_$normalized".toByteArray(StandardCharsets.UTF_8)
         val keyBytes = try {
             val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
             val spec = PBEKeySpec(normalized.toCharArray(), salt, PBKDF2_ITERATIONS, KEY_BITS)
             factory.generateSecret(spec).encoded
         } catch (_: Exception) {
-            // Fallback multi-round SHA-256 stretching if provider is restricted
             var digest = MessageDigest.getInstance("SHA-256")
                 .digest((normalized + "_aes_fallback").toByteArray(StandardCharsets.UTF_8))
             repeat(512) {
@@ -183,8 +334,16 @@ object CoupleCryptoEngine {
         return SecretKeySpec(keyBytes, "AES")
     }
 
-    fun deriveHmacKey(coupleCode: String): ByteArray {
+    fun deriveHmacKey(coupleCode: String, ecdhSharedSecretB64: String = ""): ByteArray {
         val normalized = CoupleTurnCodec.normalizeCode(coupleCode)
+        if (ecdhSharedSecretB64.isNotBlank()) {
+            val master = Base64.decode(ecdhSharedSecretB64, Base64.NO_WRAP)
+            return CoupleEcdhEngine.hkdfExpand(
+                prk = master,
+                info = "KriMoon_HMACSHA256_v3|$normalized".toByteArray(StandardCharsets.UTF_8),
+                length = 32
+            )
+        }
         val salt = "KriMoon_HMAC256_Sign_Salt_v2_$normalized".toByteArray(StandardCharsets.UTF_8)
         return try {
             val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
@@ -196,9 +355,9 @@ object CoupleCryptoEngine {
         }
     }
 
-    fun computeHmacHex(coupleCode: String, data: String): String {
+    fun computeHmacHex(coupleCode: String, data: String, ecdhSharedSecretB64: String = ""): String {
         val mac = Mac.getInstance("HmacSHA256")
-        mac.init(SecretKeySpec(deriveHmacKey(coupleCode), "HmacSHA256"))
+        mac.init(SecretKeySpec(deriveHmacKey(coupleCode, ecdhSharedSecretB64), "HmacSHA256"))
         val raw = mac.doFinal(data.toByteArray(StandardCharsets.UTF_8))
         return raw.joinToString("") { "%02x".format(it) }
     }
@@ -219,24 +378,34 @@ object CoupleCryptoEngine {
         return "${hash.substring(0, 4)}-${hash.substring(4, 8)}-${hash.substring(8, 12)}-${hash.substring(12, 16)}"
     }
 
-    fun encryptPayload(plainJson: String, coupleCode: String, aad: String): EncryptedEnvelope {
+    fun encryptPayload(
+        plainJson: String,
+        coupleCode: String,
+        aad: String,
+        ecdhSharedSecretB64: String = ""
+    ): EncryptedEnvelope {
         val iv = ByteArray(GCM_IV_BYTES)
         secureRandom.nextBytes(iv)
 
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        val keySpec = deriveAesKey(coupleCode)
+        val keySpec = deriveAesKey(coupleCode, ecdhSharedSecretB64)
         cipher.init(Cipher.ENCRYPT_MODE, keySpec, GCMParameterSpec(GCM_TAG_BITS, iv))
         cipher.updateAAD(aad.toByteArray(StandardCharsets.UTF_8))
 
         val cipherBytes = cipher.doFinal(plainJson.toByteArray(StandardCharsets.UTF_8))
         val ivB64 = Base64.encodeToString(iv, Base64.NO_WRAP)
         val cipherB64 = Base64.encodeToString(cipherBytes, Base64.NO_WRAP)
-        val hmacHex = computeHmacHex(coupleCode, "$ivB64.$cipherB64.$aad")
+        val hmacHex = computeHmacHex(coupleCode, "$ivB64.$cipherB64.$aad", ecdhSharedSecretB64)
 
         return EncryptedEnvelope(
             ivBase64 = ivB64,
             cipherBase64 = cipherB64,
-            hmacHex = hmacHex
+            hmacHex = hmacHex,
+            cipherSuite = if (ecdhSharedSecretB64.isNotBlank()) {
+                "ECDH-P256/HKDF-SHA256/AES-256-GCM"
+            } else {
+                "AES-256-GCM/PBKDF2-HMAC-SHA256"
+            }
         )
     }
 
@@ -245,13 +414,14 @@ object CoupleCryptoEngine {
         cipherBase64: String,
         expectedHmacHex: String,
         coupleCode: String,
-        aad: String
+        aad: String,
+        ecdhSharedSecretB64: String = ""
     ): Result<String> {
         return try {
-            val computedHmac = computeHmacHex(coupleCode, "$ivBase64.$cipherBase64.$aad")
+            val computedHmac = computeHmacHex(coupleCode, "$ivBase64.$cipherBase64.$aad", ecdhSharedSecretB64)
             if (!constantTimeEquals(computedHmac, expectedHmacHex)) {
                 return Result.failure(
-                    SecurityException("FIREWALL BLOCKED: HMAC-SHA256 signature mismatch (wrong Couple Code or tampered packet).")
+                    SecurityException("FIREWALL BLOCKED: HMAC-SHA256 signature mismatch (wrong key or tampered packet).")
                 )
             }
             val iv = Base64.decode(ivBase64, Base64.NO_WRAP)
@@ -260,7 +430,7 @@ object CoupleCryptoEngine {
             }
             val cipherBytes = Base64.decode(cipherBase64, Base64.NO_WRAP)
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            val keySpec = deriveAesKey(coupleCode)
+            val keySpec = deriveAesKey(coupleCode, ecdhSharedSecretB64)
             cipher.init(Cipher.DECRYPT_MODE, keySpec, GCMParameterSpec(GCM_TAG_BITS, iv))
             cipher.updateAAD(aad.toByteArray(StandardCharsets.UTF_8))
             val plainBytes = cipher.doFinal(cipherBytes)
@@ -471,7 +641,8 @@ object CoupleFirewall {
         expectedCoupleCode: String,
         existingLedger: List<CoupleBlock> = emptyList(),
         lockedPartnerName: String = "",
-        myName: String = ""
+        myName: String = "",
+        ecdhSharedSecretB64: String = ""
     ): Result<DecodedTurnPacket> {
         // Rule 0: Sliding-Window Rate Limiter & Flood Guard
         if (!com.example.security.BackendSecurityFirewall.allowRateLimitedOperation("couple_pkt_$expectedCoupleCode", maxOpsPerWindow = 50)) {
@@ -492,123 +663,29 @@ object CoupleFirewall {
             }
         }
 
-        // Delegate to Codec which executes Rule 2 (Room Tag), Rule 3 (HMAC-SHA256 & AES-256-GCM),
+        // Delegate to Codec which executes Rule 2 (Room Tag), Rule 3 (ECDH+HKDF / HMAC-SHA256 & AES-256-GCM),
         // Rule 4 (Blockchain PoW & Payload Hash), Rule 5 (Anti-Replay), and Rule 6 (Partner Lock).
         return CoupleTurnCodec.decodeSecuredPacket(
             rawInput = trimmed,
             expectedCoupleCode = expectedCoupleCode,
             existingLedger = existingLedger,
             lockedPartnerName = lockedPartnerName,
-            myName = myName
+            myName = myName,
+            ecdhSharedSecretB64 = ecdhSharedSecretB64
         )
     }
 }
 
 object CoupleGameDecks {
 
-    val doodlePrompts = listOf(
-        "Us on our dream date 🌙✨",
-        "Our future cozy apartment 🏡",
-        "Draw what you want to kiss right now 💋",
-        "Your partner as a cute animal 🐱",
-        "Late-night snack craving 🍓🍫",
-        "What we're doing next time we meet 🔥",
-        "Our signature couple tattoo 💕",
-        "Midnight stargazing picnic 🌌"
-    )
+    val doodlePrompts: List<String>
+        get() = LocalCoupleQuestionEngine.expandedDoodlePrompts
 
-    val quizQuestions: List<CoupleQuizQuestion> = listOf(
-        // SWEET
-        CoupleQuizQuestion(
-            id = "sq1",
-            prompt = "What is our ideal zero-effort Sunday morning together?",
-            options = listOf("Cuddling under blankets", "Coffee + pancakes in bed", "Binge-watching in hoodies", "Long sleepy voice call"),
-            spiceLevel = SpiceLevel.SWEET
-        ),
-        CoupleQuizQuestion(
-            id = "sq2",
-            prompt = "Which small gesture melts my heart fastest?",
-            options = listOf("Random 'miss you' text", "Forehead kiss", "Remembering tiny details", "Surprise snack delivery"),
-            spiceLevel = SpiceLevel.SWEET
-        ),
-        CoupleQuizQuestion(
-            id = "sq3",
-            prompt = "When we reunite after long distance, what happens in the first 10 seconds?",
-            options = listOf("Lift-off bear hug", "Non-stop kisses", "Happy tears & giggles", "Freeze and stare in awe"),
-            spiceLevel = SpiceLevel.SWEET
-        ),
-        CoupleQuizQuestion(
-            id = "sq4",
-            prompt = "What song or vibe screams 'us'?",
-            options = listOf("Late-night R&B slow jam", "Dreamy indie pop", "90s nostalgic love ballad", "Upbeat chaotic dance track"),
-            spiceLevel = SpiceLevel.SWEET
-        ),
-        // FLIRTY
-        CoupleQuizQuestion(
-            id = "fq1",
-            prompt = "Where should my next unexpected kiss land?",
-            options = listOf("Right on the neck", "Corner of the lips", "Slow lip lock", "Collarbone tease"),
-            spiceLevel = SpiceLevel.FLIRTY
-        ),
-        CoupleQuizQuestion(
-            id = "fq2",
-            prompt = "What outfit or look on me drives you the wildest?",
-            options = listOf("Oversized tee & nothing else", "Dressed up for date night", "Fresh out of the shower", "Cozy fitted loungewear"),
-            spiceLevel = SpiceLevel.FLIRTY
-        ),
-        CoupleQuizQuestion(
-            id = "fq3",
-            prompt = "If I whisper something teasing during a boring call, how do you react?",
-            options = listOf("Blush & lose train of thought", "Tease right back harder", "Demand a private replay later", "Smirk and bite my lip"),
-            spiceLevel = SpiceLevel.FLIRTY
-        ),
-        CoupleQuizQuestion(
-            id = "fq4",
-            prompt = "Which romantic tension trope fits us best?",
-            options = listOf("Hands wandering under the table", "Rain-soaked slow kiss", "Pinned gently against the wall", "Stolen glances across the room"),
-            spiceLevel = SpiceLevel.FLIRTY
-        ),
-        // BOLD / AFTER-DARK
-        CoupleQuizQuestion(
-            id = "bq1",
-            prompt = "On our next private weekend away, what's the #1 rule?",
-            options = listOf("Phones on DND all weekend", "Zero rush, pure chemistry", "Room service & candlelight only", "You're in charge tonight"),
-            spiceLevel = SpiceLevel.BOLD
-        ),
-        CoupleQuizQuestion(
-            id = "bq2",
-            prompt = "What kind of late-night voice note from me makes your pulse race?",
-            options = listOf("Soft sleepy whispers", "Confessing what I crave next", "Playful teasing dare", "Describing our reunion kiss"),
-            spiceLevel = SpiceLevel.BOLD
-        ),
-        CoupleQuizQuestion(
-            id = "bq3",
-            prompt = "Which midnight energy describes our chemistry best?",
-            options = listOf("Slow, intense eye contact", "Playful biting & laughs", "Can't-keep-hands-off-you", "Whispered secrets in the dark"),
-            spiceLevel = SpiceLevel.BOLD
-        ),
-        CoupleQuizQuestion(
-            id = "bq4",
-            prompt = "First 30 minutes behind closed doors when we finally see each other?",
-            options = listOf("Make out like we're in a movie", "Take turns spoiling each other", "Shower together & decompress", "Lock the door & forget time"),
-            spiceLevel = SpiceLevel.BOLD
-        )
-    )
+    val quizQuestions: List<CoupleQuizQuestion>
+        get() = LocalCoupleQuestionEngine.taggedQuizBank.map { it.question }
 
-    val wouldYouRatherPrompts: List<WouldYouRatherPrompt> = listOf(
-        // SWEET
-        WouldYouRatherPrompt("sw1", "Fall asleep on FaceTime every night", "Write each other weekly love letters", SpiceLevel.SWEET),
-        WouldYouRatherPrompt("sw2", "Cook chaotic dinner together at 1 AM", "Stargaze from a cozy rooftop", SpiceLevel.SWEET),
-        WouldYouRatherPrompt("sw3", "Wear matching hoodies in public", "Have a secret handshake only we know", SpiceLevel.SWEET),
-        // FLIRTY
-        WouldYouRatherPrompt("fw1", "Receive a spicy surprise voice note mid-day", "Get pulled in for a sudden doorway kiss", SpiceLevel.FLIRTY),
-        WouldYouRatherPrompt("fw2", "Slow dance in the kitchen at midnight", "Steamy bubble bath with candles", SpiceLevel.FLIRTY),
-        WouldYouRatherPrompt("fw3", "Tease each other in public without touching", "Sneak away from a party for 10 minutes", SpiceLevel.FLIRTY),
-        // BOLD / AFTER-DARK
-        WouldYouRatherPrompt("bw1", "Play Truth or Dare with zero skips tonight", "Let your partner call every shot on date night", SpiceLevel.BOLD),
-        WouldYouRatherPrompt("bw2", "Weekend locked in a mountain cabin", "Suite with a private rooftop hot tub", SpiceLevel.BOLD),
-        WouldYouRatherPrompt("bw3", "Slow teasing buildup all evening", "Immediate 'drop everything' reunion", SpiceLevel.BOLD)
-    )
+    val wouldYouRatherPrompts: List<WouldYouRatherPrompt>
+        get() = LocalCoupleQuestionEngine.taggedWyrBank.map { it.prompt }
 
     fun quizForSpice(spiceLevel: SpiceLevel): List<CoupleQuizQuestion> {
         val exact = quizQuestions.filter { it.spiceLevel == spiceLevel }
@@ -625,12 +702,14 @@ object CoupleTurnCodec {
     private const val PREFIX = "KRIMOON:"
     private const val BCHAIN_PREFIX = "KRIMOON:BCHAIN:"
 
+    private val codeRandom = SecureRandom()
+
     fun generateUniqueCode(existingCodes: Set<String> = emptySet()): String {
-        repeat(40) {
-            val candidate = Random.nextInt(100_000, 999_999).toString()
+        repeat(60) {
+            val candidate = (100_000 + codeRandom.nextInt(900_000)).toString()
             if (candidate !in existingCodes) return candidate
         }
-        return (System.currentTimeMillis() % 899_999 + 100_000).toString()
+        return (100_000 + codeRandom.nextInt(900_000)).toString()
     }
 
     fun normalizeCode(raw: String): String {
@@ -667,9 +746,10 @@ object CoupleTurnCodec {
     }
 
     /**
-     * Core Blockchain + AES-256-GCM Packet Builder.
+     * Core Blockchain + ECDH-P256 / AES-256-GCM Packet Builder.
      * Mines a PoW CoupleBlock, encrypts the inner payload with AES-256-GCM bound to the block hash via AAD,
      * signs with HMAC-SHA256, and returns both the wire string and mined CoupleBlock.
+     * Uses zero-knowledge Protocol v3 when [ecdhSharedSecretB64] is present.
      */
     private fun sealBlockchainPacket(
         coupleCode: String,
@@ -677,7 +757,8 @@ object CoupleTurnCodec {
         actionType: String,
         plainPayloadObj: JSONObject,
         previousHash: String,
-        blockIndex: Int
+        blockIndex: Int,
+        ecdhSharedSecretB64: String = ""
     ): Pair<String, CoupleBlock> {
         val cleanCode = normalizeCode(coupleCode)
         val cleanSender = CoupleFirewall.sanitizeName(senderName)
@@ -693,11 +774,13 @@ object CoupleTurnCodec {
             payloadHash = payloadHash
         )
 
-        val aad = "$cleanCode|${mined.blockHash}|$actionType"
+        val packetVersion = if (ecdhSharedSecretB64.isNotBlank()) 3 else 2
+        val aad = "$cleanCode|${mined.blockHash}|$actionType|v$packetVersion"
         val envelope = CoupleCryptoEngine.encryptPayload(
             plainJson = plainJson,
             coupleCode = cleanCode,
-            aad = aad
+            aad = aad,
+            ecdhSharedSecretB64 = ecdhSharedSecretB64
         )
 
         val finalBlock = mined.copy(
@@ -706,7 +789,7 @@ object CoupleTurnCodec {
         )
 
         val outer = JSONObject().apply {
-            put("v", 2)
+            put("v", packetVersion)
             put("tag", codeTag(cleanCode))
             put("blk", CoupleBlockchain.blockToJson(finalBlock))
             put("iv", envelope.ivBase64)
@@ -722,14 +805,15 @@ object CoupleTurnCodec {
         senderName: String,
         spiceLevel: SpiceLevel = SpiceLevel.FLIRTY,
         previousHash: String = CoupleBlockchain.genesisHash(coupleCode),
-        blockIndex: Int = 1
+        blockIndex: Int = 1,
+        ecdhSharedSecretB64: String = ""
     ): Pair<String, CoupleBlock> {
         val payload = JSONObject().apply {
             put("t", "HANDSHAKE")
             put("sender", CoupleFirewall.sanitizeName(senderName))
             put("spice", spiceLevel.name)
         }
-        return sealBlockchainPacket(coupleCode, senderName, "HANDSHAKE", payload, previousHash, blockIndex)
+        return sealBlockchainPacket(coupleCode, senderName, "HANDSHAKE", payload, previousHash, blockIndex, ecdhSharedSecretB64)
     }
 
     fun encodeBondHandshake(
@@ -737,20 +821,22 @@ object CoupleTurnCodec {
         senderName: String,
         spiceLevel: SpiceLevel = SpiceLevel.FLIRTY,
         previousHash: String = CoupleBlockchain.genesisHash(coupleCode),
-        blockIndex: Int = 1
-    ): String = encodeBondHandshakeWithBlock(coupleCode, senderName, spiceLevel, previousHash, blockIndex).first
+        blockIndex: Int = 1,
+        ecdhSharedSecretB64: String = ""
+    ): String = encodeBondHandshakeWithBlock(coupleCode, senderName, spiceLevel, previousHash, blockIndex, ecdhSharedSecretB64).first
 
     fun encodeUnpairNoticeWithBlock(
         coupleCode: String,
         senderName: String,
         previousHash: String = CoupleBlockchain.genesisHash(coupleCode),
-        blockIndex: Int = 1
+        blockIndex: Int = 1,
+        ecdhSharedSecretB64: String = ""
     ): Pair<String, CoupleBlock> {
         val payload = JSONObject().apply {
             put("t", "UNPAIR")
             put("sender", CoupleFirewall.sanitizeName(senderName))
         }
-        return sealBlockchainPacket(coupleCode, senderName, "UNPAIR", payload, previousHash, blockIndex)
+        return sealBlockchainPacket(coupleCode, senderName, "UNPAIR", payload, previousHash, blockIndex, ecdhSharedSecretB64)
     }
 
     fun encodeQuizTurnWithBlock(
@@ -760,7 +846,8 @@ object CoupleTurnCodec {
         choiceIndex: Int,
         spiceLevel: SpiceLevel,
         previousHash: String = CoupleBlockchain.genesisHash(coupleCode),
-        blockIndex: Int = 1
+        blockIndex: Int = 1,
+        ecdhSharedSecretB64: String = ""
     ): Pair<String, CoupleBlock> {
         val payload = JSONObject().apply {
             put("t", "QUIZ")
@@ -769,7 +856,7 @@ object CoupleTurnCodec {
             put("pick", maskChoice(choiceIndex, coupleCode, roundIndex))
             put("spice", spiceLevel.name)
         }
-        return sealBlockchainPacket(coupleCode, senderName, "QUIZ", payload, previousHash, blockIndex)
+        return sealBlockchainPacket(coupleCode, senderName, "QUIZ", payload, previousHash, blockIndex, ecdhSharedSecretB64)
     }
 
     fun encodeQuizTurn(
@@ -779,8 +866,9 @@ object CoupleTurnCodec {
         choiceIndex: Int,
         spiceLevel: SpiceLevel,
         previousHash: String = CoupleBlockchain.genesisHash(coupleCode),
-        blockIndex: Int = 1
-    ): String = encodeQuizTurnWithBlock(coupleCode, senderName, roundIndex, choiceIndex, spiceLevel, previousHash, blockIndex).first
+        blockIndex: Int = 1,
+        ecdhSharedSecretB64: String = ""
+    ): String = encodeQuizTurnWithBlock(coupleCode, senderName, roundIndex, choiceIndex, spiceLevel, previousHash, blockIndex, ecdhSharedSecretB64).first
 
     fun encodeWyrTurnWithBlock(
         coupleCode: String,
@@ -789,7 +877,8 @@ object CoupleTurnCodec {
         choiceIndex: Int,
         spiceLevel: SpiceLevel,
         previousHash: String = CoupleBlockchain.genesisHash(coupleCode),
-        blockIndex: Int = 1
+        blockIndex: Int = 1,
+        ecdhSharedSecretB64: String = ""
     ): Pair<String, CoupleBlock> {
         val payload = JSONObject().apply {
             put("t", "WYR")
@@ -798,7 +887,7 @@ object CoupleTurnCodec {
             put("pick", maskChoice(choiceIndex, coupleCode, roundIndex))
             put("spice", spiceLevel.name)
         }
-        return sealBlockchainPacket(coupleCode, senderName, "WYR", payload, previousHash, blockIndex)
+        return sealBlockchainPacket(coupleCode, senderName, "WYR", payload, previousHash, blockIndex, ecdhSharedSecretB64)
     }
 
     fun encodeWyrTurn(
@@ -808,8 +897,9 @@ object CoupleTurnCodec {
         choiceIndex: Int,
         spiceLevel: SpiceLevel,
         previousHash: String = CoupleBlockchain.genesisHash(coupleCode),
-        blockIndex: Int = 1
-    ): String = encodeWyrTurnWithBlock(coupleCode, senderName, roundIndex, choiceIndex, spiceLevel, previousHash, blockIndex).first
+        blockIndex: Int = 1,
+        ecdhSharedSecretB64: String = ""
+    ): String = encodeWyrTurnWithBlock(coupleCode, senderName, roundIndex, choiceIndex, spiceLevel, previousHash, blockIndex, ecdhSharedSecretB64).first
 
     fun encodeDoodleTurnWithBlock(
         coupleCode: String,
@@ -817,7 +907,8 @@ object CoupleTurnCodec {
         prompt: String,
         strokes: List<DoodleStrokeData>,
         previousHash: String = CoupleBlockchain.genesisHash(coupleCode),
-        blockIndex: Int = 1
+        blockIndex: Int = 1,
+        ecdhSharedSecretB64: String = ""
     ): Pair<String, CoupleBlock> {
         val payload = JSONObject().apply {
             put("t", "DOODLE")
@@ -825,7 +916,7 @@ object CoupleTurnCodec {
             put("prompt", prompt)
             put("strokes", strokesToJsonArray(strokes.takeLast(60)))
         }
-        return sealBlockchainPacket(coupleCode, senderName, "DOODLE", payload, previousHash, blockIndex)
+        return sealBlockchainPacket(coupleCode, senderName, "DOODLE", payload, previousHash, blockIndex, ecdhSharedSecretB64)
     }
 
     fun encodeDoodleTurn(
@@ -834,22 +925,24 @@ object CoupleTurnCodec {
         prompt: String,
         strokes: List<DoodleStrokeData>,
         previousHash: String = CoupleBlockchain.genesisHash(coupleCode),
-        blockIndex: Int = 1
-    ): String = encodeDoodleTurnWithBlock(coupleCode, senderName, prompt, strokes, previousHash, blockIndex).first
+        blockIndex: Int = 1,
+        ecdhSharedSecretB64: String = ""
+    ): String = encodeDoodleTurnWithBlock(coupleCode, senderName, prompt, strokes, previousHash, blockIndex, ecdhSharedSecretB64).first
 
     fun encodeTicTacToeTurnWithBlock(
         coupleCode: String,
         senderName: String,
         state: TicTacToeSyncState,
         previousHash: String = CoupleBlockchain.genesisHash(coupleCode),
-        blockIndex: Int = 1
+        blockIndex: Int = 1,
+        ecdhSharedSecretB64: String = ""
     ): Pair<String, CoupleBlock> {
         val payload = JSONObject().apply {
             put("t", "TTT")
             put("sender", CoupleFirewall.sanitizeName(senderName))
             put("state", ticTacToeToJson(state))
         }
-        return sealBlockchainPacket(coupleCode, senderName, "TTT", payload, previousHash, blockIndex)
+        return sealBlockchainPacket(coupleCode, senderName, "TTT", payload, previousHash, blockIndex, ecdhSharedSecretB64)
     }
 
     fun encodeTicTacToeTurn(
@@ -857,8 +950,63 @@ object CoupleTurnCodec {
         senderName: String,
         state: TicTacToeSyncState,
         previousHash: String = CoupleBlockchain.genesisHash(coupleCode),
-        blockIndex: Int = 1
-    ): String = encodeTicTacToeTurnWithBlock(coupleCode, senderName, state, previousHash, blockIndex).first
+        blockIndex: Int = 1,
+        ecdhSharedSecretB64: String = ""
+    ): String = encodeTicTacToeTurnWithBlock(coupleCode, senderName, state, previousHash, blockIndex, ecdhSharedSecretB64).first
+
+    fun encodeDareTurnWithBlock(
+        coupleCode: String,
+        senderName: String,
+        state: DareSyncState,
+        previousHash: String = CoupleBlockchain.genesisHash(coupleCode),
+        blockIndex: Int = 1,
+        ecdhSharedSecretB64: String = ""
+    ): Pair<String, CoupleBlock> {
+        val payload = JSONObject().apply {
+            put("t", "DARE")
+            put("sender", CoupleFirewall.sanitizeName(senderName))
+            put("stateJson", CoupleActivitiesDeck.dareStateToJson(state))
+        }
+        return sealBlockchainPacket(coupleCode, senderName, "DARE", payload, previousHash, blockIndex, ecdhSharedSecretB64)
+    }
+
+    fun encodeWavelengthTurnWithBlock(
+        coupleCode: String,
+        senderName: String,
+        state: WavelengthSyncState,
+        previousHash: String = CoupleBlockchain.genesisHash(coupleCode),
+        blockIndex: Int = 1,
+        ecdhSharedSecretB64: String = ""
+    ): Pair<String, CoupleBlock> {
+        val payload = JSONObject().apply {
+            put("t", "WAVELENGTH")
+            put("sender", CoupleFirewall.sanitizeName(senderName))
+            put("stateJson", CoupleActivitiesDeck.wavelengthStateToJson(state))
+        }
+        return sealBlockchainPacket(coupleCode, senderName, "WAVELENGTH", payload, previousHash, blockIndex, ecdhSharedSecretB64)
+    }
+
+    fun encodeWhisperTurnWithBlock(
+        coupleCode: String,
+        senderName: String,
+        likedDateId: String = "",
+        whisperNote: SecretWhisperNote? = null,
+        previousHash: String = CoupleBlockchain.genesisHash(coupleCode),
+        blockIndex: Int = 1,
+        ecdhSharedSecretB64: String = ""
+    ): Pair<String, CoupleBlock> {
+        val payload = JSONObject().apply {
+            put("t", "WHISPER")
+            put("sender", CoupleFirewall.sanitizeName(senderName))
+            put("likedDateId", likedDateId.take(32))
+            if (whisperNote != null) {
+                put("wid", whisperNote.id.take(40))
+                put("wtext", whisperNote.text.take(260))
+                put("wts", whisperNote.timestamp)
+            }
+        }
+        return sealBlockchainPacket(coupleCode, senderName, "WHISPER", payload, previousHash, blockIndex, ecdhSharedSecretB64)
+    }
 
     /**
      * Primary entry point for decoding & verifying any Couple Lounge packet through the Firewall.
@@ -868,14 +1016,16 @@ object CoupleTurnCodec {
         expectedCoupleCode: String,
         existingLedger: List<CoupleBlock> = emptyList(),
         lockedPartnerName: String = "",
-        myName: String = ""
+        myName: String = "",
+        ecdhSharedSecretB64: String = ""
     ): Result<DecodedTurnPacket> {
         return CoupleFirewall.inspectAndFilter(
             rawInput = rawInput,
             expectedCoupleCode = expectedCoupleCode,
             existingLedger = existingLedger,
             lockedPartnerName = lockedPartnerName,
-            myName = myName
+            myName = myName,
+            ecdhSharedSecretB64 = ecdhSharedSecretB64
         )
     }
 
@@ -884,7 +1034,8 @@ object CoupleTurnCodec {
         expectedCoupleCode: String,
         existingLedger: List<CoupleBlock>,
         lockedPartnerName: String,
-        myName: String
+        myName: String,
+        ecdhSharedSecretB64: String = ""
     ): Result<DecodedTurnPacket> {
         return try {
             val cleanCode = normalizeCode(expectedCoupleCode)
@@ -896,6 +1047,7 @@ object CoupleTurnCodec {
             val token = rawInput.substring(bchainIdx + BCHAIN_PREFIX.length).trim().split(Regex("\\s+")).first()
             val outerJsonStr = String(Base64.decode(token, Base64.DEFAULT), StandardCharsets.UTF_8)
             val outer = JSONObject(outerJsonStr)
+            val packetVersion = outer.optInt("v", 2)
 
             // Firewall Rule 2: Room Key Tag Isolation
             val tag = outer.optString("tag", "")
@@ -928,19 +1080,48 @@ object CoupleTurnCodec {
                 )
             }
 
-            // Firewall Rule 3: HMAC-SHA256 Signature & AES-256-GCM Authenticated Decryption
+            // Firewall Rule 3: ECDH-P256 + HKDF-SHA256 (v3) or Legacy (v2) HMAC-SHA256 & AES-256-GCM Decryption
             val ivB64 = outer.optString("iv", "")
             val ctB64 = outer.optString("ct", "")
             val sigHex = outer.optString("sig", "")
-            val aad = "$cleanCode|${block.blockHash}|${block.actionType}"
 
-            val decryptedResult = CoupleCryptoEngine.decryptPayload(
-                ivBase64 = ivB64,
-                cipherBase64 = ctB64,
-                expectedHmacHex = sigHex,
-                coupleCode = cleanCode,
-                aad = aad
-            )
+            val decryptedResult = if (packetVersion >= 3) {
+                if (ecdhSharedSecretB64.isBlank()) {
+                    return Result.failure(
+                        SecurityException("FIREWALL BLOCKED: Zero-knowledge ECDH shared secret required to decrypt v3 packet.")
+                    )
+                }
+                CoupleCryptoEngine.decryptPayload(
+                    ivBase64 = ivB64,
+                    cipherBase64 = ctB64,
+                    expectedHmacHex = sigHex,
+                    coupleCode = cleanCode,
+                    aad = "$cleanCode|${block.blockHash}|${block.actionType}|v$packetVersion",
+                    ecdhSharedSecretB64 = ecdhSharedSecretB64
+                )
+            } else {
+                // Backward-compatible v2 decryption (try v2-tagged AAD first, then legacy untagged AAD)
+                val v2Tagged = CoupleCryptoEngine.decryptPayload(
+                    ivBase64 = ivB64,
+                    cipherBase64 = ctB64,
+                    expectedHmacHex = sigHex,
+                    coupleCode = cleanCode,
+                    aad = "$cleanCode|${block.blockHash}|${block.actionType}|v2",
+                    ecdhSharedSecretB64 = ""
+                )
+                if (v2Tagged.isSuccess) {
+                    v2Tagged
+                } else {
+                    CoupleCryptoEngine.decryptPayload(
+                        ivBase64 = ivB64,
+                        cipherBase64 = ctB64,
+                        expectedHmacHex = sigHex,
+                        coupleCode = cleanCode,
+                        aad = "$cleanCode|${block.blockHash}|${block.actionType}",
+                        ecdhSharedSecretB64 = ""
+                    )
+                }
+            }
             val decryptedJson = decryptedResult.getOrElse { err ->
                 return Result.failure(err)
             }
@@ -1034,6 +1215,50 @@ object CoupleTurnCodec {
                         )
                     )
                 }
+                "DARE" -> {
+                    val stateJson = obj.optString("stateJson", "{}")
+                    Result.success(
+                        DecodedTurnPacket.DareTurn(
+                            coupleCode = cleanCode,
+                            senderName = sender,
+                            state = CoupleActivitiesDeck.dareStateFromJson(stateJson),
+                            block = block
+                        )
+                    )
+                }
+                "WAVELENGTH" -> {
+                    val stateJson = obj.optString("stateJson", "{}")
+                    Result.success(
+                        DecodedTurnPacket.WavelengthTurn(
+                            coupleCode = cleanCode,
+                            senderName = sender,
+                            state = CoupleActivitiesDeck.wavelengthStateFromJson(stateJson),
+                            block = block
+                        )
+                    )
+                }
+                "WHISPER" -> {
+                    val likedDateId = obj.optString("likedDateId", "").take(32)
+                    val wText = obj.optString("wtext", "").take(260)
+                    val note = if (wText.isNotBlank()) {
+                        SecretWhisperNote(
+                            id = obj.optString("wid", "w_${block.blockHash.take(8)}"),
+                            senderName = sender,
+                            text = wText,
+                            timestamp = obj.optLong("wts", System.currentTimeMillis()),
+                            isRevealed = false
+                        )
+                    } else null
+                    Result.success(
+                        DecodedTurnPacket.WhisperTurn(
+                            coupleCode = cleanCode,
+                            senderName = sender,
+                            likedDateId = likedDateId,
+                            whisperNote = note,
+                            block = block
+                        )
+                    )
+                }
                 else -> Result.failure(IllegalArgumentException("FIREWALL BLOCKED: Unknown game turn type."))
             }
         } catch (e: Exception) {
@@ -1109,22 +1334,56 @@ object CoupleTurnCodec {
     }
 
     fun roundStateToJson(state: RoundSyncState): String {
+        val historyArr = JSONArray()
+        state.history.takeLast(12).forEach { entry ->
+            historyArr.put(
+                JSONObject().apply {
+                    put("ri", entry.roundIndex)
+                    put("th", entry.theme.name)
+                    put("mt", entry.matched)
+                    put("cs", entry.choiceSignature)
+                    put("sp", entry.spiceLevel.name)
+                }
+            )
+        }
         return JSONObject().apply {
             put("r", state.roundIndex)
             if (state.myChoice != null) put("m", state.myChoice)
             if (state.partnerChoice != null) put("p", state.partnerChoice)
             put("pn", state.partnerName)
+            if (historyArr.length() > 0) put("h", historyArr)
         }.toString()
     }
 
     fun roundStateFromJson(json: String): RoundSyncState {
         return runCatching {
             val o = JSONObject(json.ifBlank { "{}" })
+            val historyList = mutableListOf<RoundOutcome>()
+            val hArr = o.optJSONArray("h")
+            if (hArr != null) {
+                for (i in 0 until hArr.length()) {
+                    val ho = hArr.optJSONObject(i) ?: continue
+                    val theme = runCatching { QuestionTheme.valueOf(ho.optString("th", "ROMANCE")) }
+                        .getOrDefault(QuestionTheme.ROMANCE)
+                    val spice = runCatching { SpiceLevel.valueOf(ho.optString("sp", "FLIRTY")) }
+                        .getOrDefault(SpiceLevel.FLIRTY)
+                    historyList.add(
+                        RoundOutcome(
+                            roundIndex = ho.optInt("ri", 0),
+                            theme = theme,
+                            matched = ho.optBoolean("mt", false),
+                            choiceSignature = ho.optInt("cs", 0),
+                            spiceLevel = spice
+                        )
+                    )
+                }
+            }
             RoundSyncState(
                 roundIndex = o.optInt("r", 0),
                 myChoice = if (o.has("m")) o.optInt("m") else null,
                 partnerChoice = if (o.has("p")) o.optInt("p") else null,
-                partnerName = o.optString("pn", "")
+                partnerName = o.optString("pn", ""),
+                history = historyList
             )
         }.getOrDefault(RoundSyncState())
     }

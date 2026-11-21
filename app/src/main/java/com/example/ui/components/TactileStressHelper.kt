@@ -167,3 +167,93 @@ class TactileStressHelper(
         } catch (_: Exception) {}
     }
 }
+
+/**
+ * Refined, tiered haptic feedback engine for everyday UI interactions.
+ * Differentiates light navigation ticks, crisp tactile clicks, warm double confirmations,
+ * and gentle magnetic thuds without harsh buzzes.
+ */
+object AestheticHaptics {
+    private fun resolveVibrator(context: Context): Vibrator? = try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Feather-light tick for tab switches, chips, and subtle selection changes. */
+    fun softTick(context: Context, fallback: HapticFeedback? = null) {
+        val vib = resolveVibrator(context)
+        try {
+            if (vib != null && vib.hasVibrator()) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    vib.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK))
+                    return
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vib.vibrate(VibrationEffect.createOneShot(7L, 55))
+                    return
+                }
+            }
+        } catch (_: Exception) {}
+        try { fallback?.performHapticFeedback(HapticFeedbackType.TextHandleMove) } catch (_: Exception) {}
+    }
+
+    /** Crisp mechanical click for cards, primary CTAs, and toggle actions. */
+    fun crispClick(context: Context, fallback: HapticFeedback? = null) {
+        val vib = resolveVibrator(context)
+        try {
+            if (vib != null && vib.hasVibrator()) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    vib.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
+                    return
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vib.vibrate(VibrationEffect.createOneShot(11L, 110))
+                    return
+                }
+            }
+        } catch (_: Exception) {}
+        try { fallback?.performHapticFeedback(HapticFeedbackType.TextHandleMove) } catch (_: Exception) {}
+    }
+
+    /** Warm rhythmic double-pulse for approvals, matches, completions, and reveals. */
+    fun warmConfirm(context: Context, fallback: HapticFeedback? = null) {
+        val vib = resolveVibrator(context)
+        try {
+            if (vib != null && vib.hasVibrator()) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vib.vibrate(
+                        VibrationEffect.createWaveform(
+                            longArrayOf(0L, 10L, 42L, 16L),
+                            intArrayOf(0, 95, 0, 155),
+                            -1
+                        )
+                    )
+                    return
+                }
+            }
+        } catch (_: Exception) {}
+        try { fallback?.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
+    }
+
+    /** Soft magnetic detent for locking choices or snapping cards/dials. */
+    fun gentleThud(context: Context, fallback: HapticFeedback? = null) {
+        val vib = resolveVibrator(context)
+        try {
+            if (vib != null && vib.hasVibrator()) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    vib.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK))
+                    return
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vib.vibrate(VibrationEffect.createOneShot(16L, 145))
+                    return
+                }
+            }
+        } catch (_: Exception) {}
+        try { fallback?.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
+    }
+}
+

@@ -178,9 +178,13 @@ private fun NeonBeatStage(
 
     LaunchedEffect(isGameOver) {
         if (isGameOver) return@LaunchedEffect
-        var lastNano = System.nanoTime()
+        var lastNano = 0L
         while (isActive && !isGameOver) {
             withFrameNanos { now ->
+                if (lastNano == 0L) {
+                    lastNano = now
+                    return@withFrameNanos
+                }
                 val dt = ((now - lastNano) / 1_000_000_000f).coerceIn(0.002f, 0.04f)
                 lastNano = now
 

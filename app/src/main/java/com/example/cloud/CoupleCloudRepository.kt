@@ -3,6 +3,7 @@ package com.example.cloud
 import android.content.Context
 import com.example.R
 import com.example.model.CoupleBlock
+import com.example.model.CoupleBlockchain
 import com.example.model.CoupleTurnCodec
 import com.example.model.SpiceLevel
 import com.example.security.BackendSecurityFirewall
@@ -25,6 +26,7 @@ import kotlinx.coroutines.tasks.await
 data class CloudJoinResult(
     val room: CoupleCloudRoom,
     val createdNew: Boolean,
+    val isPendingHostApproval: Boolean,
     val justJoinedAsPartner: Boolean
 )
 
@@ -83,7 +85,7 @@ class CoupleCloudRepository(
     }
 
     /**
-     * Real-time stream of a single bonded room document.
+     * Real-time stream of a single room document (works for bonded members AND pending join requesters).
      */
     fun observeRoom(coupleCode: String, userId: String): Flow<CoupleCloudRoom?> = flow {
         val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
@@ -160,54 +162,153 @@ class CoupleCloudRepository(
     }
 
     /**
-     * Creates a new 6-digit cloud room or joins an existing WAITING room live over the internet.
+     * Atomically reserves a globally unique, never-before-used 6-digit room code via Firestore transaction.
+     * Because rooms can never be deleted, once reserved here, NO other couple can ever claim this code.
      */
-    suspend fun createOrJoinCloudRoom(
-        coupleCode: String,
+    suspend fun createUniqueCloudRoom(
         myName: String,
         spiceLevel: SpiceLevel,
-        genesisHash: String
+        preferredCode: String? = null,
+        creatorPublicKey: String = ""
+    ): Result<CloudJoinResult> {
+        val path = "coupleRooms"
+        return try {
+            val uid = requireUserId()
+            val cleanName = BackendSecurityFirewall.sanitizeField(myName, maxLength = 32).ifBlank { "Host" }
+            val safeSpice = if (spiceLevel.name in setOf("SWEET", "FLIRTY", "BOLD")) spiceLevel.name else "FLIRTY"
+            val safePubKey = creatorPublicKey.trim().take(256)
+            val explicitCode = preferredCode?.let { CoupleTurnCodec.normalizeCode(it) }?.takeIf { it.length == 6 }
+
+            val attempts = if (explicitCode != null) 1 else 10
+            val triedCodes = mutableSetOf<String>()
+
+            repeat(attempts) {
+                val candidate = explicitCode ?: CoupleTurnCodec.generateUniqueCode(triedCodes)
+                triedCodes.add(candidate)
+                val docRef = roomsCollection().document(candidate)
+                val genesisHash = CoupleBlockchain.genesisHash(candidate).take(128)
+
+                val claimed: Boolean = try {
+                    db.runTransaction { tx ->
+                        val snap = tx.get(docRef)
+                        if (snap.exists()) {
+                            false
+                        } else {
+                            val payload = mapOf(
+                                "coupleCode" to candidate,
+                                "creatorUid" to uid,
+                                "creatorName" to cleanName,
+                                "creatorPublicKey" to safePubKey,
+                                "partnerUid" to "",
+                                "partnerName" to "",
+                                "partnerPublicKey" to "",
+                                "pendingPartnerUid" to "",
+                                "pendingPartnerName" to "",
+                                "pendingPartnerPublicKey" to "",
+                                "memberUids" to listOf(uid),
+                                "spiceLevel" to safeSpice,
+                                "status" to "WAITING",
+                                "blockCount" to 1L,
+                                "latestBlockHash" to genesisHash,
+                                "createdAt" to FieldValue.serverTimestamp(),
+                                "updatedAt" to FieldValue.serverTimestamp()
+                            )
+                            tx.set(docRef, payload)
+                            true
+                        }
+                    }.await()
+                } catch (e: FirebaseFirestoreException) {
+                    if (e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                        // Existing room owned by another couple rejects read/write -> treat as already taken
+                        false
+                    } else {
+                        throw e
+                    }
+                }
+
+                if (claimed) {
+                    val created = CoupleCloudRoom(
+                        id = candidate,
+                        coupleCode = candidate,
+                        creatorUid = uid,
+                        creatorName = cleanName,
+                        creatorPublicKey = safePubKey,
+                        partnerUid = "",
+                        partnerName = "",
+                        partnerPublicKey = "",
+                        pendingPartnerUid = "",
+                        pendingPartnerName = "",
+                        pendingPartnerPublicKey = "",
+                        memberUids = listOf(uid),
+                        spiceLevel = safeSpice,
+                        status = "WAITING",
+                        blockCount = 1L,
+                        latestBlockHash = genesisHash
+                    )
+                    return Result.success(
+                        CloudJoinResult(
+                            room = created,
+                            createdNew = true,
+                            isPendingHostApproval = false,
+                            justJoinedAsPartner = false
+                        )
+                    )
+                }
+            }
+
+            if (explicitCode != null) {
+                Result.failure(
+                    SecurityException("Room #$explicitCode is already permanently claimed by another couple. Create a fresh room code instead.")
+                )
+            } else {
+                Result.failure(IllegalStateException("Could not reserve a unique room code. Please try again."))
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.CREATE, path)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Submits a join request to an existing Host's room code.
+     * The joining partner enters PENDING_APPROVAL until the Host explicitly taps Allow.
+     */
+    suspend fun requestToJoinCloudRoom(
+        coupleCode: String,
+        myName: String,
+        partnerPublicKey: String = ""
     ): Result<CloudJoinResult> {
         val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
         val path = "coupleRooms/$cleanCode"
         return try {
             val uid = requireUserId()
-            require(cleanCode.length == 6) { "Couple code must be 6 digits." }
+            if (!BackendSecurityFirewall.allowRateLimitedOperation("couple_join_attempt_$uid", maxOpsPerWindow = 10, windowMillis = 60_000L)) {
+                return Result.failure(
+                    SecurityException("Too many join attempts — wait a moment before trying another code.")
+                )
+            }
+            require(cleanCode.length == 6) { "Room code must be 6 digits." }
             val cleanName = BackendSecurityFirewall.sanitizeField(myName, maxLength = 32).ifBlank { "Partner" }
-            val safeSpice = if (spiceLevel.name in setOf("SWEET", "FLIRTY", "BOLD")) spiceLevel.name else "FLIRTY"
+            val safePubKey = partnerPublicKey.trim().take(256)
             val docRef = roomsCollection().document(cleanCode)
 
-            val existingSnap = docRef.get().await()
+            val existingSnap = try {
+                docRef.get().await()
+            } catch (e: FirebaseFirestoreException) {
+                if (e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                    return Result.failure(
+                        SecurityException("Room #$cleanCode is private and already locked to another couple.")
+                    )
+                }
+                throw e
+            }
+
             if (!existingSnap.exists()) {
-                val payload = mapOf(
-                    "coupleCode" to cleanCode,
-                    "creatorUid" to uid,
-                    "creatorName" to cleanName,
-                    "partnerUid" to "",
-                    "partnerName" to "",
-                    "memberUids" to listOf(uid),
-                    "spiceLevel" to safeSpice,
-                    "status" to "WAITING",
-                    "blockCount" to 1L,
-                    "latestBlockHash" to genesisHash.take(128),
-                    "createdAt" to FieldValue.serverTimestamp(),
-                    "updatedAt" to FieldValue.serverTimestamp()
+                return Result.failure(
+                    IllegalStateException("Room #$cleanCode doesn't exist yet. Ask your partner to create the room first.")
                 )
-                docRef.set(payload).await()
-                val created = CoupleCloudRoom(
-                    id = cleanCode,
-                    coupleCode = cleanCode,
-                    creatorUid = uid,
-                    creatorName = cleanName,
-                    partnerUid = "",
-                    partnerName = "",
-                    memberUids = listOf(uid),
-                    spiceLevel = safeSpice,
-                    status = "WAITING",
-                    blockCount = 1L,
-                    latestBlockHash = genesisHash.take(128)
-                )
-                return Result.success(CloudJoinResult(created, createdNew = true, justJoinedAsPartner = false))
             }
 
             val existing = existingSnap.toObject(
@@ -216,57 +317,204 @@ class CoupleCloudRepository(
             ) ?: return Result.failure(IllegalStateException("Unable to read room data."))
 
             if (existing.status == "UNPAIRED") {
-                return Result.failure(IllegalStateException("This couple code has ended. Create a fresh room code."))
+                return Result.failure(
+                    IllegalStateException("Room #$cleanCode has permanently ended and cannot be reused.")
+                )
             }
 
-            // Already a bonded member (returning or testing on 2nd phone with same account)
+            // Already awaiting approval by this user
+            if (existing.status == "PENDING_APPROVAL" && existing.pendingPartnerUid == uid) {
+                return Result.success(
+                    CloudJoinResult(
+                        room = existing,
+                        createdNew = false,
+                        isPendingHostApproval = true,
+                        justJoinedAsPartner = false
+                    )
+                )
+            }
+
+            // Already a bonded member
             if (uid in existing.memberUids) {
-                if (existing.creatorUid == uid && existing.creatorName != cleanName && existing.partnerName.isBlank()) {
-                    // Same-account 2nd phone joining with a different display name
+                // Same-account 2nd phone testing: if status is WAITING and name differs, submit pending request so Host can approve
+                if (existing.creatorUid == uid &&
+                    existing.status == "WAITING" &&
+                    existing.memberUids.size == 1 &&
+                    !existing.creatorName.equals(cleanName, ignoreCase = true)
+                ) {
                     docRef.update(
                         mapOf(
-                            "partnerName" to cleanName,
-                            "status" to "CONNECTED",
+                            "pendingPartnerUid" to uid,
+                            "pendingPartnerName" to cleanName,
+                            "pendingPartnerPublicKey" to safePubKey,
+                            "status" to "PENDING_APPROVAL",
                             "updatedAt" to FieldValue.serverTimestamp()
                         )
                     ).await()
                     return Result.success(
                         CloudJoinResult(
-                            room = existing.copy(partnerName = cleanName, status = "CONNECTED"),
+                            room = existing.copy(
+                                pendingPartnerUid = uid,
+                                pendingPartnerName = cleanName,
+                                pendingPartnerPublicKey = safePubKey,
+                                status = "PENDING_APPROVAL"
+                            ),
                             createdNew = false,
-                            justJoinedAsPartner = true
+                            isPendingHostApproval = true,
+                            justJoinedAsPartner = false
                         )
                     )
                 }
-                return Result.success(CloudJoinResult(existing, createdNew = false, justJoinedAsPartner = false))
+                return Result.success(
+                    CloudJoinResult(
+                        room = existing,
+                        createdNew = false,
+                        isPendingHostApproval = false,
+                        justJoinedAsPartner = false
+                    )
+                )
             }
 
-            // Joining an open WAITING 1-member room as the 2nd partner
-            if (existing.status == "WAITING" && existing.memberUids.size == 1 && existing.partnerUid.isBlank()) {
-                val updatedMembers = listOf(existing.creatorUid, uid)
+            // Open WAITING room -> submit join request with Partner's ECDH public key for Host confirmation
+            if (existing.status == "WAITING" &&
+                existing.memberUids.size == 1 &&
+                existing.partnerUid.isBlank() &&
+                existing.pendingPartnerUid.isBlank()
+            ) {
                 docRef.update(
                     mapOf(
-                        "partnerUid" to uid,
-                        "partnerName" to cleanName,
-                        "memberUids" to updatedMembers,
-                        "status" to "CONNECTED",
+                        "pendingPartnerUid" to uid,
+                        "pendingPartnerName" to cleanName,
+                        "pendingPartnerPublicKey" to safePubKey,
+                        "status" to "PENDING_APPROVAL",
                         "updatedAt" to FieldValue.serverTimestamp()
                     )
                 ).await()
-                val joinedRoom = existing.copy(
-                    partnerUid = uid,
-                    partnerName = cleanName,
-                    memberUids = updatedMembers,
-                    status = "CONNECTED"
+                val pendingRoom = existing.copy(
+                    pendingPartnerUid = uid,
+                    pendingPartnerName = cleanName,
+                    pendingPartnerPublicKey = safePubKey,
+                    status = "PENDING_APPROVAL"
                 )
-                return Result.success(CloudJoinResult(joinedRoom, createdNew = false, justJoinedAsPartner = true))
+                return Result.success(
+                    CloudJoinResult(
+                        room = pendingRoom,
+                        createdNew = false,
+                        isPendingHostApproval = true,
+                        justJoinedAsPartner = false
+                    )
+                )
             }
 
-            Result.failure(SecurityException("This room is private and already locked to 2 partners."))
+            if (existing.status == "PENDING_APPROVAL") {
+                return Result.failure(
+                    SecurityException("Room #$cleanCode already has a pending request awaiting the Host.")
+                )
+            }
+
+            Result.failure(SecurityException("Room #$cleanCode is private and permanently locked to 2 partners."))
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             handleFirestoreError(e, OperationType.WRITE, path)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Host-only secondary confirmation: allows the pending partner into the room,
+     * locking memberUids to the couple and transitioning status to CONNECTED.
+     */
+    suspend fun approvePendingPartner(coupleCode: String): Result<CoupleCloudRoom> {
+        val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
+        val path = "coupleRooms/$cleanCode"
+        return try {
+            val uid = requireUserId()
+            require(cleanCode.length == 6) { "Invalid room code." }
+            val docRef = roomsCollection().document(cleanCode)
+
+            val approvedRoom = db.runTransaction { tx ->
+                val snap = tx.get(docRef)
+                val existing = snap.toObject(
+                    CoupleCloudRoom::class.java,
+                    DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+                ) ?: throw IllegalStateException("Room not found.")
+
+                if (existing.creatorUid != uid) {
+                    throw SecurityException("Only the room creator can approve entry.")
+                }
+                if (existing.status != "PENDING_APPROVAL" || existing.pendingPartnerUid.isBlank()) {
+                    throw IllegalStateException("No pending partner request to approve.")
+                }
+
+                val isSameAccountTest = existing.pendingPartnerUid == existing.creatorUid
+                val finalPartnerUid = if (isSameAccountTest) "" else existing.pendingPartnerUid
+                val finalMembers = if (isSameAccountTest) {
+                    existing.memberUids
+                } else {
+                    listOf(existing.creatorUid, existing.pendingPartnerUid)
+                }
+
+                tx.update(
+                    docRef,
+                    mapOf(
+                        "partnerUid" to finalPartnerUid,
+                        "partnerName" to existing.pendingPartnerName,
+                        "partnerPublicKey" to existing.pendingPartnerPublicKey,
+                        "memberUids" to finalMembers,
+                        "pendingPartnerUid" to "",
+                        "pendingPartnerName" to "",
+                        "pendingPartnerPublicKey" to "",
+                        "status" to "CONNECTED",
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                )
+
+                existing.copy(
+                    partnerUid = finalPartnerUid,
+                    partnerName = existing.pendingPartnerName,
+                    partnerPublicKey = existing.pendingPartnerPublicKey,
+                    memberUids = finalMembers,
+                    pendingPartnerUid = "",
+                    pendingPartnerName = "",
+                    pendingPartnerPublicKey = "",
+                    status = "CONNECTED"
+                )
+            }.await()
+
+            Result.success(approvedRoom)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.UPDATE, path)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Host declines a join request OR the waiting partner cancels their own request,
+     * returning the room cleanly to WAITING.
+     */
+    suspend fun declineOrCancelPendingPartner(coupleCode: String): Result<Unit> {
+        val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
+        val path = "coupleRooms/$cleanCode"
+        return try {
+            requireUserId()
+            require(cleanCode.length == 6) { "Invalid room code." }
+            roomsCollection().document(cleanCode).update(
+                mapOf(
+                    "pendingPartnerUid" to "",
+                    "pendingPartnerName" to "",
+                    "pendingPartnerPublicKey" to "",
+                    "status" to "WAITING",
+                    "updatedAt" to FieldValue.serverTimestamp()
+                )
+            ).await()
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.UPDATE, path)
             Result.failure(e)
         }
     }
@@ -304,7 +552,10 @@ class CoupleCloudRepository(
             }
 
             val cleanSender = BackendSecurityFirewall.sanitizeField(senderName, maxLength = 32).ifBlank { "Partner" }
-            val allowedActions = setOf("GENESIS_BOND", "HANDSHAKE", "QUIZ", "WYR", "DOODLE", "TTT", "UNPAIR")
+            val allowedActions = setOf(
+                "GENESIS_BOND", "HANDSHAKE", "QUIZ", "WYR", "DOODLE", "TTT",
+                "DARE", "WAVELENGTH", "WHISPER", "UNPAIR"
+            )
             val safeAction = if (block.actionType in allowedActions) block.actionType else "HANDSHAKE"
 
             val blockPayload = mapOf(
@@ -362,7 +613,8 @@ class CoupleCloudRepository(
     }
 
     /**
-     * Permanently ends the couple bond in Firestore (terminal UNPAIRED state).
+     * Permanently retires the couple room in Firestore (terminal UNPAIRED state).
+     * Document is never deleted so no other couple can ever reuse this 6-digit code.
      */
     suspend fun unpairCloudRoom(coupleCode: String): Result<Unit> {
         val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
@@ -373,6 +625,9 @@ class CoupleCloudRepository(
             roomsCollection().document(cleanCode).update(
                 mapOf(
                     "status" to "UNPAIRED",
+                    "pendingPartnerUid" to "",
+                    "pendingPartnerName" to "",
+                    "pendingPartnerPublicKey" to "",
                     "updatedAt" to FieldValue.serverTimestamp()
                 )
             ).await()

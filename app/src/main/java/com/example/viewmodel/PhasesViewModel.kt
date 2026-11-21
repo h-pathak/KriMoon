@@ -17,8 +17,11 @@ import com.example.data.UserNote
 import com.example.data.UserProfile
 import com.example.cloud.CoupleCloudRepository
 import com.example.cloud.CoupleCloudRoom
+import com.example.model.CoupleActivitiesDeck
 import com.example.model.CoupleBlock
 import com.example.model.CoupleBlockchain
+import com.example.model.CoupleEcdhEngine
+import com.example.model.CoupleEcdhKeyPair
 import com.example.model.CoupleTurnCodec
 import com.example.model.CycleCalculator
 import com.example.model.CycleHistoryItem
@@ -96,6 +99,7 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyMap())
 
     val coupleRooms: StateFlow<List<CoupleRoomRecord>> = repository.coupleRooms
+        .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private val _activeCoupleCode = MutableStateFlow<String?>(null)
@@ -112,7 +116,9 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
             targetCode != null -> rooms.firstOrNull { it.coupleCode == targetCode } ?: rooms.firstOrNull { it.isBonded } ?: rooms.firstOrNull()
             else -> rooms.firstOrNull { it.isBonded } ?: rooms.firstOrNull()
         }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+    }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     // Live 2-Phone Encrypted Cloud Sync State
     private val _cloudAuthUid = MutableStateFlow<String?>(null)
@@ -221,6 +227,7 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
             repository.checkAndSeedCategoriesIfEmpty()
             repository.checkAndSeedShopItemsIfEmpty()
             repository.checkAndSeedMedicineRemindersIfEmpty()
+            repository.migratePlaintextRecordsToEncryptedVault()
         }
     }
 
@@ -821,8 +828,8 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
 
         _cloudSyncStatus.value = "CONNECTING"
 
-        // 1. Discover any bonded cloud rooms for this signed-in user (with bounded backoff retry)
-        userRoomsJob = viewModelScope.launch {
+        // 1. Discover any bonded cloud rooms for this signed-in user (off Main thread)
+        userRoomsJob = viewModelScope.launch(Dispatchers.Default) {
             var attempt = 0
             while (attempt < 4 && _cloudAuthUid.value == normalizedUid) {
                 var failed = false
@@ -857,16 +864,21 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         // 2. Coordinate real-time room & encrypted block listeners for whichever room is active
         roomWatcherCoordinatorJob = viewModelScope.launch {
             activeCoupleRoom
-                .map { it?.coupleCode }
+                .map { room ->
+                    if (room == null || room.isPassAndPlay) null
+                    else Pair(room.coupleCode, room.approvalStatus == "PENDING_HOST_APPROVAL")
+                }
                 .distinctUntilChanged()
-                .collectLatest { code ->
+                .collectLatest { state ->
                     activeRoomSyncJob?.cancel()
                     activeBlocksSyncJob?.cancel()
+                    val code = state?.first
+                    val isPendingApproval = state?.second ?: false
                     if (code.isNullOrBlank()) {
                         _cloudSyncStatus.value = "WAITING"
                         return@collectLatest
                     }
-                    attachActiveRoomListeners(cloudRepo, code, normalizedUid)
+                    attachActiveRoomListeners(cloudRepo, code, normalizedUid, isPendingApproval)
                 }
         }
     }
@@ -874,33 +886,77 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
     private fun attachActiveRoomListeners(
         cloudRepo: CoupleCloudRepository,
         coupleCode: String,
-        uid: String
+        uid: String,
+        isPendingHostApproval: Boolean
     ) {
-        activeRoomSyncJob = viewModelScope.launch {
+        activeRoomSyncJob = viewModelScope.launch(Dispatchers.Default) {
             var attemptedAutoRegister = false
             var attempt = 0
             while (attempt < 4 && _cloudAuthUid.value == uid) {
                 var failed = false
+                var declinedByPermission = false
                 cloudRepo.observeRoom(coupleCode, uid)
                     .catch { error ->
                         val firestoreError = generateSequence(error) { it.cause }
                             .filterIsInstance<FirebaseFirestoreException>()
                             .firstOrNull()
                         if (firestoreError == null && error is CancellationException) throw error
-                        failed = true
-                        _cloudSyncStatus.value = "OFFLINE"
+                        val localPending = repository.getCoupleRoom(coupleCode)
+                        if (firestoreError?.code == FirebaseFirestoreException.Code.PERMISSION_DENIED &&
+                            localPending != null &&
+                            !localPending.isHost &&
+                            localPending.approvalStatus == "PENDING_HOST_APPROVAL"
+                        ) {
+                            declinedByPermission = true
+                            coupleRoomMutex.withLock {
+                                repository.deleteCoupleRoom(coupleCode)
+                            }
+                            if (_activeCoupleCode.value == coupleCode) {
+                                _activeCoupleCode.value = null
+                            }
+                            userProfile.value?.let { profile ->
+                                if (profile.activeCoupleCode == coupleCode) {
+                                    repository.saveProfile(profile.copy(activeCoupleCode = ""))
+                                }
+                            }
+                            _cloudSyncStatus.value = "WAITING"
+                            showFeedback("Host declined your join request")
+                        } else {
+                            failed = true
+                            _cloudSyncStatus.value = "OFFLINE"
+                        }
                     }
                     .collect { cloudRoom ->
                         attempt = 0
                         if (cloudRoom == null) {
-                            // Legacy local-only room created before cloud sync: register it seamlessly once
+                            // Legacy local-only room created before cloud sync: register it once if we are host
                             if (!attemptedAutoRegister) {
                                 attemptedAutoRegister = true
                                 val local = repository.getCoupleRoom(coupleCode)
-                                if (local != null && local.isBonded) {
+                                if (local != null && local.isBonded && local.isHost && local.approvalStatus != "PENDING_HOST_APPROVAL") {
                                     val spice = runCatching { SpiceLevel.valueOf(local.spiceLevel) }.getOrDefault(SpiceLevel.FLIRTY)
-                                    val genesisHash = local.lastBlockHash.ifBlank { CoupleBlockchain.genesisHash(coupleCode) }
-                                    cloudRepo.createOrJoinCloudRoom(coupleCode, local.myName, spice, genesisHash)
+                                    val pubKey = if (local.ecdhPublicKeyB64.isNotBlank()) {
+                                        local.ecdhPublicKeyB64
+                                    } else {
+                                        val generated = withContext(Dispatchers.Default) { CoupleEcdhEngine.generateKeyPair() }
+                                        coupleRoomMutex.withLock {
+                                            repository.getCoupleRoom(coupleCode)?.let { cur ->
+                                                repository.saveCoupleRoom(
+                                                    cur.copy(
+                                                        ecdhPublicKeyB64 = generated.publicKeyB64,
+                                                        ecdhPrivateKeyB64 = generated.privateKeyB64
+                                                    )
+                                                )
+                                            }
+                                        }
+                                        generated.publicKeyB64
+                                    }
+                                    cloudRepo.createUniqueCloudRoom(
+                                        myName = local.myName,
+                                        spiceLevel = spice,
+                                        preferredCode = coupleCode,
+                                        creatorPublicKey = pubKey
+                                    )
                                 }
                             }
                             _cloudSyncStatus.value = "WAITING"
@@ -924,12 +980,65 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                             return@collect
                         }
 
-                        val justConnected = mergeCloudRoomIntoLocal(cloudRoom, uid)
-                        _cloudSyncStatus.value = if (cloudRoom.status == "CONNECTED") "LIVE" else "WAITING"
+                        val localBefore = repository.getCoupleRoom(coupleCode)
+                        val wasPendingRequester = localBefore != null &&
+                            !localBefore.isHost &&
+                            localBefore.approvalStatus == "PENDING_HOST_APPROVAL"
 
-                        // If partner just joined (memberUids now contains both phones), rebroadcast any pre-join local turns
+                        // Detect Host declining Partner 2's pending request
+                        if (wasPendingRequester &&
+                            cloudRoom.status == "WAITING" &&
+                            cloudRoom.pendingPartnerUid != uid
+                        ) {
+                            coupleRoomMutex.withLock {
+                                repository.deleteCoupleRoom(coupleCode)
+                            }
+                            if (_activeCoupleCode.value == coupleCode) {
+                                _activeCoupleCode.value = null
+                            }
+                            userProfile.value?.let { profile ->
+                                if (profile.activeCoupleCode == coupleCode) {
+                                    repository.saveProfile(profile.copy(activeCoupleCode = ""))
+                                }
+                            }
+                            _cloudSyncStatus.value = "WAITING"
+                            showFeedback("Host declined your join request")
+                            return@collect
+                        }
+
+                        val justConnected = mergeCloudRoomIntoLocal(cloudRoom, uid)
+                        _cloudSyncStatus.value = when (cloudRoom.status) {
+                            "CONNECTED" -> "LIVE"
+                            "PENDING_APPROVAL" -> "PENDING_APPROVAL"
+                            else -> "WAITING"
+                        }
+
+                        // Partner 2 was just allowed in by Host -> immediately send encrypted BondHandshake block
+                        if (wasPendingRequester && cloudRoom.status == "CONNECTED") {
+                            val freshLocal = repository.getCoupleRoom(coupleCode)
+                            if (freshLocal != null) {
+                                val spice = runCatching { SpiceLevel.valueOf(freshLocal.spiceLevel) }.getOrDefault(SpiceLevel.FLIRTY)
+                                val (packet, block) = withContext(Dispatchers.Default) {
+                                    CoupleTurnCodec.encodeBondHandshakeWithBlock(
+                                        coupleCode = coupleCode,
+                                        senderName = freshLocal.myName,
+                                        spiceLevel = spice,
+                                        previousHash = freshLocal.lastBlockHash.ifBlank { CoupleBlockchain.genesisHash(coupleCode) },
+                                        blockIndex = freshLocal.blockHeight.coerceAtLeast(1),
+                                        ecdhSharedSecretB64 = freshLocal.ecdhSharedSecretB64
+                                    )
+                                }
+                                sentBlockHashes.add(block.blockHash)
+                                commitOutgoingCoupleBlock(coupleCode, block)
+                                cloudRepo.publishEncryptedBlock(coupleCode, freshLocal.myName, block, packet)
+                                showFeedback("Host allowed you in! Connected live ♥")
+                            }
+                        }
+
+                        // If partner was just approved by Host, rebroadcast any pre-approval local Host moves
+                        val isHostLocal = localBefore?.isHost ?: (cloudRoom.creatorUid == uid)
                         if (cloudRoom.status == "CONNECTED" &&
-                            cloudRoom.memberUids.size == 2 &&
+                            isHostLocal &&
                             cloudRoom.creatorUid == uid &&
                             (justConnected || coupleCode !in rebroadcastedCodes)
                         ) {
@@ -937,60 +1046,63 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                             rebroadcastPendingLocalMoves(cloudRepo, coupleCode)
                         }
                     }
-                if (!failed) break
+                if (!failed || declinedByPermission) break
                 attempt++
                 delay(2000L * attempt)
             }
         }
 
-        activeBlocksSyncJob = viewModelScope.launch {
-            var attempt = 0
-            while (attempt < 4 && _cloudAuthUid.value == uid) {
-                var failed = false
-                cloudRepo.observeEncryptedBlocks(coupleCode, uid)
-                    .catch { error ->
-                        val firestoreError = generateSequence(error) { it.cause }
-                            .filterIsInstance<FirebaseFirestoreException>()
-                            .firstOrNull()
-                        if (firestoreError == null && error is CancellationException) throw error
-                        failed = true
-                    }
-                    .collect { blocks ->
-                        attempt = 0
-                        for (blk in blocks) {
-                            val hash = blk.blockHash
-                            if (hash.isBlank() || hash in processedBlockHashes || hash in sentBlockHashes) continue
-                            val localRoom = repository.getCoupleRoom(coupleCode) ?: continue
-                            val existingLedger = CoupleBlockchain.ledgerFromJson(localRoom.blockchainLedgerJson)
-                            if (existingLedger.any { it.blockHash == hash }) {
-                                processedBlockHashes.add(hash)
-                                continue
-                            }
-                            // Ignore blocks originating from this exact player/device
-                            val isOwnBlock = blk.senderUid == uid &&
-                                blk.senderName.equals(localRoom.myName.trim(), ignoreCase = true)
-                            if (isOwnBlock) {
-                                processedBlockHashes.add(hash)
-                                continue
-                            }
-                            processedBlockHashes.add(hash)
-                            applyTurnPacketToRoom(
-                                room = localRoom,
-                                rawPacket = blk.encryptedPacket,
-                                isAutoSync = true,
-                                fromCloudLive = true
-                            )
+        // Only subscribe to encrypted blocks once admitted (pending requesters are not yet in memberUids)
+        if (!isPendingHostApproval) {
+            activeBlocksSyncJob = viewModelScope.launch(Dispatchers.Default) {
+                var attempt = 0
+                while (attempt < 4 && _cloudAuthUid.value == uid) {
+                    var failed = false
+                    cloudRepo.observeEncryptedBlocks(coupleCode, uid)
+                        .catch { error ->
+                            val firestoreError = generateSequence(error) { it.cause }
+                                .filterIsInstance<FirebaseFirestoreException>()
+                                .firstOrNull()
+                            if (firestoreError == null && error is CancellationException) throw error
+                            failed = true
                         }
-                    }
-                if (!failed) break
-                attempt++
-                delay(2000L * attempt)
+                        .collect { blocks ->
+                            attempt = 0
+                            for (blk in blocks) {
+                                val hash = blk.blockHash
+                                if (hash.isBlank() || hash in processedBlockHashes || hash in sentBlockHashes) continue
+                                val localRoom = repository.getCoupleRoom(coupleCode) ?: continue
+                                val existingLedger = CoupleBlockchain.ledgerFromJson(localRoom.blockchainLedgerJson)
+                                if (existingLedger.any { it.blockHash == hash }) {
+                                    processedBlockHashes.add(hash)
+                                    continue
+                                }
+                                // Ignore blocks originating from this exact player/device
+                                val isOwnBlock = blk.senderUid == uid &&
+                                    blk.senderName.equals(localRoom.myName.trim(), ignoreCase = true)
+                                if (isOwnBlock) {
+                                    processedBlockHashes.add(hash)
+                                    continue
+                                }
+                                processedBlockHashes.add(hash)
+                                applyTurnPacketToRoom(
+                                    room = localRoom,
+                                    rawPacket = blk.encryptedPacket,
+                                    isAutoSync = true,
+                                    fromCloudLive = true
+                                )
+                            }
+                        }
+                    if (!failed) break
+                    attempt++
+                    delay(2000L * attempt)
+                }
             }
         }
     }
 
     /**
-     * When Phone B joins a room where Phone A already made moves while waiting,
+     * When Phone B is approved into a room where Phone A already made moves while waiting,
      * rebroadcast Phone A's pending moves with the updated 2-member room membership
      * so Phone B receives them immediately.
      */
@@ -1001,6 +1113,7 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         val local = repository.getCoupleRoom(coupleCode) ?: return
         if (local.isPassAndPlay) return
         val spice = runCatching { SpiceLevel.valueOf(local.spiceLevel) }.getOrDefault(SpiceLevel.FLIRTY)
+        val sharedSecret = local.ecdhSharedSecretB64
         var prevHash = local.lastBlockHash.ifBlank { CoupleBlockchain.genesisHash(coupleCode) }
         var height = local.blockHeight.coerceAtLeast(1)
 
@@ -1008,7 +1121,7 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         if (quizState.myChoice != null && quizState.partnerChoice == null) {
             val (pkt, blk) = withContext(Dispatchers.Default) {
                 CoupleTurnCodec.encodeQuizTurnWithBlock(
-                    coupleCode, local.myName, quizState.roundIndex, quizState.myChoice, spice, prevHash, height
+                    coupleCode, local.myName, quizState.roundIndex, quizState.myChoice, spice, prevHash, height, sharedSecret
                 )
             }
             sentBlockHashes.add(blk.blockHash)
@@ -1022,7 +1135,7 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         if (wyrState.myChoice != null && wyrState.partnerChoice == null) {
             val (pkt, blk) = withContext(Dispatchers.Default) {
                 CoupleTurnCodec.encodeWyrTurnWithBlock(
-                    coupleCode, local.myName, wyrState.roundIndex, wyrState.myChoice, spice, prevHash, height
+                    coupleCode, local.myName, wyrState.roundIndex, wyrState.myChoice, spice, prevHash, height, sharedSecret
                 )
             }
             sentBlockHashes.add(blk.blockHash)
@@ -1036,7 +1149,7 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         if (strokes.isNotEmpty()) {
             val (pkt, blk) = withContext(Dispatchers.Default) {
                 CoupleTurnCodec.encodeDoodleTurnWithBlock(
-                    coupleCode, local.myName, local.doodlePrompt, strokes.takeLast(30), prevHash, height
+                    coupleCode, local.myName, local.doodlePrompt, strokes.takeLast(30), prevHash, height, sharedSecret
                 )
             }
             sentBlockHashes.add(blk.blockHash)
@@ -1050,7 +1163,53 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         if (ttt.board.any { it.isNotEmpty() }) {
             val (pkt, blk) = withContext(Dispatchers.Default) {
                 CoupleTurnCodec.encodeTicTacToeTurnWithBlock(
-                    coupleCode, local.myName, ttt, prevHash, height
+                    coupleCode, local.myName, ttt, prevHash, height, sharedSecret
+                )
+            }
+            sentBlockHashes.add(blk.blockHash)
+            commitOutgoingCoupleBlock(coupleCode, blk)
+            cloudRepo.publishEncryptedBlock(coupleCode, local.myName, blk, pkt)
+            prevHash = blk.blockHash
+            height++
+        }
+
+        val dareState = CoupleActivitiesDeck.dareStateFromJson(local.dareStateJson)
+        if (dareState.promptText.isNotBlank() && dareState.status == "PENDING") {
+            val (pkt, blk) = withContext(Dispatchers.Default) {
+                CoupleTurnCodec.encodeDareTurnWithBlock(
+                    coupleCode, local.myName, dareState, prevHash, height, sharedSecret
+                )
+            }
+            sentBlockHashes.add(blk.blockHash)
+            commitOutgoingCoupleBlock(coupleCode, blk)
+            cloudRepo.publishEncryptedBlock(coupleCode, local.myName, blk, pkt)
+            prevHash = blk.blockHash
+            height++
+        }
+
+        val waveState = CoupleActivitiesDeck.wavelengthStateFromJson(local.wavelengthStateJson)
+        if (waveState.clueWord.isNotBlank() && waveState.phase == "GUESS") {
+            val (pkt, blk) = withContext(Dispatchers.Default) {
+                CoupleTurnCodec.encodeWavelengthTurnWithBlock(
+                    coupleCode, local.myName, waveState, prevHash, height, sharedSecret
+                )
+            }
+            sentBlockHashes.add(blk.blockHash)
+            commitOutgoingCoupleBlock(coupleCode, blk)
+            cloudRepo.publishEncryptedBlock(coupleCode, local.myName, blk, pkt)
+            prevHash = blk.blockHash
+            height++
+        }
+
+        val whisperState = CoupleActivitiesDeck.dateWhisperStateFromJson(local.whisperStateJson)
+        val latestMyWhisper = whisperState.whispers.lastOrNull {
+            it.senderName.equals(local.myName.trim(), ignoreCase = true)
+        }
+        val latestMyDateLike = whisperState.myLikedIds.lastOrNull().orEmpty()
+        if (latestMyWhisper != null || latestMyDateLike.isNotBlank()) {
+            val (pkt, blk) = withContext(Dispatchers.Default) {
+                CoupleTurnCodec.encodeWhisperTurnWithBlock(
+                    coupleCode, local.myName, latestMyDateLike, latestMyWhisper, prevHash, height, sharedSecret
                 )
             }
             sentBlockHashes.add(blk.blockHash)
@@ -1061,25 +1220,36 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
 
     private suspend fun mergeCloudRoomIntoLocal(cloudRoom: CoupleCloudRoom, uid: String): Boolean = coupleRoomMutex.withLock {
         val existing = repository.getCoupleRoom(cloudRoom.coupleCode)
-        val isCreator = cloudRoom.creatorUid == uid
+        val isHostLocal = when {
+            existing != null -> existing.isHost
+            cloudRoom.creatorUid == uid -> true
+            else -> false
+        }
         val defaultMyName = _cloudUserName.value
             ?: userProfile.value?.name?.takeIf { it.isNotBlank() }
-            ?: if (isCreator) cloudRoom.creatorName else cloudRoom.partnerName.ifBlank { "Me" }
+            ?: if (isHostLocal) cloudRoom.creatorName else cloudRoom.partnerName.ifBlank { cloudRoom.pendingPartnerName.ifBlank { "Me" } }
 
         val resolvedMyName = existing?.myName?.takeIf { it.isNotBlank() } ?: defaultMyName
         val resolvedPartnerName = when {
-            isCreator && cloudRoom.partnerName.isNotBlank() &&
+            isHostLocal && cloudRoom.partnerName.isNotBlank() &&
                 !cloudRoom.partnerName.equals(resolvedMyName, ignoreCase = true) -> cloudRoom.partnerName
-            isCreator && cloudRoom.creatorName.isNotBlank() &&
+            isHostLocal && cloudRoom.creatorName.isNotBlank() &&
                 !cloudRoom.creatorName.equals(resolvedMyName, ignoreCase = true) -> cloudRoom.creatorName
-            !isCreator -> cloudRoom.creatorName
+            !isHostLocal -> cloudRoom.creatorName
             else -> existing?.partnerName.orEmpty()
         }
         val isLiveConnected = cloudRoom.status == "CONNECTED"
+        val resolvedApprovalStatus = when (cloudRoom.status) {
+            "CONNECTED" -> "CONNECTED"
+            "PENDING_APPROVAL" -> if (isHostLocal) "AWAITING_MY_APPROVAL" else "PENDING_HOST_APPROVAL"
+            else -> "WAITING"
+        }
+
+        val peerPubKey = if (isHostLocal) cloudRoom.partnerPublicKey else cloudRoom.creatorPublicKey
 
         if (existing == null) {
             val genesis = CoupleBlockchain.createGenesisBlock(cloudRoom.coupleCode, resolvedMyName)
-            val initialTtt = TicTacToeSyncState(mySymbol = if (isCreator) "X" else "O")
+            val initialTtt = TicTacToeSyncState(mySymbol = if (isHostLocal) "X" else "O")
             val created = CoupleRoomRecord(
                 coupleCode = cloudRoom.coupleCode,
                 myName = resolvedMyName,
@@ -1087,6 +1257,10 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                 spiceLevel = cloudRoom.spiceLevel.ifBlank { SpiceLevel.FLIRTY.name },
                 isBonded = true,
                 partnerLocked = isLiveConnected,
+                isHost = isHostLocal,
+                approvalStatus = resolvedApprovalStatus,
+                pendingPartnerName = cloudRoom.pendingPartnerName,
+                peerPublicKeyB64 = peerPubKey,
                 ticTacToeStateJson = CoupleTurnCodec.ticTacToeToJsonString(initialTtt),
                 blockchainLedgerJson = CoupleBlockchain.ledgerToJson(listOf(genesis)),
                 lastBlockHash = genesis.blockHash,
@@ -1098,18 +1272,49 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
             repository.saveCoupleRoom(created)
             return@withLock isLiveConnected
         } else {
+            val resolvedPeerPub = peerPubKey.ifBlank { existing.peerPublicKeyB64 }
+            val resolvedSharedSecret = if (
+                resolvedPeerPub.isNotBlank() &&
+                existing.ecdhPrivateKeyB64.isNotBlank() &&
+                (existing.peerPublicKeyB64 != resolvedPeerPub || existing.ecdhSharedSecretB64.isBlank())
+            ) {
+                withContext(Dispatchers.Default) {
+                    CoupleEcdhEngine.deriveSharedSecretB64(
+                        myPrivateKeyB64 = existing.ecdhPrivateKeyB64,
+                        peerPublicKeyB64 = resolvedPeerPub,
+                        coupleCode = cloudRoom.coupleCode,
+                        myPublicKeyB64 = existing.ecdhPublicKeyB64
+                    ).orEmpty()
+                }
+            } else {
+                existing.ecdhSharedSecretB64
+            }
+
             val partnerChanged = resolvedPartnerName.isNotBlank() && resolvedPartnerName != existing.partnerName
             val lockChanged = isLiveConnected && !existing.partnerLocked
             val spiceChanged = cloudRoom.spiceLevel.isNotBlank() && cloudRoom.spiceLevel != existing.spiceLevel
-            if (partnerChanged || lockChanged || spiceChanged) {
+            val statusChanged = resolvedApprovalStatus != existing.approvalStatus
+            val pendingChanged = cloudRoom.pendingPartnerName != existing.pendingPartnerName
+            val ecdhChanged = resolvedPeerPub != existing.peerPublicKeyB64 || resolvedSharedSecret != existing.ecdhSharedSecretB64
+            if (partnerChanged || lockChanged || spiceChanged || statusChanged || pendingChanged || ecdhChanged) {
                 repository.saveCoupleRoom(
                     existing.copy(
                         partnerName = resolvedPartnerName.ifBlank { existing.partnerName },
                         partnerLocked = existing.partnerLocked || isLiveConnected,
-                        spiceLevel = cloudRoom.spiceLevel.ifBlank { existing.spiceLevel }
+                        spiceLevel = cloudRoom.spiceLevel.ifBlank { existing.spiceLevel },
+                        approvalStatus = resolvedApprovalStatus,
+                        pendingPartnerName = cloudRoom.pendingPartnerName,
+                        peerPublicKeyB64 = resolvedPeerPub,
+                        ecdhSharedSecretB64 = resolvedSharedSecret
                     )
                 )
-                if (lockChanged && resolvedPartnerName.isNotBlank()) {
+                if (isHostLocal &&
+                    resolvedApprovalStatus == "AWAITING_MY_APPROVAL" &&
+                    existing.approvalStatus != "AWAITING_MY_APPROVAL"
+                ) {
+                    val reqName = cloudRoom.pendingPartnerName.ifBlank { "Your partner" }
+                    showFeedback("$reqName wants to enter Room #${cloudRoom.coupleCode} — tap Allow ♥")
+                } else if (lockChanged && resolvedPartnerName.isNotBlank() && existing.approvalStatus != "PENDING_HOST_APPROVAL") {
                     showFeedback("Connected live with $resolvedPartnerName ♥")
                 }
             }
@@ -1117,7 +1322,100 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun createOrJoinCoupleRoom(myName: String, rawCode: String) {
+    /**
+     * Generates and atomically reserves a globally unique, single-use 6-digit couple room code.
+     * Once generated, no other couple can ever claim or reuse this code.
+     */
+    fun createUniqueCoupleRoom(myName: String) {
+        val cleanName = myName.trim()
+        if (cleanName.isBlank()) {
+            showFeedback("Please enter your name first 💕")
+            return
+        }
+        viewModelScope.launch {
+            _isCloudBusy.value = true
+            try {
+                val uid = _cloudAuthUid.value
+                val cloudRepo = if (uid != null) getCloudRepoOrNull() else null
+                val isOfflinePassAndPlay = uid == null
+
+                val keyPair = withContext(Dispatchers.Default) {
+                    CoupleEcdhEngine.generateKeyPair()
+                }
+
+                val reservedCode: String = if (cloudRepo != null && uid != null) {
+                    val result = cloudRepo.createUniqueCloudRoom(
+                        myName = cleanName,
+                        spiceLevel = SpiceLevel.FLIRTY,
+                        creatorPublicKey = keyPair.publicKeyB64
+                    )
+                    if (result.isFailure) {
+                        val msg = result.exceptionOrNull()?.message
+                            ?: "Could not reserve a unique room code. Check your internet and try again."
+                        showFeedback(msg)
+                        return@launch
+                    }
+                    result.getOrThrow().room.coupleCode
+                } else {
+                    CoupleTurnCodec.generateUniqueCode(coupleRooms.value.map { it.coupleCode }.toSet())
+                }
+
+                val genesis = withContext(Dispatchers.Default) {
+                    CoupleBlockchain.createGenesisBlock(reservedCode, cleanName)
+                }
+
+                coupleRoomMutex.withLock {
+                    val ledger = listOf(genesis)
+                    val initialTtt = TicTacToeSyncState(mySymbol = "X")
+                    val created = CoupleRoomRecord(
+                        coupleCode = reservedCode,
+                        myName = cleanName,
+                        partnerName = "",
+                        spiceLevel = SpiceLevel.FLIRTY.name,
+                        isPassAndPlay = isOfflinePassAndPlay,
+                        isBonded = true,
+                        partnerLocked = false,
+                        isHost = true,
+                        approvalStatus = if (isOfflinePassAndPlay) "CONNECTED" else "WAITING",
+                        pendingPartnerName = "",
+                        ecdhPublicKeyB64 = keyPair.publicKeyB64,
+                        ecdhPrivateKeyB64 = keyPair.privateKeyB64,
+                        ticTacToeStateJson = CoupleTurnCodec.ticTacToeToJsonString(initialTtt),
+                        blockchainLedgerJson = CoupleBlockchain.ledgerToJson(ledger),
+                        lastBlockHash = genesis.blockHash,
+                        blockHeight = 1,
+                        firewallPassedCount = 1,
+                        firewallBlockedCount = 0,
+                        lastFirewallEvent = "Unique zero-knowledge E2EE room reserved"
+                    )
+                    repository.saveCoupleRoom(created)
+                }
+
+                val currentProfile = userProfile.value ?: UserProfile(id = 1, name = cleanName, isOnboarded = true)
+                repository.saveProfile(
+                    currentProfile.copy(
+                        name = currentProfile.name.ifBlank { cleanName },
+                        activeCoupleCode = reservedCode
+                    )
+                )
+                _activeCoupleCode.value = reservedCode
+
+                if (isOfflinePassAndPlay) {
+                    showFeedback("Pass & Play room #$reservedCode ready ♥")
+                } else {
+                    showFeedback("Unique Room #$reservedCode created — share it & tap Allow when your partner joins 🔒")
+                }
+            } finally {
+                _isCloudBusy.value = false
+            }
+        }
+    }
+
+    /**
+     * Requests entry into a Host's existing 6-digit room code.
+     * Enters PENDING_HOST_APPROVAL until the room creator explicitly taps Allow.
+     */
+    fun requestJoinCoupleRoom(myName: String, rawCode: String) {
         val cleanName = myName.trim()
         val cleanCode = CoupleTurnCodec.extractCoupleCodeFromText(rawCode)
         if (cleanName.isBlank()) {
@@ -1125,92 +1423,143 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
         if (cleanCode.length != 6) {
-            showFeedback("Couple Code must be 6 digits")
+            showFeedback("Room code must be 6 digits")
             return
         }
         viewModelScope.launch {
             _isCloudBusy.value = true
             try {
-                val existing = repository.getCoupleRoom(cleanCode)
-                val genesis = withContext(Dispatchers.Default) {
-                    CoupleBlockchain.createGenesisBlock(cleanCode, cleanName)
-                }
                 val uid = _cloudAuthUid.value
                 val cloudRepo = if (uid != null) getCloudRepoOrNull() else null
+                val isOfflinePassAndPlay = uid == null
 
-                var joinedPartnerName = existing?.partnerName.orEmpty()
-                var joinedLocked = existing?.partnerLocked ?: false
-                var joinedSpice = existing?.spiceLevel ?: SpiceLevel.FLIRTY.name
-                var justJoinedAsPartner = false
+                var partnerName = ""
+                var spice = SpiceLevel.FLIRTY.name
+                var isHostFlag = isOfflinePassAndPlay
+                var approvalStatus = if (isOfflinePassAndPlay) "CONNECTED" else "PENDING_HOST_APPROVAL"
+                var pendingName = ""
+                var partnerLocked = false
+                var peerPubKey = ""
+
+                val existingBeforeJoin = repository.getCoupleRoom(cleanCode)
+                val localKeyPair = if (
+                    existingBeforeJoin != null &&
+                    existingBeforeJoin.ecdhPublicKeyB64.isNotBlank() &&
+                    existingBeforeJoin.ecdhPrivateKeyB64.isNotBlank()
+                ) {
+                    CoupleEcdhKeyPair(
+                        publicKeyB64 = existingBeforeJoin.ecdhPublicKeyB64,
+                        privateKeyB64 = existingBeforeJoin.ecdhPrivateKeyB64
+                    )
+                } else {
+                    withContext(Dispatchers.Default) { CoupleEcdhEngine.generateKeyPair() }
+                }
 
                 if (cloudRepo != null && uid != null) {
-                    val cloudResult = cloudRepo.createOrJoinCloudRoom(
+                    val result = cloudRepo.requestToJoinCloudRoom(
                         coupleCode = cleanCode,
                         myName = cleanName,
-                        spiceLevel = runCatching { SpiceLevel.valueOf(joinedSpice) }.getOrDefault(SpiceLevel.FLIRTY),
-                        genesisHash = genesis.blockHash
+                        partnerPublicKey = localKeyPair.publicKeyB64
                     )
-                    if (cloudResult.isFailure) {
-                        val msg = cloudResult.exceptionOrNull()?.message
-                            ?: "Could not connect to room. Check your internet and try again."
+                    if (result.isFailure) {
+                        val msg = result.exceptionOrNull()?.message
+                            ?: "Could not request access to Room #$cleanCode."
                         showFeedback(msg)
                         return@launch
                     }
-                    val joinInfo = cloudResult.getOrThrow()
-                    justJoinedAsPartner = joinInfo.justJoinedAsPartner
-                    joinedSpice = joinInfo.room.spiceLevel.ifBlank { SpiceLevel.FLIRTY.name }
-                    joinedLocked = joinInfo.room.status == "CONNECTED"
-                    joinedPartnerName = when {
-                        joinInfo.room.creatorUid == uid &&
-                            joinInfo.room.partnerName.isNotBlank() &&
-                            !joinInfo.room.partnerName.equals(cleanName, ignoreCase = true) -> joinInfo.room.partnerName
-                        joinInfo.room.creatorUid == uid &&
-                            !joinInfo.room.creatorName.equals(cleanName, ignoreCase = true) -> joinInfo.room.creatorName
-                        joinInfo.room.creatorUid != uid -> joinInfo.room.creatorName
-                        else -> joinedPartnerName
+                    val joinInfo = result.getOrThrow()
+                    val cloudRoom = joinInfo.room
+                    spice = cloudRoom.spiceLevel.ifBlank { SpiceLevel.FLIRTY.name }
+                    partnerLocked = cloudRoom.status == "CONNECTED"
+                    pendingName = cloudRoom.pendingPartnerName
+                    isHostFlag = cloudRoom.creatorUid == uid && !joinInfo.isPendingHostApproval
+                    approvalStatus = when {
+                        cloudRoom.status == "CONNECTED" -> "CONNECTED"
+                        joinInfo.isPendingHostApproval -> "PENDING_HOST_APPROVAL"
+                        cloudRoom.status == "PENDING_APPROVAL" && isHostFlag -> "AWAITING_MY_APPROVAL"
+                        else -> "WAITING"
+                    }
+                    partnerName = if (!isHostFlag) {
+                        cloudRoom.creatorName
+                    } else {
+                        cloudRoom.partnerName
+                    }
+                    peerPubKey = if (!isHostFlag) {
+                        cloudRoom.creatorPublicKey
+                    } else {
+                        cloudRoom.partnerPublicKey
                     }
                 }
 
-                val isOfflinePassAndPlay = uid == null
-                val baseRoom = coupleRoomMutex.withLock {
-                    val freshExisting = repository.getCoupleRoom(cleanCode)
-                    if (freshExisting != null) {
-                        val existingLedger = CoupleBlockchain.ledgerFromJson(freshExisting.blockchainLedgerJson)
-                            .ifEmpty { listOf(genesis) }
-                        val updated = freshExisting.copy(
-                            myName = cleanName,
-                            partnerName = joinedPartnerName.ifBlank { freshExisting.partnerName },
-                            partnerLocked = joinedLocked || freshExisting.partnerLocked,
-                            spiceLevel = joinedSpice,
-                            isPassAndPlay = if (isOfflinePassAndPlay) true else freshExisting.isPassAndPlay,
-                            isBonded = true,
-                            blockchainLedgerJson = CoupleBlockchain.ledgerToJson(existingLedger),
-                            lastBlockHash = existingLedger.last().blockHash,
-                            blockHeight = existingLedger.size
+                val derivedSharedSecret = if (peerPubKey.isNotBlank()) {
+                    withContext(Dispatchers.Default) {
+                        CoupleEcdhEngine.deriveSharedSecretB64(
+                            myPrivateKeyB64 = localKeyPair.privateKeyB64,
+                            peerPublicKeyB64 = peerPubKey,
+                            coupleCode = cleanCode,
+                            myPublicKeyB64 = localKeyPair.publicKeyB64
+                        ).orEmpty()
+                    }
+                } else {
+                    ""
+                }
+
+                val genesis = withContext(Dispatchers.Default) {
+                    CoupleBlockchain.createGenesisBlock(cleanCode, cleanName)
+                }
+
+                coupleRoomMutex.withLock {
+                    val existing = repository.getCoupleRoom(cleanCode)
+                    if (existing != null) {
+                        val ledger = CoupleBlockchain.ledgerFromJson(existing.blockchainLedgerJson).ifEmpty { listOf(genesis) }
+                        repository.saveCoupleRoom(
+                            existing.copy(
+                                myName = cleanName,
+                                partnerName = partnerName.ifBlank { existing.partnerName },
+                                spiceLevel = spice,
+                                isPassAndPlay = if (isOfflinePassAndPlay) true else existing.isPassAndPlay,
+                                isBonded = true,
+                                partnerLocked = partnerLocked || existing.partnerLocked,
+                                isHost = isHostFlag,
+                                approvalStatus = approvalStatus,
+                                pendingPartnerName = pendingName,
+                                ecdhPublicKeyB64 = localKeyPair.publicKeyB64,
+                                ecdhPrivateKeyB64 = localKeyPair.privateKeyB64,
+                                peerPublicKeyB64 = peerPubKey.ifBlank { existing.peerPublicKeyB64 },
+                                ecdhSharedSecretB64 = derivedSharedSecret.ifBlank { existing.ecdhSharedSecretB64 },
+                                blockchainLedgerJson = CoupleBlockchain.ledgerToJson(ledger),
+                                lastBlockHash = ledger.last().blockHash,
+                                blockHeight = ledger.size
+                            )
                         )
-                        repository.saveCoupleRoom(updated)
-                        updated
                     } else {
                         val ledger = listOf(genesis)
-                        val initialTtt = TicTacToeSyncState(mySymbol = if (justJoinedAsPartner) "O" else "X")
-                        val created = CoupleRoomRecord(
-                            coupleCode = cleanCode,
-                            myName = cleanName,
-                            partnerName = joinedPartnerName,
-                            spiceLevel = joinedSpice,
-                            isPassAndPlay = isOfflinePassAndPlay,
-                            isBonded = true,
-                            partnerLocked = joinedLocked,
-                            ticTacToeStateJson = CoupleTurnCodec.ticTacToeToJsonString(initialTtt),
-                            blockchainLedgerJson = CoupleBlockchain.ledgerToJson(ledger),
-                            lastBlockHash = genesis.blockHash,
-                            blockHeight = 1,
-                            firewallPassedCount = 1,
-                            firewallBlockedCount = 0,
-                            lastFirewallEvent = "Private bond established"
+                        val initialTtt = TicTacToeSyncState(mySymbol = if (isHostFlag) "X" else "O")
+                        repository.saveCoupleRoom(
+                            CoupleRoomRecord(
+                                coupleCode = cleanCode,
+                                myName = cleanName,
+                                partnerName = partnerName,
+                                spiceLevel = spice,
+                                isPassAndPlay = isOfflinePassAndPlay,
+                                isBonded = true,
+                                partnerLocked = partnerLocked,
+                                isHost = isHostFlag,
+                                approvalStatus = approvalStatus,
+                                pendingPartnerName = pendingName,
+                                ecdhPublicKeyB64 = localKeyPair.publicKeyB64,
+                                ecdhPrivateKeyB64 = localKeyPair.privateKeyB64,
+                                peerPublicKeyB64 = peerPubKey,
+                                ecdhSharedSecretB64 = derivedSharedSecret,
+                                ticTacToeStateJson = CoupleTurnCodec.ticTacToeToJsonString(initialTtt),
+                                blockchainLedgerJson = CoupleBlockchain.ledgerToJson(ledger),
+                                lastBlockHash = genesis.blockHash,
+                                blockHeight = 1,
+                                firewallPassedCount = 1,
+                                firewallBlockedCount = 0,
+                                lastFirewallEvent = "Awaiting Host secondary confirmation"
+                            )
                         )
-                        repository.saveCoupleRoom(created)
-                        created
                     }
                 }
 
@@ -1223,30 +1572,121 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                 )
                 _activeCoupleCode.value = cleanCode
 
-                // If joining a live cloud room as partner, immediately publish an encrypted handshake block
-                if (justJoinedAsPartner && cloudRepo != null && uid != null) {
-                    val spice = runCatching { SpiceLevel.valueOf(baseRoom.spiceLevel) }.getOrDefault(SpiceLevel.FLIRTY)
-                    val (packet, block) = withContext(Dispatchers.Default) {
-                        CoupleTurnCodec.encodeBondHandshakeWithBlock(
-                            coupleCode = cleanCode,
-                            senderName = cleanName,
-                            spiceLevel = spice,
-                            previousHash = baseRoom.lastBlockHash.ifBlank { genesis.blockHash },
-                            blockIndex = baseRoom.blockHeight
+                when {
+                    isOfflinePassAndPlay -> showFeedback("Pass & Play room #$cleanCode ready ♥")
+                    approvalStatus == "PENDING_HOST_APPROVAL" -> {
+                        _cloudSyncStatus.value = "PENDING_APPROVAL"
+                        showFeedback("Request sent to ${partnerName.ifBlank { "Host" }} — waiting for Allow 🔒")
+                    }
+                    approvalStatus == "CONNECTED" -> showFeedback("Connected live to Room #$cleanCode ♥")
+                    else -> showFeedback("Room #$cleanCode ready ✨")
+                }
+            } finally {
+                _isCloudBusy.value = false
+            }
+        }
+    }
+
+    fun createOrJoinCoupleRoom(myName: String, rawCode: String) {
+        if (rawCode.isBlank()) {
+            createUniqueCoupleRoom(myName)
+        } else {
+            requestJoinCoupleRoom(myName, rawCode)
+        }
+    }
+
+    /**
+     * Host-only secondary confirmation: allows the pending partner into the private room.
+     */
+    fun approvePendingPartner(coupleCode: String) {
+        viewModelScope.launch {
+            _isCloudBusy.value = true
+            try {
+                val cloudRepo = getCloudRepoOrNull() ?: return@launch
+                val result = cloudRepo.approvePendingPartner(coupleCode)
+                if (result.isFailure) {
+                    showFeedback(result.exceptionOrNull()?.message ?: "Could not approve partner")
+                    return@launch
+                }
+                val approved = result.getOrThrow()
+                coupleRoomMutex.withLock {
+                    val fresh = repository.getCoupleRoom(coupleCode)
+                    if (fresh != null) {
+                        val partnerPub = approved.partnerPublicKey.ifBlank { fresh.peerPublicKeyB64 }
+                        val sharedSecret = if (partnerPub.isNotBlank() && fresh.ecdhPrivateKeyB64.isNotBlank()) {
+                            withContext(Dispatchers.Default) {
+                                CoupleEcdhEngine.deriveSharedSecretB64(
+                                    myPrivateKeyB64 = fresh.ecdhPrivateKeyB64,
+                                    peerPublicKeyB64 = partnerPub,
+                                    coupleCode = coupleCode,
+                                    myPublicKeyB64 = fresh.ecdhPublicKeyB64
+                                ).orEmpty()
+                            }
+                        } else {
+                            fresh.ecdhSharedSecretB64
+                        }
+                        repository.saveCoupleRoom(
+                            fresh.copy(
+                                partnerName = approved.partnerName.ifBlank { fresh.partnerName },
+                                partnerLocked = true,
+                                approvalStatus = "CONNECTED",
+                                pendingPartnerName = "",
+                                peerPublicKeyB64 = partnerPub,
+                                ecdhSharedSecretB64 = sharedSecret
+                            )
                         )
                     }
-                    sentBlockHashes.add(block.blockHash)
-                    commitOutgoingCoupleBlock(cleanCode, block)
-                    cloudRepo.publishEncryptedBlock(cleanCode, cleanName, block, packet)
-                    showFeedback("Connected live with ${joinedPartnerName.ifBlank { "your partner" }} ♥")
-                } else if (rawCode.contains("KRIMOON:BCHAIN:")) {
-                    applyTurnPacketToRoom(baseRoom, rawCode, isAutoSync = false)
-                } else if (isOfflinePassAndPlay) {
-                    showFeedback("Pass & Play room #$cleanCode ready ♥")
-                } else if (joinedLocked && joinedPartnerName.isNotBlank()) {
-                    showFeedback("Connected live with $joinedPartnerName ♥")
+                }
+                _cloudSyncStatus.value = "LIVE"
+                rebroadcastedCodes.add(coupleCode)
+                rebroadcastPendingLocalMoves(cloudRepo, coupleCode)
+                showFeedback("Allowed ${approved.partnerName.ifBlank { "Partner" }} into Room #$coupleCode ♥")
+            } finally {
+                _isCloudBusy.value = false
+            }
+        }
+    }
+
+    /**
+     * Host declines a pending join request OR the waiting partner cancels their own request.
+     */
+    fun declinePendingPartner(coupleCode: String) {
+        viewModelScope.launch {
+            _isCloudBusy.value = true
+            try {
+                val local = repository.getCoupleRoom(coupleCode)
+                getCloudRepoOrNull()?.declineOrCancelPendingPartner(coupleCode)
+
+                if (local != null && !local.isHost) {
+                    // Joining partner cancelled their pending request
+                    coupleRoomMutex.withLock {
+                        repository.deleteCoupleRoom(coupleCode)
+                    }
+                    if (_activeCoupleCode.value == coupleCode) {
+                        _activeCoupleCode.value = null
+                    }
+                    userProfile.value?.let { profile ->
+                        if (profile.activeCoupleCode == coupleCode) {
+                            repository.saveProfile(profile.copy(activeCoupleCode = ""))
+                        }
+                    }
+                    _cloudSyncStatus.value = "WAITING"
+                    showFeedback("Join request cancelled")
                 } else {
-                    showFeedback("Room #$cleanCode ready — share the code to connect live ✨")
+                    // Host declined incoming join request
+                    coupleRoomMutex.withLock {
+                        val fresh = repository.getCoupleRoom(coupleCode)
+                        if (fresh != null) {
+                            repository.saveCoupleRoom(
+                                fresh.copy(
+                                    approvalStatus = "WAITING",
+                                    pendingPartnerName = ""
+                                )
+                            )
+                        }
+                    }
+                    _cloudSyncStatus.value = "WAITING"
+                    showFeedback("Declined request — Room #$coupleCode stays private 🔒")
                 }
             } finally {
                 _isCloudBusy.value = false
@@ -1421,6 +1861,53 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun saveCoupleDareState(dareStateJson: String, bumpStreak: Boolean = false) {
+        val room = activeCoupleRoom.value ?: return
+        viewModelScope.launch {
+            coupleRoomMutex.withLock {
+                val fresh = repository.getCoupleRoom(room.coupleCode) ?: room
+                repository.saveCoupleRoom(
+                    fresh.copy(
+                        dareStateJson = dareStateJson,
+                        streakCount = fresh.streakCount + if (bumpStreak) 1 else 0
+                    )
+                )
+            }
+        }
+    }
+
+    fun saveCoupleWavelengthState(wavelengthStateJson: String, bumpMatch: Boolean = false) {
+        val room = activeCoupleRoom.value ?: return
+        viewModelScope.launch {
+            coupleRoomMutex.withLock {
+                val fresh = repository.getCoupleRoom(room.coupleCode) ?: room
+                repository.saveCoupleRoom(
+                    fresh.copy(
+                        wavelengthStateJson = wavelengthStateJson,
+                        matchCount = fresh.matchCount + if (bumpMatch) 1 else 0,
+                        streakCount = fresh.streakCount + if (bumpMatch) 1 else 0
+                    )
+                )
+            }
+        }
+    }
+
+    fun saveCoupleWhisperState(whisperStateJson: String, bumpMatch: Boolean = false) {
+        val room = activeCoupleRoom.value ?: return
+        viewModelScope.launch {
+            coupleRoomMutex.withLock {
+                val fresh = repository.getCoupleRoom(room.coupleCode) ?: room
+                repository.saveCoupleRoom(
+                    fresh.copy(
+                        whisperStateJson = whisperStateJson,
+                        matchCount = fresh.matchCount + if (bumpMatch) 1 else 0,
+                        streakCount = fresh.streakCount + if (bumpMatch) 1 else 0
+                    )
+                )
+            }
+        }
+    }
+
     fun importCoupleTurnPacket(rawPacket: String, isAutoSync: Boolean = false) {
         val room = activeCoupleRoom.value
         if (room == null) {
@@ -1458,7 +1945,8 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                 expectedCoupleCode = freshRoom.coupleCode,
                 existingLedger = existingLedger,
                 lockedPartnerName = lockedPartner,
-                myName = freshRoom.myName
+                myName = freshRoom.myName,
+                ecdhSharedSecretB64 = freshRoom.ecdhSharedSecretB64
             )
         }
 
@@ -1517,6 +2005,19 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 is DecodedTurnPacket.QuizTurn -> {
                     val current = CoupleTurnCodec.roundStateFromJson(freshRoom.quizStateJson)
+                    // Never rewind to an older completed round if a delayed block arrives
+                    if (packet.roundIndex < current.roundIndex) {
+                        repository.saveCoupleRoom(
+                            freshRoom.copy(
+                                blockchainLedgerJson = CoupleBlockchain.ledgerToJson(updatedLedger),
+                                lastBlockHash = newLastHash,
+                                blockHeight = newHeight,
+                                firewallPassedCount = newPassed,
+                                lastFirewallEvent = auditMsg
+                            )
+                        )
+                        return@onSuccess
+                    }
                     val updated = if (current.roundIndex == packet.roundIndex) {
                         current.copy(partnerChoice = packet.choiceIndex, partnerName = packet.senderName)
                     } else {
@@ -1524,10 +2025,14 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                             roundIndex = packet.roundIndex,
                             myChoice = null,
                             partnerChoice = packet.choiceIndex,
-                            partnerName = packet.senderName
+                            partnerName = packet.senderName,
+                            history = current.history
                         )
                     }
-                    val isMatch = updated.myChoice != null && updated.myChoice == updated.partnerChoice
+                    val newlyRevealed = current.partnerChoice == null &&
+                        updated.myChoice != null &&
+                        updated.partnerChoice != null
+                    val isMatch = newlyRevealed && updated.myChoice == updated.partnerChoice
                     repository.saveCoupleRoom(
                         freshRoom.copy(
                             partnerName = packet.senderName,
@@ -1548,6 +2053,18 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 is DecodedTurnPacket.WyrTurn -> {
                     val current = CoupleTurnCodec.roundStateFromJson(freshRoom.wyrStateJson)
+                    if (packet.roundIndex < current.roundIndex) {
+                        repository.saveCoupleRoom(
+                            freshRoom.copy(
+                                blockchainLedgerJson = CoupleBlockchain.ledgerToJson(updatedLedger),
+                                lastBlockHash = newLastHash,
+                                blockHeight = newHeight,
+                                firewallPassedCount = newPassed,
+                                lastFirewallEvent = auditMsg
+                            )
+                        )
+                        return@onSuccess
+                    }
                     val updated = if (current.roundIndex == packet.roundIndex) {
                         current.copy(partnerChoice = packet.choiceIndex, partnerName = packet.senderName)
                     } else {
@@ -1555,10 +2072,14 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                             roundIndex = packet.roundIndex,
                             myChoice = null,
                             partnerChoice = packet.choiceIndex,
-                            partnerName = packet.senderName
+                            partnerName = packet.senderName,
+                            history = current.history
                         )
                     }
-                    val isMatch = updated.myChoice != null && updated.myChoice == updated.partnerChoice
+                    val newlyRevealed = current.partnerChoice == null &&
+                        updated.myChoice != null &&
+                        updated.partnerChoice != null
+                    val isMatch = newlyRevealed && updated.myChoice == updated.partnerChoice
                     repository.saveCoupleRoom(
                         freshRoom.copy(
                             partnerName = packet.senderName,
@@ -1616,6 +2137,89 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                     )
                     showFeedback("${packet.senderName} played Tic-Tac-Toe ⚡")
                 }
+                is DecodedTurnPacket.DareTurn -> {
+                    val prev = CoupleActivitiesDeck.dareStateFromJson(freshRoom.dareStateJson)
+                    val newlyCompleted = packet.state.status == "COMPLETED" && prev.status != "COMPLETED"
+                    repository.saveCoupleRoom(
+                        freshRoom.copy(
+                            partnerName = packet.senderName,
+                            partnerLocked = true,
+                            isBonded = true,
+                            dareStateJson = CoupleActivitiesDeck.dareStateToJson(packet.state),
+                            streakCount = freshRoom.streakCount + if (newlyCompleted) 1 else 0,
+                            blockchainLedgerJson = CoupleBlockchain.ledgerToJson(updatedLedger),
+                            lastBlockHash = newLastHash,
+                            blockHeight = newHeight,
+                            firewallPassedCount = newPassed,
+                            lastFirewallEvent = auditMsg
+                        )
+                    )
+                    val verb = if (packet.state.status == "COMPLETED") "completed the challenge" else "sent a Truth or Dare"
+                    showFeedback("${packet.senderName} $verb 🎲")
+                }
+                is DecodedTurnPacket.WavelengthTurn -> {
+                    val prev = CoupleActivitiesDeck.wavelengthStateFromJson(freshRoom.wavelengthStateJson)
+                    val newlyMatched = packet.state.phase == "REVEAL" &&
+                        prev.phase != "REVEAL" &&
+                        packet.state.lastScore >= 60
+                    repository.saveCoupleRoom(
+                        freshRoom.copy(
+                            partnerName = packet.senderName,
+                            partnerLocked = true,
+                            isBonded = true,
+                            wavelengthStateJson = CoupleActivitiesDeck.wavelengthStateToJson(packet.state),
+                            matchCount = freshRoom.matchCount + if (newlyMatched) 1 else 0,
+                            streakCount = freshRoom.streakCount + if (newlyMatched) 1 else 0,
+                            blockchainLedgerJson = CoupleBlockchain.ledgerToJson(updatedLedger),
+                            lastBlockHash = newLastHash,
+                            blockHeight = newHeight,
+                            firewallPassedCount = newPassed,
+                            lastFirewallEvent = auditMsg
+                        )
+                    )
+                    showFeedback("${packet.senderName} updated Heart Wavelength 🌊")
+                }
+                is DecodedTurnPacket.WhisperTurn -> {
+                    val current = CoupleActivitiesDeck.dateWhisperStateFromJson(freshRoom.whisperStateJson)
+                    val updatedPartnerLikes = if (packet.likedDateId.isNotBlank()) {
+                        current.partnerLikedIds + packet.likedDateId
+                    } else {
+                        current.partnerLikedIds
+                    }
+                    val isNewDateMatch = packet.likedDateId.isNotBlank() &&
+                        packet.likedDateId in current.myLikedIds &&
+                        packet.likedDateId !in current.partnerLikedIds
+                    val incomingNote = packet.whisperNote
+                    val updatedWhispers = if (incomingNote != null && current.whispers.none { it.id == incomingNote.id }) {
+                        (current.whispers + incomingNote.copy(isRevealed = false)).takeLast(24)
+                    } else {
+                        current.whispers
+                    }
+                    val merged = current.copy(
+                        partnerLikedIds = updatedPartnerLikes,
+                        whispers = updatedWhispers
+                    )
+                    repository.saveCoupleRoom(
+                        freshRoom.copy(
+                            partnerName = packet.senderName,
+                            partnerLocked = true,
+                            isBonded = true,
+                            whisperStateJson = CoupleActivitiesDeck.dateWhisperStateToJson(merged),
+                            matchCount = freshRoom.matchCount + if (isNewDateMatch) 1 else 0,
+                            streakCount = freshRoom.streakCount + if (isNewDateMatch) 1 else 0,
+                            blockchainLedgerJson = CoupleBlockchain.ledgerToJson(updatedLedger),
+                            lastBlockHash = newLastHash,
+                            blockHeight = newHeight,
+                            firewallPassedCount = newPassed,
+                            lastFirewallEvent = auditMsg
+                        )
+                    )
+                    when {
+                        isNewDateMatch -> showFeedback("It's a Date Night Match with ${packet.senderName} 💞")
+                        incomingNote != null -> showFeedback("New Secret Whisper from ${packet.senderName} 💌")
+                        else -> showFeedback("${packet.senderName} voted on a Date Night ✨")
+                    }
+                }
             }
         }
         }
@@ -1628,15 +2232,15 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
 }
 
 enum class NavScreen(val label: String, val emoji: String) {
-    CYCLE("Cycle", "🌸"),
-    PERIODS("Periods", "🩸"),
+    CYCLE("Today", "🌸"),
+    PERIODS("Calendar", "🩸"),
     CARE("Care", "🌿"),
-    NOTES("Notes", "📝"),
+    NOTES("Journal", "📝"),
     PLAY("Play", "🎮")
 }
 
 enum class CareTab(val label: String, val emoji: String) {
     WATER("Water", "💧"),
     MEDS("Meds", "💊"),
-    CHECKLIST("To Get", "🛍️")
+    CHECKLIST("Wishlist", "🛍️")
 }

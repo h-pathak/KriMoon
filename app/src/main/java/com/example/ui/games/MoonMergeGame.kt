@@ -32,6 +32,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
@@ -122,6 +123,8 @@ fun MoonMergeGame(
 
     var boxWidthPx by remember { mutableFloatStateOf(0f) }
     var boxHeightPx by remember { mutableFloatStateOf(0f) }
+    val latestSoundEnabled by rememberUpdatedState(soundEnabled)
+    val latestOnScoreSaved by rememberUpdatedState(onScoreSaved)
 
     fun resetGame() {
         orbs = emptyList()
@@ -155,18 +158,22 @@ fun MoonMergeGame(
         nextTier = Random.nextInt(0, 4)
         dropCooldown = 0.34f
         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-        if (soundEnabled) SoundHelper.playSound(context, SoundHelper.SOUND_SWEET_BUBBLE, 0.7f)
+        if (latestSoundEnabled) SoundHelper.playSound(context, SoundHelper.SOUND_SWEET_BUBBLE, 0.7f)
     }
 
     // 60fps Suika Physics Loop
     LaunchedEffect(isGameOver, boxWidthPx, boxHeightPx) {
         if (isGameOver || boxWidthPx <= 0f || boxHeightPx <= 0f) return@LaunchedEffect
-        var lastNano = System.nanoTime()
+        var lastNano = 0L
         val gravity = with(density) { 1250.dp.toPx() }
         val dangerY = with(density) { 74.dp.toPx() }
 
         while (isActive && !isGameOver) {
             withFrameNanos { now ->
+                if (lastNano == 0L) {
+                    lastNano = now
+                    return@withFrameNanos
+                }
                 val dt = ((now - lastNano) / 1_000_000_000f).coerceIn(0.002f, 0.032f)
                 lastNano = now
                 if (dropCooldown > 0f) dropCooldown = max(0f, dropCooldown - dt)
@@ -259,7 +266,7 @@ fun MoonMergeGame(
 
                 if (mergedAny) {
                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                    if (soundEnabled) SoundHelper.playCuteChime(context)
+                    if (latestSoundEnabled) SoundHelper.playCuteChime(context)
                     particleController.spawn(
                         centerX = boxWidthPx * aimXFraction,
                         centerY = boxHeightPx * 0.45f,
@@ -276,7 +283,7 @@ fun MoonMergeGame(
                 val overflowed = updated.any { it.ageSec > 1.8f && (it.y - it.radius) < dangerY && kotlin.math.abs(it.vy) < 40f }
                 if (overflowed) {
                     isGameOver = true
-                    onScoreSaved(score, maxCombo)
+                    latestOnScoreSaved(score, maxCombo)
                 }
             }
         }
@@ -388,8 +395,12 @@ fun MoonMergeGame(
                 }
                 .testTag("moon_merge_canvas")
         ) {
-            boxWidthPx = constraints.maxWidth.toFloat()
-            boxHeightPx = constraints.maxHeight.toFloat()
+            val maxW = constraints.maxWidth.toFloat()
+            val maxH = constraints.maxHeight.toFloat()
+            LaunchedEffect(maxW, maxH) {
+                boxWidthPx = maxW
+                boxHeightPx = maxH
+            }
             val currentMeta = MERGE_TIERS[currentTier]
             val currentRadiusPx = with(density) { currentMeta.radiusDp.dp.toPx() }
             val dangerY = with(density) { 74.dp.toPx() }

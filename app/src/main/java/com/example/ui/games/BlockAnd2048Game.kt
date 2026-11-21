@@ -29,6 +29,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -361,6 +362,7 @@ private fun Glow2048Stage(
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
     val particleController = LocalParticleController.current
+    val latestSoundEnabled by rememberUpdatedState(soundEnabled)
 
     fun spawnTile(grid: List<List<Int>>): List<List<Int>> {
         val empty = mutableListOf<Pair<Int, Int>>()
@@ -441,7 +443,7 @@ private fun Glow2048Stage(
             val spawned = spawnTile(candidate)
             grid = spawned
             haptic.performHapticFeedback(if (totalGain > 0) HapticFeedbackType.LongPress else HapticFeedbackType.TextHandleMove)
-            if (totalGain > 0 && soundEnabled) SoundHelper.playSound(context, SoundHelper.SOUND_SWEET_BUBBLE, 0.7f)
+            if (totalGain > 0 && latestSoundEnabled) SoundHelper.playSound(context, SoundHelper.SOUND_SWEET_BUBBLE, 0.7f)
             if (totalGain >= 64) particleController.spawn(500f, 650f, listOf("✨", "🌙", "💎"), 10)
             if (!canMove(spawned)) {
                 isGameOver = true

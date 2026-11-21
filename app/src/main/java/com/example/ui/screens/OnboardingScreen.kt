@@ -122,8 +122,7 @@ fun OnboardingScreen(
         Text(
             text = "Welcome to KriMoon",
             style = MaterialTheme.typography.headlineMedium.copy(
-                fontWeight = FontWeight.Bold,
-                fontFamily = FontFamily.Serif
+                fontWeight = FontWeight.Bold
             ),
             color = MaterialTheme.colorScheme.onBackground
         )
@@ -131,7 +130,7 @@ fun OnboardingScreen(
         Spacer(modifier = Modifier.height(6.dp))
 
         Text(
-            text = "A private, beautiful cycle companion that lives only on your phone.",
+            text = "Lunar cycle intelligence, soft-girl rituals & encrypted couple sync — private by default.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center
@@ -277,23 +276,30 @@ fun OnboardingScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Privacy Badge
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(horizontal = 8.dp)
+        // Privacy-by-Default Pill
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+            border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            modifier = Modifier.fillMaxWidth()
         ) {
-            Icon(
-                imageVector = Icons.Default.Lock,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(16.dp)
-            )
-            Spacer(modifier = Modifier.width(6.dp))
-            Text(
-                text = "100% offline & local. Gentle cycle alerts & water nudges live only on this device.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Lock,
+                    contentDescription = "Private on device",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "Private by default · Health logs & alerts stay stored locally on your phone.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
 
         Spacer(modifier = Modifier.height(20.dp))

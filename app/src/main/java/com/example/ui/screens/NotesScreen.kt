@@ -79,7 +79,6 @@ import androidx.compose.ui.unit.sp
 import com.example.data.UserNote
 import com.example.notifications.NotificationHelper
 import com.example.ui.components.CuteAddButton
-import com.example.ui.components.CuteEmptyStateCard
 import com.example.ui.components.LocalParticleController
 import com.example.ui.components.cute3DCard
 import com.example.ui.theme.PhasesPlum
@@ -170,12 +169,14 @@ fun NotesScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f)
+                ) {
                     Text(
-                        text = "Private Scratchpad",
+                        text = "Private Journal",
                         style = MaterialTheme.typography.headlineSmall.copy(
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Serif
+                            fontWeight = FontWeight.Bold
                         ),
                         color = MaterialTheme.colorScheme.onBackground
                     )
@@ -189,6 +190,7 @@ fun NotesScreen(
                 }
 
                 if (activeRemindersCount > 0) {
+                    Spacer(modifier = Modifier.width(8.dp))
                     Surface(
                         shape = RoundedCornerShape(100.dp),
                         color = MaterialTheme.colorScheme.primaryContainer,
@@ -240,8 +242,10 @@ fun NotesScreen(
                         Text(
                             text = "Write a private note 💌",
                             style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
-                            color = MaterialTheme.colorScheme.onSurface
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.weight(1f)
                         )
+                        Spacer(modifier = Modifier.width(8.dp))
                         Surface(
                             shape = RoundedCornerShape(100.dp),
                             color = PhasesRose.copy(alpha = 0.15f)
@@ -406,22 +410,14 @@ fun NotesScreen(
             }
         }
 
-        // Notes List / User-Friendly 3D Empty State
-        if (filteredNotes.isEmpty()) {
+        // Notes List
+        if (filteredNotes.isEmpty() && filterTag == "reminders") {
             item {
-                CuteEmptyStateCard(
-                    emoji = if (filterTag == "reminders") "⏰" else "💌",
-                    title = if (filterTag == "reminders") "No active note reminders" else "Your Private Diary is Cozy",
-                    description = if (filterTag == "reminders") {
-                        "Tap 'Set Reminder' on any note above to schedule custom notification alerts."
-                    } else {
-                        "Write fleeting reflections, cycle symptoms, doctor questions, or loving reminders above."
-                    },
-                    buttonText = "+ Write a Note 🌸",
-                    onButtonClick = {
-                        particleController.showToast(coroutineScope, "Type your thoughts in the box above 🌸", "✏️")
-                    },
-                    testTag = "empty_notes_card"
+                Text(
+                    text = "No active note reminders yet.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp)
                 )
             }
         } else {
@@ -445,13 +441,13 @@ fun NotesScreen(
     }
 
     // Modal Dialog to Edit or Set Reminder on an Existing Note
-    if (editingReminderNote != null) {
+    editingReminderNote?.let { targetNote ->
         NoteReminderDialog(
-            note = editingReminderNote!!,
+            note = targetNote,
             onDismiss = { editingReminderNote = null },
             onSaveReminder = { reminderMillis ->
                 ensureNotificationPermission()
-                onUpdateReminder(editingReminderNote!!.id, reminderMillis)
+                onUpdateReminder(targetNote.id, reminderMillis)
                 particleController.spawn(500f, 400f, listOf("⏰", "🔔", "✨"), 12)
                 particleController.showToast(
                     coroutineScope,
@@ -765,7 +761,7 @@ private fun NoteCard(
                             )
                             Spacer(modifier = Modifier.width(5.dp))
                             Text(
-                                text = "Reminding: ${formatReminderTime(note.reminderTimeMillis!!)}",
+                                text = "Reminding: ${formatReminderTime(note.reminderTimeMillis)}",
                                 style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                                 color = MaterialTheme.colorScheme.primary
                             )

@@ -2,28 +2,48 @@
   "entities": {
     "CoupleCloudRoom": {
       "title": "CoupleCloudRoom",
-      "description": "Real-time bonded room connecting at most two authenticated partners via a 6-digit couple code. Stores only routing metadata; all game moves are stored as AES-256-GCM encrypted blockchain envelopes in the blocks subcollection.",
+      "description": "Real-time zero-knowledge E2EE bonded room connecting at most two authenticated partners via a permanently unique 6-digit couple code, Host secondary confirmation, and immutable ECDH P-256 public key exchange. Room documents are never deleted so a generated code can never be reused by another couple.",
       "type": "object",
       "properties": {
         "coupleCode": {
           "type": "string",
-          "description": "6-digit unique numeric room code matching the document ID."
+          "description": "6-digit globally unique numeric room code matching the document ID."
         },
         "creatorUid": {
           "type": "string",
-          "description": "Firebase Auth UID of the partner who created the room (immutable)."
+          "description": "Firebase Auth UID of the Host partner who created the room (immutable)."
         },
         "creatorName": {
           "type": "string",
-          "description": "Display name of the room creator (1-32 characters)."
+          "description": "Display name of the room creator (1-32 characters, immutable after creation)."
+        },
+        "creatorPublicKey": {
+          "type": "string",
+          "description": "Base64 X.509 SPKI ECDH P-256 public key of the Host partner (immutable once set; private key never leaves device)."
         },
         "partnerUid": {
           "type": "string",
-          "description": "Firebase Auth UID of the joining partner (empty string until joined, immutable once set)."
+          "description": "Firebase Auth UID of the approved joining partner (empty string until Host approves, immutable once set)."
         },
         "partnerName": {
           "type": "string",
-          "description": "Display name of the joining partner (0-32 characters)."
+          "description": "Display name of the approved joining partner (0-32 characters, immutable once approved)."
+        },
+        "partnerPublicKey": {
+          "type": "string",
+          "description": "Base64 X.509 SPKI ECDH P-256 public key of the approved partner (promoted from pendingPartnerPublicKey on Host approval, immutable once set)."
+        },
+        "pendingPartnerUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of a partner awaiting Host secondary confirmation (empty string when no request is pending)."
+        },
+        "pendingPartnerName": {
+          "type": "string",
+          "description": "Display name of a partner awaiting Host secondary confirmation (0-32 characters)."
+        },
+        "pendingPartnerPublicKey": {
+          "type": "string",
+          "description": "Base64 X.509 SPKI ECDH P-256 public key of the pending partner awaiting Host approval."
         },
         "memberUids": {
           "type": "array",
@@ -36,12 +56,12 @@
         },
         "status": {
           "type": "string",
-          "enum": ["WAITING", "CONNECTED", "UNPAIRED"],
-          "description": "Room lifecycle state; UNPAIRED is a terminal state locking further updates."
+          "enum": ["WAITING", "PENDING_APPROVAL", "CONNECTED", "UNPAIRED"],
+          "description": "Room lifecycle state; WAITING accepts a join request -> PENDING_APPROVAL awaits Host Allow/Decline -> CONNECTED unlocks zero-knowledge ECDH play; UNPAIRED permanently locks and retires the code."
         },
         "blockCount": {
           "type": "integer",
-          "description": "Total number of encrypted blockchain blocks committed to this room."
+          "description": "Monotonically increasing total number of encrypted blockchain blocks committed to this room."
         },
         "latestBlockHash": {
           "type": "string",
@@ -62,8 +82,13 @@
         "coupleCode",
         "creatorUid",
         "creatorName",
+        "creatorPublicKey",
         "partnerUid",
         "partnerName",
+        "partnerPublicKey",
+        "pendingPartnerUid",
+        "pendingPartnerName",
+        "pendingPartnerPublicKey",
         "memberUids",
         "spiceLevel",
         "status",
@@ -75,7 +100,7 @@
     },
     "CoupleEncryptedBlock": {
       "title": "CoupleEncryptedBlock",
-      "description": "Immutable, append-only AES-256-GCM + Proof-of-Work blockchain packet carrying an encrypted couple game move or handshake between two bonded phones.",
+      "description": "Immutable, append-only, non-deletable ECDH-P256 + HKDF-SHA256 + AES-256-GCM + Proof-of-Work blockchain packet carrying an encrypted couple game move, activity turn, or handshake between two bonded phones.",
       "type": "object",
       "properties": {
         "coupleCode": {
@@ -100,8 +125,8 @@
         },
         "actionType": {
           "type": "string",
-          "enum": ["GENESIS_BOND", "HANDSHAKE", "QUIZ", "WYR", "DOODLE", "TTT", "UNPAIR"],
-          "description": "Type of encrypted couple game turn or lifecycle event."
+          "enum": ["GENESIS_BOND", "HANDSHAKE", "QUIZ", "WYR", "DOODLE", "TTT", "DARE", "WAVELENGTH", "WHISPER", "UNPAIR"],
+          "description": "Type of encrypted couple activity turn or lifecycle event."
         },
         "blockHash": {
           "type": "string",
@@ -109,7 +134,7 @@
         },
         "encryptedPacket": {
           "type": "string",
-          "description": "AES-256-GCM + HMAC-SHA256 encrypted KRIMOON:BCHAIN: ciphertext envelope."
+          "description": "Zero-knowledge ECDH + AES-256-GCM + HMAC-SHA256 encrypted KRIMOON:BCHAIN: ciphertext envelope."
         },
         "createdAt": {
           "type": "string",
@@ -133,11 +158,11 @@
   "firestore": {
     "/coupleRooms/{coupleCode}": {
       "schema": { "$ref": "#/entities/CoupleCloudRoom" },
-      "description": "Root collection of bonded 2-partner couple rooms keyed by their 6-digit coupleCode."
+      "description": "Root collection of permanently unique 2-partner couple rooms with Host approval gating and immutable ECDH P-256 public key exchange, keyed by their 6-digit coupleCode."
     },
     "/coupleRooms/{coupleCode}/blocks/{blockId}": {
       "schema": { "$ref": "#/entities/CoupleEncryptedBlock" },
-      "description": "Append-only stream of AES-256-GCM encrypted blockchain move envelopes for a couple room."
+      "description": "Immutable, non-deletable append-only stream of zero-knowledge encrypted blockchain move envelopes for a couple room."
     }
   }
 }

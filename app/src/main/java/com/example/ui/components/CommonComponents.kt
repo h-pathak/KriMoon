@@ -24,11 +24,23 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.CalendarMonth
+import androidx.compose.material.icons.filled.EditNote
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.SportsEsports
+import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.CalendarMonth
+import androidx.compose.material.icons.outlined.EditNote
+import androidx.compose.material.icons.outlined.FavoriteBorder
+import androidx.compose.material.icons.outlined.SportsEsports
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -49,6 +61,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -62,10 +75,12 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.model.CyclePhase
 import com.example.model.CycleStatus
+import com.example.ui.theme.EditorialDisplayFont
 import com.example.ui.theme.PhasesInk
 import com.example.ui.theme.PhasesInkSoft
 import com.example.ui.theme.PhasesLine
@@ -84,47 +99,79 @@ fun PhasesTopBar(
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    TopAppBar(
-        title = {
-            Column {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = title,
-                        style = MaterialTheme.typography.titleLarge.copy(
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Serif
-                        ),
-                        color = MaterialTheme.colorScheme.onBackground
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(text = "✿", color = PhasesRose, fontSize = 16.sp)
+    Column(modifier = modifier.fillMaxWidth()) {
+        TopAppBar(
+            title = {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f, fill = false)
+                    ) {
+                        Text(
+                            text = title,
+                            style = MaterialTheme.typography.titleLarge.copy(
+                                fontFamily = EditorialDisplayFont,
+                                fontWeight = FontWeight.Bold
+                            ),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
+                        Spacer(modifier = Modifier.width(5.dp))
+                        Text(
+                            text = "☽",
+                            color = PhasesRose,
+                            fontSize = 14.sp
+                        )
+                    }
+                    if (!subtitle.isNullOrBlank()) {
+                        Surface(
+                            shape = RoundedCornerShape(100.dp),
+                            color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
+                            border = BorderStroke(1.dp, PhasesRose.copy(alpha = 0.22f))
+                        ) {
+                            Text(
+                                text = subtitle,
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
                 }
-                if (!subtitle.isNullOrBlank()) {
-                    Text(
-                        text = subtitle,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+            },
+            actions = {
+                val ctx = LocalContext.current
+                val topHaptic = LocalHapticFeedback.current
+                IconButton(
+                    onClick = {
+                        AestheticHaptics.softTick(ctx, topHaptic)
+                        onOpenSettings()
+                    },
+                    modifier = Modifier.testTag("settings_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Settings,
+                        contentDescription = "Settings",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-            }
-        },
-        actions = {
-            IconButton(
-                onClick = onOpenSettings,
-                modifier = Modifier.testTag("settings_button")
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Settings,
-                    contentDescription = "Settings",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        },
-        colors = TopAppBarDefaults.topAppBarColors(
-            containerColor = Color.Transparent
-        ),
-        modifier = modifier
-    )
+            },
+            colors = TopAppBarDefaults.topAppBarColors(
+                containerColor = MaterialTheme.colorScheme.background.copy(alpha = 0.96f)
+            )
+        )
+        HorizontalDivider(
+            thickness = 0.5.dp,
+            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.65f)
+        )
+    }
 }
 
 @Composable
@@ -133,58 +180,76 @@ fun PhasesBottomNav(
     onScreenSelected: (NavScreen) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
 
-    NavigationBar(
-        containerColor = MaterialTheme.colorScheme.surface,
-        tonalElevation = 8.dp,
-        modifier = modifier
-    ) {
-        NavScreen.values().forEach { screen ->
-            val isSelected = currentScreen == screen
-            val scale by animateFloatAsState(
-                targetValue = if (isSelected) 1.22f else 1.0f,
-                animationSpec = spring(
-                    dampingRatio = Spring.DampingRatioMediumBouncy,
-                    stiffness = Spring.StiffnessMedium
-                ),
-                label = "nav_scale"
-            )
+    Column(modifier = modifier.fillMaxWidth()) {
+        HorizontalDivider(
+            thickness = 0.5.dp,
+            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)
+        )
+        NavigationBar(
+            containerColor = MaterialTheme.colorScheme.surface,
+            tonalElevation = 0.dp
+        ) {
+            NavScreen.entries.forEach { screen ->
+                val isSelected = currentScreen == screen
+                val scale by animateFloatAsState(
+                    targetValue = if (isSelected) 1.08f else 1.0f,
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                        stiffness = Spring.StiffnessMedium
+                    ),
+                    label = "nav_scale"
+                )
+                val navIcon = when (screen) {
+                    NavScreen.CYCLE -> if (isSelected) Icons.Filled.AutoAwesome else Icons.Outlined.AutoAwesome
+                    NavScreen.PERIODS -> if (isSelected) Icons.Filled.CalendarMonth else Icons.Outlined.CalendarMonth
+                    NavScreen.CARE -> if (isSelected) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder
+                    NavScreen.NOTES -> if (isSelected) Icons.Filled.EditNote else Icons.Outlined.EditNote
+                    NavScreen.PLAY -> if (isSelected) Icons.Filled.SportsEsports else Icons.Outlined.SportsEsports
+                }
 
-            NavigationBarItem(
-                selected = isSelected,
-                onClick = {
-                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                    onScreenSelected(screen)
-                },
-                icon = {
-                    Text(
-                        text = screen.emoji,
-                        fontSize = 20.sp,
-                        modifier = Modifier.graphicsLayer {
-                            scaleX = scale
-                            scaleY = scale
-                        }
-                    )
-                },
-                label = {
-                    Text(
-                        text = screen.label,
-                        maxLines = 1,
-                        softWrap = false,
-                        style = MaterialTheme.typography.labelSmall.copy(
-                            fontSize = 11.sp,
-                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
+                NavigationBarItem(
+                    selected = isSelected,
+                    onClick = {
+                        AestheticHaptics.softTick(context, haptic)
+                        onScreenSelected(screen)
+                    },
+                    icon = {
+                        Icon(
+                            imageVector = navIcon,
+                            contentDescription = screen.label,
+                            modifier = Modifier
+                                .size(22.dp)
+                                .graphicsLayer {
+                                    scaleX = scale
+                                    scaleY = scale
+                                }
                         )
-                    )
-                },
-                colors = NavigationBarItemDefaults.colors(
-                    indicatorColor = MaterialTheme.colorScheme.primaryContainer,
-                    selectedTextColor = MaterialTheme.colorScheme.primary,
-                    unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
-                ),
-                modifier = Modifier.testTag("nav_${screen.name.lowercase()}")
-            )
+                    },
+                    label = {
+                        Text(
+                            text = screen.label,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontSize = 11.sp,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
+                            )
+                        )
+                    },
+                    colors = NavigationBarItemDefaults.colors(
+                        indicatorColor = MaterialTheme.colorScheme.primaryContainer,
+                        selectedIconColor = MaterialTheme.colorScheme.primary,
+                        selectedTextColor = MaterialTheme.colorScheme.primary,
+                        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+                    ),
+                    modifier = Modifier.testTag("nav_${screen.name.lowercase()}")
+                )
+            }
         }
     }
 }

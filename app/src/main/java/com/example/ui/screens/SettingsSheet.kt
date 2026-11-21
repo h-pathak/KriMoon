@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.NotificationsActive
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material3.AlertDialog
@@ -81,6 +82,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.UserProfile
 import com.example.notifications.NotificationHelper
+import com.example.notifications.SoundHelper
 import com.example.ui.theme.PhasesPlum
 import com.example.ui.theme.PhasesRose
 import com.example.ui.theme.PhasesSage
@@ -134,6 +136,7 @@ fun SettingsSheet(
     var checkinReminders by remember(userProfile) { mutableStateOf(userProfile?.checkinRemindersEnabled ?: true) }
     var shopReminders by remember(userProfile) { mutableStateOf(userProfile?.shopRemindersEnabled ?: true) }
     var reminderHour by remember(userProfile) { mutableIntStateOf(userProfile?.reminderHour ?: 20) }
+    var celebrationSoundsEnabled by remember { mutableStateOf(SoundHelper.isCelebrationSoundEnabled(context)) }
 
     var showClearConfirmDialog by remember { mutableStateOf(false) }
 
@@ -156,12 +159,12 @@ fun SettingsSheet(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Settings & Notifications",
+                    text = "Settings & Soundscape",
                     style = MaterialTheme.typography.titleLarge.copy(
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Serif
+                        fontWeight = FontWeight.Bold
                     ),
-                    color = MaterialTheme.colorScheme.onSurface
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f)
                 )
                 IconButton(onClick = onDismiss) {
                     Icon(Icons.Default.Close, contentDescription = "Close")
@@ -543,6 +546,50 @@ fun SettingsSheet(
                             }
                         }
                     }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // Calm Soundscape Card (Selective Sound Controls)
+            Card(
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("calm_soundscape_card")
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.VolumeUp,
+                            contentDescription = null,
+                            tint = PhasesRose,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Text(
+                            text = "Calm Soundscape",
+                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
+                    ReminderSwitchRow(
+                        title = "Soft Milestone Chimes",
+                        description = "Play a gentle chime only on milestones like 100% hydration or all meds complete. Routine taps stay silently haptic; medication alarms always alert.",
+                        checked = celebrationSoundsEnabled,
+                        onCheckedChange = { enabled ->
+                            celebrationSoundsEnabled = enabled
+                            SoundHelper.setCelebrationSoundEnabled(context, enabled)
+                            if (enabled) {
+                                SoundHelper.playCelebration(context)
+                            }
+                        },
+                        testTag = "switch_celebration_sounds"
+                    )
                 }
             }
 

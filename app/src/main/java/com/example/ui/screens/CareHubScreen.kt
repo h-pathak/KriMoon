@@ -112,10 +112,10 @@ fun CareHubScreen(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 6.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                // Symmetric 3-column Equal-Height Daily Summary Strip
+                // Unified 3-column Equal-Height Interactive Switcher & Live Summary Strip
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -128,11 +128,14 @@ fun CareHubScreen(
                         value = "$waterCount / $waterGoal",
                         accentColor = PhasesWaterBlue,
                         selected = activeTab == CareTab.WATER,
-                        onClick = { onSelectTab(CareTab.WATER) },
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onSelectTab(CareTab.WATER)
+                        },
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxHeight(),
-                        testTag = "care_metric_water"
+                        testTag = "care_tab_water"
                     )
                     CareMetricCard(
                         emoji = "💊",
@@ -140,72 +143,30 @@ fun CareHubScreen(
                         value = if (activeMeds == 0) "0 set" else "$takenMeds / $activeMeds",
                         accentColor = PhasesRose,
                         selected = activeTab == CareTab.MEDS,
-                        onClick = { onSelectTab(CareTab.MEDS) },
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onSelectTab(CareTab.MEDS)
+                        },
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxHeight(),
-                        testTag = "care_metric_meds"
+                        testTag = "care_tab_meds"
                     )
                     CareMetricCard(
                         emoji = "🛍️",
-                        label = "To Get",
+                        label = "Wishlist",
                         value = "$pendingItems left",
                         accentColor = PhasesSage,
                         selected = activeTab == CareTab.CHECKLIST,
-                        onClick = { onSelectTab(CareTab.CHECKLIST) },
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onSelectTab(CareTab.CHECKLIST)
+                        },
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxHeight(),
-                        testTag = "care_metric_checklist"
+                        testTag = "care_tab_checklist"
                     )
-                }
-
-                // Balanced 3-Segment Pill Switcher
-                Surface(
-                    shape = RoundedCornerShape(100.dp),
-                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(4.dp),
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        CareTab.entries.forEach { tab ->
-                            val isSelected = activeTab == tab
-                            Surface(
-                                shape = RoundedCornerShape(100.dp),
-                                color = if (isSelected) PhasesPlum else Color.Transparent,
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .cuteBouncyClick {
-                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                        onSelectTab(tab)
-                                    }
-                                    .testTag("care_tab_${tab.name.lowercase()}")
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(vertical = 8.dp, horizontal = 6.dp),
-                                    horizontalArrangement = Arrangement.Center,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(text = tab.emoji, fontSize = 14.sp)
-                                    Spacer(modifier = Modifier.width(5.dp))
-                                    Text(
-                                        text = tab.label,
-                                        maxLines = 1,
-                                        softWrap = false,
-                                        style = MaterialTheme.typography.labelMedium.copy(
-                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
-                                        ),
-                                        color = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            }
-                        }
-                    }
                 }
             }
 

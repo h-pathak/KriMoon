@@ -17,6 +17,11 @@ enum class OperationType(val value: String) {
     WRITE("write")
 }
 
+private fun maskUid(uid: String?): String {
+    if (uid.isNullOrBlank()) return "unauthenticated"
+    return if (uid.length <= 6) "***" else "${uid.take(4)}***${uid.takeLast(2)}"
+}
+
 fun handleFirestoreError(
     exception: Throwable,
     operationType: OperationType,
@@ -29,23 +34,24 @@ fun handleFirestoreError(
 
     val currentUser = runCatching { Firebase.auth.currentUser }.getOrNull()
 
+    // Never log plaintext email addresses or full UIDs to Android Logcat
     val providerInfoList = currentUser?.providerData?.map { provider ->
         JSONObject().apply {
             put("providerId", provider.providerId)
-            put("email", provider.email)
+            put("hasEmail", !provider.email.isNullOrBlank())
         }
     } ?: emptyList()
 
     val authInfoJson = JSONObject().apply {
-        put("userId", currentUser?.uid)
-        put("email", currentUser?.email)
+        put("userIdMasked", maskUid(currentUser?.uid))
+        put("authenticated", currentUser != null)
         put("emailVerified", currentUser?.isEmailVerified)
-        put("tenantId", currentUser?.tenantId)
         put("providerInfo", JSONArray(providerInfoList))
     }
 
+    val errorCode = (rootError as? FirebaseFirestoreException)?.code?.name ?: rootError.javaClass.simpleName
     val errorInfoJson = JSONObject().apply {
-        put("error", rootError.message ?: rootError.toString())
+        put("errorCode", errorCode)
         put("operationType", operationType.value)
         put("path", path)
         put("authInfo", authInfoJson)

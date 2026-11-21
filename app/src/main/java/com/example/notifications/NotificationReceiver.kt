@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import androidx.core.app.NotificationCompat
 import com.example.data.AppDatabase
+import com.example.data.PhasesRepository
 import com.example.model.CycleCalculator
 import com.example.model.CyclePhase
 import kotlinx.coroutines.CoroutineScope
@@ -26,51 +27,32 @@ class NotificationReceiver : BroadcastReceiver() {
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val db = AppDatabase.getInstance(context)
-                val profile = db.userProfileDao().getUserProfile().firstOrNull()
+                val repo = PhasesRepository(db)
+                val profile = repo.getProfileOnce()
 
                 when (action) {
                     NotificationHelper.ACTION_MEDICINE_REMINDER -> {
                         val medId = intent.getLongExtra(NotificationHelper.EXTRA_MEDICINE_ID, -1L)
-                        val medName = com.example.security.BackendSecurityFirewall.sanitizeField(
-                            intent.getStringExtra(NotificationHelper.EXTRA_MEDICINE_NAME) ?: "Daily Wellness Pill",
-                            maxLength = 100
-                        )
-                        val medDosage = com.example.security.BackendSecurityFirewall.sanitizeField(
-                            intent.getStringExtra(NotificationHelper.EXTRA_MEDICINE_DOSAGE) ?: "1 dose",
-                            maxLength = 80
-                        )
-                        val customSound = com.example.security.BackendSecurityFirewall.sanitizeField(
-                            intent.getStringExtra(NotificationHelper.EXTRA_MEDICINE_CUSTOM_SOUND) ?: "cute_chime",
-                            maxLength = 40
-                        )
-                        val customMsg = com.example.security.BackendSecurityFirewall.sanitizeField(
-                            intent.getStringExtra(NotificationHelper.EXTRA_MEDICINE_CUSTOM_MESSAGE) ?: "",
-                            maxLength = 300
-                        )
-                        handleMedicineReminder(context, db, medId, medName, medDosage, profile?.name ?: "Krishi", customSound, customMsg)
+                        handleMedicineReminder(context, repo, medId, profile?.name ?: "Krishi")
                     }
 
                     NotificationHelper.ACTION_TAKE_MEDICINE_QUICK -> {
                         val medId = intent.getLongExtra(NotificationHelper.EXTRA_MEDICINE_ID, -1L)
-                        val medName = com.example.security.BackendSecurityFirewall.sanitizeField(
-                            intent.getStringExtra(NotificationHelper.EXTRA_MEDICINE_NAME) ?: "Pill",
-                            maxLength = 100
-                        )
-                        handleQuickMedicineTake(context, db, medId, medName, profile?.name ?: "Krishi")
+                        handleQuickMedicineTake(context, repo, medId, profile?.name ?: "Krishi")
                     }
 
                     NotificationHelper.ACTION_WATER_REMINDER -> {
                         if (profile?.waterRemindersEnabled == true) {
-                            handleWaterReminder(context, db, profile.waterGoal, profile.name)
+                            handleWaterReminder(context, repo, profile.waterGoal, profile.name)
                         }
                     }
 
                     NotificationHelper.ACTION_ADD_WATER_QUICK -> {
-                        handleQuickWaterAdd(context, db, profile?.waterGoal ?: 8, profile?.name ?: "Krishi")
+                        handleQuickWaterAdd(context, repo, profile?.waterGoal ?: 8, profile?.name ?: "Krishi")
                     }
 
                     NotificationHelper.ACTION_CYCLE_REMINDER -> {
-                        handleCycleReminder(context, db, profile)
+                        handleCycleReminder(context, repo, profile)
                     }
 
                     NotificationHelper.ACTION_CHECKIN_REMINDER -> {
@@ -81,44 +63,27 @@ class NotificationReceiver : BroadcastReceiver() {
 
                     NotificationHelper.ACTION_NOTE_REMINDER -> {
                         val noteId = intent.getLongExtra(NotificationHelper.EXTRA_NOTE_ID, -1L)
-                        val content = com.example.security.BackendSecurityFirewall.sanitizeField(
-                            intent.getStringExtra(NotificationHelper.EXTRA_NOTE_CONTENT) ?: "",
-                            maxLength = 2000
-                        )
-                        val tag = com.example.security.BackendSecurityFirewall.sanitizeField(
-                            intent.getStringExtra(NotificationHelper.EXTRA_NOTE_TAG) ?: "thought",
-                            maxLength = 32
-                        )
-                        val timestamp = intent.getLongExtra(NotificationHelper.EXTRA_NOTE_TIMESTAMP, System.currentTimeMillis())
-                        handleNoteReminder(context, db, noteId, content, tag, timestamp)
+                        handleNoteReminder(context, repo, noteId)
                     }
 
                     NotificationHelper.ACTION_SNOOZE_NOTE_REMINDER -> {
                         val noteId = intent.getLongExtra(NotificationHelper.EXTRA_NOTE_ID, -1L)
-                        val content = com.example.security.BackendSecurityFirewall.sanitizeField(
-                            intent.getStringExtra(NotificationHelper.EXTRA_NOTE_CONTENT) ?: "",
-                            maxLength = 2000
-                        )
-                        val tag = com.example.security.BackendSecurityFirewall.sanitizeField(
-                            intent.getStringExtra(NotificationHelper.EXTRA_NOTE_TAG) ?: "thought",
-                            maxLength = 32
-                        )
-                        handleSnoozeNote(context, db, noteId, content, tag)
+                        handleSnoozeNote(context, repo, noteId)
                     }
 
                     NotificationHelper.ACTION_DISMISS_NOTE_REMINDER -> {
                         val noteId = intent.getLongExtra(NotificationHelper.EXTRA_NOTE_ID, -1L)
-                        handleDismissNote(context, db, noteId)
+                        handleDismissNote(context, repo, noteId)
                     }
 
                     NotificationHelper.ACTION_NOTE_DAILY_REFLECTION -> {
-                        handleDailyNoteReflection(context, db, profile?.name ?: "Krishi")
+                        handleDailyNoteReflection(context, repo)
                     }
 
                     Intent.ACTION_BOOT_COMPLETED -> {
                         if (profile != null) {
-                            val periods = db.periodLogDao().getAllPeriods().firstOrNull() ?: emptyList()
-                            val medicines = db.medicineReminderDao().getAllReminders().firstOrNull() ?: emptyList()
+                            val periods = repo.getPeriodLogsOnce()
+                            val medicines = repo.getMedicationsOnce()
                             val status = CycleCalculator.compute(
                                 periods = periods,
                                 defaultCycleLength = profile.cycleLength,
@@ -127,9 +92,8 @@ class NotificationReceiver : BroadcastReceiver() {
                             NotificationHelper.scheduleAllReminders(context, profile, status, medicines)
                         }
 
-                        // Re-schedule all active user note reminders
                         try {
-                            val activeNotes = db.userNoteDao().getActiveRemindersList()
+                            val activeNotes = repo.getActiveNoteRemindersOnce()
                             val now = System.currentTimeMillis()
                             for (note in activeNotes) {
                                 if (note.reminderTimeMillis != null && note.reminderTimeMillis > now) {
@@ -147,36 +111,32 @@ class NotificationReceiver : BroadcastReceiver() {
 
     private suspend fun handleMedicineReminder(
         context: Context,
-        db: AppDatabase,
+        repo: PhasesRepository,
         medId: Long,
-        medName: String,
-        medDosage: String,
-        userName: String,
-        customSound: String = "cute_chime",
-        customMessage: String = ""
+        userName: String
     ) {
         val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
-        val med = if (medId > 0) db.medicationDao().getById(medId) else null
-        
-        // If already taken today, do not nag!
-        if (med != null && med.lastTakenDate == todayStr) return
+        val med = if (medId > 0) repo.getMedicationById(medId) else null
+        if (med == null || !med.isEnabled) return
+
+        // If already taken today, do not nag
+        if (med.lastTakenDate == todayStr) return
 
         val timeOfDay = NotificationHelper.getTimeOfDay()
-        val displayName = med?.name ?: medName
-        val displayDosage = med?.dosage ?: medDosage
-        val soundToPlay = med?.customSound ?: customSound
+        val displayName = med.name.ifBlank { "Daily Wellness Pill" }
+        val displayDosage = med.dosage.ifBlank { "1 dose" }
+        val soundToPlay = med.customSound.ifBlank { "cute_chime" }
 
-        // Play the chosen custom alert sound directly
-        SoundHelper.playSound(context, soundToPlay)
+        SoundHelper.playAlarmOrPreview(context, soundToPlay)
 
         val takeIntent = Intent(context, NotificationReceiver::class.java).apply {
+            setPackage(context.packageName)
             action = NotificationHelper.ACTION_TAKE_MEDICINE_QUICK
             putExtra(NotificationHelper.EXTRA_MEDICINE_ID, medId)
-            putExtra(NotificationHelper.EXTRA_MEDICINE_NAME, displayName)
         }
         val takePending = PendingIntent.getBroadcast(
             context,
-            (NotificationHelper.NOTIFICATION_ID_MEDICINE_BASE + medId.toInt()).toInt(),
+            (NotificationHelper.NOTIFICATION_ID_MEDICINE_BASE + medId.toInt()),
             takeIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
@@ -187,16 +147,14 @@ class NotificationReceiver : BroadcastReceiver() {
         ).build()
 
         val greetingTarget = if (userName.isNotBlank()) userName else "gorgeous"
-        val rawMessage = when {
-            !med?.customReminderMessage.isNullOrBlank() -> med!!.customReminderMessage
-            customMessage.isNotBlank() -> customMessage
-            else -> "${timeOfDay.greeting}, $greetingTarget! Time for your $displayName ($displayDosage) ✨ Have a fresh glass of water with it! 💧💕 Staying healthy looks beautiful on you!"
-        }
+        val medCustomMsg = med.customReminderMessage.takeIf { it.isNotBlank() }
+        val rawMessage = medCustomMsg
+            ?: "${timeOfDay.greeting}, $greetingTarget! Time for your $displayName ($displayDosage) ✨ Have a fresh glass of water with it! 💧💕 Staying healthy looks beautiful on you!"
         val message = NotificationHelper.formatTimeDependentGreeting(rawMessage, userName = userName)
 
         NotificationHelper.showNotification(
             context = context,
-            notificationId = (NotificationHelper.NOTIFICATION_ID_MEDICINE_BASE + medId.toInt()).toInt(),
+            notificationId = (NotificationHelper.NOTIFICATION_ID_MEDICINE_BASE + medId.toInt()),
             channelId = NotificationHelper.CHANNEL_MEDICINE,
             title = "${timeOfDay.titlePrefix} Pill Care ${timeOfDay.emoji}💊",
             message = message,
@@ -207,24 +165,22 @@ class NotificationReceiver : BroadcastReceiver() {
 
     private suspend fun handleQuickMedicineTake(
         context: Context,
-        db: AppDatabase,
+        repo: PhasesRepository,
         medId: Long,
-        medName: String,
         userName: String
     ) {
         val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
         val nowTimeStr = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
-        if (medId > 0) {
-            val med = db.medicationDao().getById(medId)
-            if (med != null) {
-                db.medicationDao().update(med.copy(lastTakenDate = todayStr, lastTakenTime = nowTimeStr))
-            }
+        val med = if (medId > 0) repo.getMedicationById(medId) else null
+        if (med != null) {
+            repo.markMedicationTakenToday(medId, todayStr, nowTimeStr)
         }
 
+        val medName = med?.name?.ifBlank { "your pill" } ?: "your pill"
         val greeting = if (userName.isNotBlank()) userName else "Krishi"
         NotificationHelper.showNotification(
             context = context,
-            notificationId = (NotificationHelper.NOTIFICATION_ID_MEDICINE_BASE + medId.toInt()).toInt(),
+            notificationId = (NotificationHelper.NOTIFICATION_ID_MEDICINE_BASE + medId.toInt()),
             channelId = NotificationHelper.CHANNEL_MEDICINE,
             title = "Wellness Checked! 🌸✨",
             message = "Way to go, $greeting! Marked $medName as taken. Keep glowing and taking care of yourself! 💖💊",
@@ -232,12 +188,13 @@ class NotificationReceiver : BroadcastReceiver() {
         )
     }
 
-    private suspend fun handleWaterReminder(context: Context, db: AppDatabase, goal: Int, userName: String) {
+    private suspend fun handleWaterReminder(context: Context, repo: PhasesRepository, goal: Int, userName: String) {
         val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
-        val waterLog = db.waterLogDao().getWaterLog(todayStr).firstOrNull()
+        val waterLog = repo.getWaterLogForDate(todayStr).firstOrNull()
         val count = waterLog?.glassesCount ?: 0
 
         val addWaterIntent = Intent(context, NotificationReceiver::class.java).apply {
+            setPackage(context.packageName)
             action = NotificationHelper.ACTION_ADD_WATER_QUICK
         }
         val addWaterPending = PendingIntent.getBroadcast(
@@ -276,13 +233,11 @@ class NotificationReceiver : BroadcastReceiver() {
         )
     }
 
-    private suspend fun handleQuickWaterAdd(context: Context, db: AppDatabase, goal: Int, userName: String) {
+    private suspend fun handleQuickWaterAdd(context: Context, repo: PhasesRepository, goal: Int, userName: String) {
         val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
-        val currentCount = db.waterLogDao().getWaterLog(todayStr).firstOrNull()?.glassesCount ?: 0
+        val currentCount = repo.getWaterLogForDate(todayStr).firstOrNull()?.glassesCount ?: 0
         val newCount = currentCount + 1
-        db.waterLogDao().insertOrUpdate(
-            com.example.data.WaterLog(dateString = todayStr, glassesCount = newCount)
-        )
+        repo.setWaterCount(todayStr, newCount)
 
         val greeting = if (userName.isNotBlank()) userName else "Krishi"
         val message = if (newCount >= goal) {
@@ -303,11 +258,11 @@ class NotificationReceiver : BroadcastReceiver() {
 
     private suspend fun handleCycleReminder(
         context: Context,
-        db: AppDatabase,
+        repo: PhasesRepository,
         profile: com.example.data.UserProfile?
     ) {
         if (profile == null) return
-        val periods = db.periodLogDao().getAllPeriods().firstOrNull() ?: emptyList()
+        val periods = repo.getPeriodLogsOnce()
         val status = CycleCalculator.compute(
             periods = periods,
             defaultCycleLength = profile.cycleLength,
@@ -316,7 +271,6 @@ class NotificationReceiver : BroadcastReceiver() {
 
         val name = if (profile.name.isNotBlank()) profile.name else "Angel"
 
-        // 1. Period in 2 days
         if (profile.cycleRemindersEnabled && status.daysUntilNextPeriod == 2) {
             NotificationHelper.showNotification(
                 context = context,
@@ -329,7 +283,6 @@ class NotificationReceiver : BroadcastReceiver() {
             return
         }
 
-        // 2. Period expected today
         if (profile.cycleRemindersEnabled && status.daysUntilNextPeriod == 0 && !status.isLate) {
             NotificationHelper.showNotification(
                 context = context,
@@ -342,7 +295,6 @@ class NotificationReceiver : BroadcastReceiver() {
             return
         }
 
-        // 3. Period is late
         if (profile.cycleRemindersEnabled && status.isLate && status.daysLate in 1..4) {
             NotificationHelper.showNotification(
                 context = context,
@@ -355,7 +307,6 @@ class NotificationReceiver : BroadcastReceiver() {
             return
         }
 
-        // 4. Fertile / Ovulation window
         if (profile.fertileRemindersEnabled && (status.currentPhase == CyclePhase.FERTILE || status.currentPhase == CyclePhase.OVULATION)) {
             NotificationHelper.showNotification(
                 context = context,
@@ -368,7 +319,6 @@ class NotificationReceiver : BroadcastReceiver() {
             return
         }
 
-        // 5. Checklist Reminder for PMS / Luteal
         if (profile.shopRemindersEnabled && (status.currentPhase == CyclePhase.LUTEAL || status.currentPhase == CyclePhase.LATE_LUTEAL)) {
             NotificationHelper.showNotification(
                 context = context,
@@ -411,86 +361,50 @@ class NotificationReceiver : BroadcastReceiver() {
 
     private suspend fun handleNoteReminder(
         context: Context,
-        db: AppDatabase,
-        noteId: Long,
-        fallbackContent: String,
-        fallbackTag: String,
-        timestamp: Long
+        repo: PhasesRepository,
+        noteId: Long
     ) {
-        val note = if (noteId > 0) db.userNoteDao().getById(noteId) else null
-        val finalContent = note?.content ?: fallbackContent
-        val finalTag = note?.tag ?: fallbackTag
+        if (noteId <= 0L) return
+        val note = repo.getNoteById(noteId) ?: return
+        if (note.content.isBlank()) return
 
-        if (finalContent.isBlank()) return
-
-        // Mark reminder as fired in database
-        if (note != null) {
-            db.userNoteDao().updateReminder(note.id, note.reminderTimeMillis, reminderFired = true)
-        }
-
-        val displayNote = note ?: com.example.data.UserNote(
-            id = noteId,
-            content = finalContent,
-            tag = finalTag,
-            timestampMillis = timestamp,
-            reminderFired = true
-        )
-
-        NotificationHelper.showNoteReminderNotification(context, displayNote)
+        repo.markNoteReminderFired(note.id, note.reminderTimeMillis, reminderFired = true)
+        NotificationHelper.showNoteReminderNotification(context, note.copy(reminderFired = true))
     }
 
     private suspend fun handleSnoozeNote(
         context: Context,
-        db: AppDatabase,
-        noteId: Long,
-        noteContent: String,
-        noteTag: String
+        repo: PhasesRepository,
+        noteId: Long
     ) {
-        // Cancel currently shown notification
+        if (noteId <= 0L) return
         androidx.core.app.NotificationManagerCompat.from(context).cancel(
             (NotificationHelper.NOTIFICATION_ID_NOTE_BASE + noteId).toInt()
         )
-
-        // 1 hour snooze
         val snoozeMillis = System.currentTimeMillis() + 60 * 60 * 1000L
-        if (noteId > 0) {
-            db.userNoteDao().updateReminder(noteId, snoozeMillis, reminderFired = false)
-            val updated = db.userNoteDao().getById(noteId)
-            if (updated != null) {
-                NotificationHelper.scheduleNoteReminder(context, updated)
-                return
-            }
-        }
-
-        val fallbackNote = com.example.data.UserNote(
-            id = noteId,
-            content = noteContent,
-            tag = noteTag,
-            reminderTimeMillis = snoozeMillis,
-            reminderFired = false
-        )
-        NotificationHelper.scheduleNoteReminder(context, fallbackNote)
+        repo.updateNoteReminder(noteId, snoozeMillis)
+        val updated = repo.getNoteById(noteId) ?: return
+        NotificationHelper.scheduleNoteReminder(context, updated)
     }
 
     private suspend fun handleDismissNote(
         context: Context,
-        db: AppDatabase,
+        repo: PhasesRepository,
         noteId: Long
     ) {
         androidx.core.app.NotificationManagerCompat.from(context).cancel(
             (NotificationHelper.NOTIFICATION_ID_NOTE_BASE + noteId).toInt()
         )
-        if (noteId > 0) {
-            db.userNoteDao().updateReminder(noteId, null, reminderFired = true)
+        if (noteId > 0L) {
+            repo.markNoteReminderFired(noteId, null, reminderFired = true)
         }
     }
 
     private suspend fun handleDailyNoteReflection(
         context: Context,
-        db: AppDatabase,
-        userName: String
+        repo: PhasesRepository
     ) {
-        val notes = db.userNoteDao().getAllNotes().firstOrNull() ?: emptyList()
+        val notes = repo.getAllNotesOnce()
         if (notes.isEmpty()) return
 
         val selectedNote = notes.random()

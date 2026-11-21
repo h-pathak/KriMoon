@@ -559,17 +559,17 @@ class ExampleRobolectricTest {
         assertFalse("DROP TABLE must be redacted", sanitized.contains("DROP TABLE", ignoreCase = true))
         assertFalse("UNION SELECT must be redacted", sanitized.contains("UNION SELECT", ignoreCase = true))
 
-        // 3. Verify At-Rest AES-256-GCM Encryption & Decryption Vault + Tamper Protection
+        // 3. Verify At-Rest Android Keystore AES-256-GCM Encryption & Decryption Vault + Tamper Protection
         val sensitivePlain = "Intimate private cycle note: cramps & migraine on day 2"
         val encrypted = firewall.encryptAtRest(sensitivePlain, aadContext = "user_note_42")
-        assertTrue("Encrypted field must carry ENC:AES256GCM: header", encrypted.startsWith("ENC:AES256GCM:"))
+        assertTrue("Encrypted field must carry ENC:AKSV2: header", encrypted.startsWith("ENC:AKSV2:"))
         assertFalse("Ciphertext must not leak plaintext", encrypted.contains("migraine"))
         val decrypted = firewall.decryptAtRest(encrypted, aadContext = "user_note_42")
         assertEquals(sensitivePlain, decrypted)
 
-        // Wrong context tag (cross-row swap attack) must fail decryption safely
+        // Wrong context tag (cross-row swap attack) must fail decryption safely (fail-closed)
         val wrongContextDecrypted = firewall.decryptAtRest(encrypted, aadContext = "user_note_999")
-        assertEquals("[Tampered Record Blocked by At-Rest Vault]", wrongContextDecrypted)
+        assertEquals("", wrongContextDecrypted)
 
         // 4. Verify Entity Bounds & Schema Invariant Clamping
         val outOfBoundsProfile = UserProfile(

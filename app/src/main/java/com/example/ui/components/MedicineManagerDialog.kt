@@ -257,12 +257,13 @@ fun MedicineManagerDialog(
                     }
                 } else {
                     // Form for adding or editing
-                    val isEdit = editingReminder != null
-                    var formName by remember { mutableStateOf(if (isEdit) editingReminder!!.name else newName) }
-                    var formDosage by remember { mutableStateOf(if (isEdit) editingReminder!!.dosage else newDosage) }
-                    var formHour by remember { mutableIntStateOf(if (isEdit) editingReminder!!.hour else newHour) }
-                    var formMinute by remember { mutableIntStateOf(if (isEdit) editingReminder!!.minute else newMinute) }
-                    var formEmoji by remember { mutableStateOf(if (isEdit) editingReminder!!.categoryEmoji else newEmoji) }
+                    val currentEditing = editingReminder
+                    val isEdit = currentEditing != null
+                    var formName by remember(currentEditing?.id) { mutableStateOf(currentEditing?.name ?: newName) }
+                    var formDosage by remember(currentEditing?.id) { mutableStateOf(currentEditing?.dosage ?: newDosage) }
+                    var formHour by remember(currentEditing?.id) { mutableIntStateOf(currentEditing?.hour ?: newHour) }
+                    var formMinute by remember(currentEditing?.id) { mutableIntStateOf(currentEditing?.minute ?: newMinute) }
+                    var formEmoji by remember(currentEditing?.id) { mutableStateOf(currentEditing?.categoryEmoji ?: newEmoji) }
 
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         OutlinedTextField(
@@ -467,9 +468,9 @@ fun MedicineManagerDialog(
                                 enabled = formName.isNotBlank(),
                                 onClick = {
                                     if (formName.isNotBlank()) {
-                                        if (isEdit) {
+                                        if (currentEditing != null) {
                                             onUpdateReminder(
-                                                editingReminder!!.copy(
+                                                currentEditing.copy(
                                                     name = formName.trim(),
                                                     dosage = formDosage.trim().ifBlank { "1 dose" },
                                                     hour = formHour,

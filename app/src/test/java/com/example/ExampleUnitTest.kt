@@ -399,5 +399,42 @@ class ExampleUnitTest {
         val predictedStartDay = monthDays.find { it.isPredictedPeriodStart }
         assertNotNull("Expected predicted period start day must be marked", predictedStartDay)
     }
+
+    @Test
+    fun `expanded couple question banks have rich questions across all spice levels`() {
+        val quiz = com.example.model.CoupleGameDecks.quizQuestions
+        val wyr = com.example.model.CoupleGameDecks.wouldYouRatherPrompts
+        assertTrue("Quiz deck should have at least 48 questions", quiz.size >= 48)
+        assertTrue("WYR deck should have at least 45 dilemmas", wyr.size >= 45)
+        assertTrue("Doodle deck should have at least 16 prompts", com.example.model.CoupleGameDecks.doodlePrompts.size >= 16)
+
+        com.example.model.SpiceLevel.entries.forEach { level ->
+            assertTrue("Quiz should have >= 15 questions for $level", quiz.count { it.spiceLevel == level } >= 15)
+            assertTrue("WYR should have >= 15 dilemmas for $level", wyr.count { it.spiceLevel == level } >= 15)
+        }
+    }
+
+    @Test
+    fun `local adaptive couple question engine is deterministic across 2 phones and escalates heat from answers`() {
+        val engine = com.example.model.LocalCoupleQuestionEngine
+        val history = listOf(
+            com.example.model.RoundOutcome(0, com.example.model.QuestionTheme.TOUCH, matched = true, choiceSignature = 11, spiceLevel = com.example.model.SpiceLevel.FLIRTY),
+            com.example.model.RoundOutcome(1, com.example.model.QuestionTheme.TOUCH, matched = true, choiceSignature = 22, spiceLevel = com.example.model.SpiceLevel.FLIRTY)
+        )
+
+        val phoneAQuiz = engine.generateQuizRound("986607", 2, com.example.model.SpiceLevel.FLIRTY, history)
+        val phoneBQuiz = engine.generateQuizRound("986607", 2, com.example.model.SpiceLevel.FLIRTY, history)
+        assertEquals("Both phones must generate identical adaptive quiz prompts", phoneAQuiz.question.prompt, phoneBQuiz.question.prompt)
+        assertEquals("Both phones must generate identical adaptive quiz options", phoneAQuiz.question.options, phoneBQuiz.question.options)
+        assertTrue("Round 2 after 2 matched rounds must trigger adaptive follow-up", phoneAQuiz.isAdaptiveFollowUp)
+        assertTrue("Heat score must increase above base Flirty (52)", phoneAQuiz.heatScore > 52)
+
+        val phoneAWyr = engine.generateWyrRound("986607", 2, com.example.model.SpiceLevel.FLIRTY, history)
+        val phoneBWyr = engine.generateWyrRound("986607", 2, com.example.model.SpiceLevel.FLIRTY, history)
+        assertEquals("Both phones must generate identical adaptive WYR option A", phoneAWyr.prompt.optionA, phoneBWyr.prompt.optionA)
+        assertEquals("Both phones must generate identical adaptive WYR option B", phoneAWyr.prompt.optionB, phoneBWyr.prompt.optionB)
+        assertTrue("Adaptive WYR follow-up flag must be set", phoneAWyr.isAdaptiveFollowUp)
+    }
 }
+
 

@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -131,12 +132,11 @@ fun WaterScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Hydration Tracker",
+                        text = "Hydration Ritual",
                         style = MaterialTheme.typography.headlineSmall.copy(
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Serif
+                            fontWeight = FontWeight.Bold
                         ),
                         color = MaterialTheme.colorScheme.onBackground
                     )
@@ -146,6 +146,8 @@ fun WaterScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+
+                Spacer(modifier = Modifier.width(8.dp))
 
                 IconButton(
                     onClick = {
@@ -172,7 +174,7 @@ fun WaterScreen(
                     val next = count + 1
                     onIncrementWater()
                     if (next >= goal && count < goal) {
-                        SoundHelper.playSound(context, SoundHelper.SOUND_CUTE_CHIME)
+                        SoundHelper.playCelebration(context)
                         particleController.showToast(
                             coroutineScope = coroutineScope,
                             message = "Goal reached! Hydrated queen 💧👑",
@@ -285,9 +287,10 @@ fun WaterScreen(
                                     },
                                     enabled = goal > 4,
                                     shape = CircleShape,
-                                    modifier = Modifier.size(36.dp)
+                                    contentPadding = PaddingValues(0.dp),
+                                    modifier = Modifier.size(40.dp)
                                 ) {
-                                    Text("-", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                    Text("-", fontWeight = FontWeight.Bold, fontSize = 18.sp)
                                 }
 
                                 Text(
@@ -306,9 +309,10 @@ fun WaterScreen(
                                     },
                                     enabled = goal < 20,
                                     shape = CircleShape,
-                                    modifier = Modifier.size(36.dp)
+                                    contentPadding = PaddingValues(0.dp),
+                                    modifier = Modifier.size(40.dp)
                                 ) {
-                                    Text("+", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                    Text("+", fontWeight = FontWeight.Bold, fontSize = 18.sp)
                                 }
                             }
                         }
@@ -360,7 +364,6 @@ fun WaterScreen(
                         onClick = {
                             val next = count + 1
                             onIncrementWater()
-                            SoundHelper.playSound(context, SoundHelper.SOUND_SWEET_BUBBLE)
                             tactile.onDropSip(next >= goal && count < goal)
 
                             particleController.spawn(
@@ -370,7 +373,7 @@ fun WaterScreen(
                                 count = 12
                             )
                             if (next >= goal && count < goal) {
-                                SoundHelper.playSound(context, SoundHelper.SOUND_CUTE_CHIME)
+                                SoundHelper.playCelebration(context)
                                 particleController.showToast(
                                     coroutineScope = coroutineScope,
                                     message = "Goal reached! Hydrated queen 💧👑",
@@ -416,8 +419,11 @@ fun WaterScreen(
                                 scaleY = bottleScale.value
                             }
                             .clickable {
+                                val crossesGoal = count < goal && count + 2 >= goal
                                 tactile.onPresetLogged(2)
-                                SoundHelper.playSound(context, SoundHelper.SOUND_SWEET_BUBBLE)
+                                if (crossesGoal) {
+                                    SoundHelper.playCelebration(context)
+                                }
                                 coroutineScope.launch {
                                     bottleScale.snapTo(1f)
                                     bottleScale.animateTo(0.92f, tween(70))

@@ -220,21 +220,22 @@ fun ShoppingScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "To Get & Care Lists 🛍️",
+                            text = "Wishlist & Care Essentials",
                             style = MaterialTheme.typography.headlineSmall.copy(
-                                fontWeight = FontWeight.Bold,
-                                fontFamily = FontFamily.Serif
+                                fontWeight = FontWeight.Bold
                             ),
                             color = MaterialTheme.colorScheme.onBackground
                         )
                         Text(
-                            text = "Fully customizable tasks, reorderable items & editable categories",
+                            text = "Curated cycle essentials, cozy comforts & custom checklists",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
+
+                    Spacer(modifier = Modifier.width(8.dp))
 
                     // Preferences & View Customizer Button
                     Box {
@@ -472,10 +473,12 @@ fun ShoppingScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "+ Add Care Item or Routine 🌸",
+                                text = "Add Care Item or Routine",
                                 style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
-                                color = MaterialTheme.colorScheme.onSurface
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.weight(1f)
                             )
+                            Spacer(modifier = Modifier.width(8.dp))
                             Surface(
                                 shape = RoundedCornerShape(100.dp),
                                 color = PhasesRose.copy(alpha = 0.12f)

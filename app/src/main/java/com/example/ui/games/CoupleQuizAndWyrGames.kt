@@ -49,8 +49,10 @@ import androidx.compose.ui.unit.sp
 import com.example.data.CoupleRoomRecord
 import com.example.model.CoupleBlock
 import com.example.model.CoupleBlockchain
-import com.example.model.CoupleGameDecks
 import com.example.model.CoupleTurnCodec
+import com.example.model.LocalCoupleQuestionEngine
+import com.example.model.QuestionTheme
+import com.example.model.RoundOutcome
 import com.example.model.RoundSyncState
 import com.example.model.SpiceLevel
 import com.example.notifications.SoundHelper
@@ -75,15 +77,23 @@ fun CoupleQuizGame(
     modifier: Modifier = Modifier
 ) {
     val spice = runCatching { SpiceLevel.valueOf(room.spiceLevel) }.getOrDefault(SpiceLevel.FLIRTY)
-    val deck = remember(spice) { CoupleGameDecks.quizForSpice(spice) }
     val state = remember(room.quizStateJson) { CoupleTurnCodec.roundStateFromJson(room.quizStateJson) }
-    val qIndex = (state.roundIndex % deck.size + deck.size) % deck.size
-    val question = deck[qIndex]
+    val generated = remember(room.coupleCode, state.roundIndex, spice, state.history) {
+        LocalCoupleQuestionEngine.generateQuizRound(
+            coupleCode = room.coupleCode,
+            roundIndex = state.roundIndex,
+            baseSpice = spice,
+            history = state.history
+        )
+    }
 
     SyncedChoiceRoundGame(
         title = "💋 Couple Quiz",
-        promptText = question.prompt,
-        options = question.options,
+        promptText = generated.question.prompt,
+        options = generated.question.options,
+        theme = generated.theme,
+        heatScore = generated.heatScore,
+        adaptiveTag = if (generated.isAdaptiveFollowUp) generated.adaptiveTag else "",
         room = room,
         spice = spice,
         state = state,
@@ -106,15 +116,23 @@ fun CoupleWyrGame(
     modifier: Modifier = Modifier
 ) {
     val spice = runCatching { SpiceLevel.valueOf(room.spiceLevel) }.getOrDefault(SpiceLevel.FLIRTY)
-    val deck = remember(spice) { CoupleGameDecks.wyrForSpice(spice) }
     val state = remember(room.wyrStateJson) { CoupleTurnCodec.roundStateFromJson(room.wyrStateJson) }
-    val pIndex = (state.roundIndex % deck.size + deck.size) % deck.size
-    val prompt = deck[pIndex]
+    val generated = remember(room.coupleCode, state.roundIndex, spice, state.history) {
+        LocalCoupleQuestionEngine.generateWyrRound(
+            coupleCode = room.coupleCode,
+            roundIndex = state.roundIndex,
+            baseSpice = spice,
+            history = state.history
+        )
+    }
 
     SyncedChoiceRoundGame(
         title = "🔥 Would You Rather",
         promptText = "Which would you choose together?",
-        options = listOf(prompt.optionA, prompt.optionB),
+        options = listOf(generated.prompt.optionA, generated.prompt.optionB),
+        theme = generated.theme,
+        heatScore = generated.heatScore,
+        adaptiveTag = if (generated.isAdaptiveFollowUp) generated.adaptiveTag else "",
         room = room,
         spice = spice,
         state = state,
@@ -132,6 +150,9 @@ private fun SyncedChoiceRoundGame(
     title: String,
     promptText: String,
     options: List<String>,
+    theme: QuestionTheme,
+    heatScore: Int,
+    adaptiveTag: String,
     room: CoupleRoomRecord,
     spice: SpiceLevel,
     state: RoundSyncState,
@@ -161,12 +182,13 @@ private fun SyncedChoiceRoundGame(
         val sender = room.myName
         val prevHash = room.lastBlockHash.ifBlank { CoupleBlockchain.genesisHash(code) }
         val nextIndex = room.blockHeight
+        val sharedSecret = room.ecdhSharedSecretB64
         scope.launch {
             val (packet, block) = withContext(Dispatchers.Default) {
                 if (isQuiz) {
-                    CoupleTurnCodec.encodeQuizTurnWithBlock(code, sender, roundIdx, choiceIdx, spice, prevHash, nextIndex)
+                    CoupleTurnCodec.encodeQuizTurnWithBlock(code, sender, roundIdx, choiceIdx, spice, prevHash, nextIndex, sharedSecret)
                 } else {
-                    CoupleTurnCodec.encodeWyrTurnWithBlock(code, sender, roundIdx, choiceIdx, spice, prevHash, nextIndex)
+                    CoupleTurnCodec.encodeWyrTurnWithBlock(code, sender, roundIdx, choiceIdx, spice, prevHash, nextIndex, sharedSecret)
                 }
             }
             onSendLiveBlock(packet, block)
@@ -202,6 +224,43 @@ private fun SyncedChoiceRoundGame(
             }
         }
 
+        // Compact Chemistry Heat Bar (Local Adaptive Spice Meter)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(
+                text = "🔥 Heat $heatScore%",
+                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                color = if (heatScore >= 70) Color(0xFFE11D68) else PhasesRose
+            )
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .size(height = 6.dp, width = 100.dp)
+                    .clip(RoundedCornerShape(100.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth((heatScore / 100f).coerceIn(0.08f, 1f))
+                        .size(height = 6.dp, width = 100.dp)
+                        .clip(RoundedCornerShape(100.dp))
+                        .background(
+                            Brush.horizontalGradient(
+                                listOf(PhasesPlum, PhasesRose, Color(0xFFE11D68))
+                            )
+                        )
+                )
+            }
+            Text(
+                text = "${theme.emoji} ${theme.label}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
         // Question / Dilemma Card
         Card(
             shape = RoundedCornerShape(24.dp),
@@ -218,6 +277,20 @@ private fun SyncedChoiceRoundGame(
                     .padding(20.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
+                if (adaptiveTag.isNotBlank()) {
+                    Surface(
+                        shape = RoundedCornerShape(100.dp),
+                        color = Color(0xFFE11D68).copy(alpha = 0.14f),
+                        border = BorderStroke(0.8.dp, Color(0xFFE11D68).copy(alpha = 0.35f))
+                    ) {
+                        Text(
+                            text = adaptiveTag,
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = Color(0xFFE11D68),
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                        )
+                    }
+                }
                 Text(
                     text = promptText,
                     style = MaterialTheme.typography.titleLarge.copy(
@@ -373,7 +446,24 @@ private fun SyncedChoiceRoundGame(
                     )
                     Button(
                         onClick = {
-                            val next = RoundSyncState(roundIndex = state.roundIndex + 1, partnerName = partnerDisplay)
+                            val myPick = state.myChoice ?: 0
+                            val partnerPick = state.partnerChoice ?: 0
+                            // Order-independent choice signature so Phone A & Phone B generate identical follow-ups
+                            val symmetricSig = minOf(myPick, partnerPick) * 10 + maxOf(myPick, partnerPick)
+                            val outcome = RoundOutcome(
+                                roundIndex = state.roundIndex,
+                                theme = theme,
+                                matched = isMatch,
+                                choiceSignature = symmetricSig,
+                                spiceLevel = spice
+                            )
+                            val updatedHistory = (state.history.filterNot { it.roundIndex == state.roundIndex } + outcome)
+                                .takeLast(12)
+                            val next = RoundSyncState(
+                                roundIndex = state.roundIndex + 1,
+                                partnerName = partnerDisplay,
+                                history = updatedHistory
+                            )
                             onSaveState(CoupleTurnCodec.roundStateToJson(next), false)
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = PhasesPlum),
