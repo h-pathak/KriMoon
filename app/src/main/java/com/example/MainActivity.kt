@@ -539,15 +539,17 @@ private fun PlayTabHost(
     val cloudSyncStatus by viewModel.cloudSyncStatus.collectAsStateWithLifecycle()
     val isCloudBusy by viewModel.isCloudBusy.collectAsStateWithLifecycle()
     val pendingTurnCount by viewModel.activePendingTurnCount.collectAsStateWithLifecycle()
+    val inviteJoinState by viewModel.inviteJoinState.collectAsStateWithLifecycle()
 
-    val loungeState = remember(coupleRooms, activeCoupleRoom, cloudAuthUid, cloudSyncStatus, isCloudBusy, pendingTurnCount) {
+    val loungeState = remember(coupleRooms, activeCoupleRoom, cloudAuthUid, cloudSyncStatus, isCloudBusy, pendingTurnCount, inviteJoinState) {
         CoupleLoungeUiState(
             coupleRooms = coupleRooms,
             activeRoom = activeCoupleRoom,
             cloudAuthUid = cloudAuthUid,
             cloudSyncStatus = cloudSyncStatus,
             isCloudBusy = isCloudBusy,
-            pendingTurnCount = pendingTurnCount
+            pendingTurnCount = pendingTurnCount,
+            inviteJoinState = inviteJoinState
         )
     }
     val loungeActions = remember(viewModel) {
@@ -557,6 +559,7 @@ private fun PlayTabHost(
             onRetryCloudSync = { viewModel.retryCloudSync() },
             onCreateUniqueRoom = { name -> viewModel.createUniqueCoupleRoom(name) },
             onRequestJoinRoom = { name, code -> viewModel.requestJoinCoupleRoom(name, code) },
+            onClearInviteJoinState = { viewModel.clearInviteJoinState() },
             onApprovePendingPartner = { code -> viewModel.approvePendingPartner(code) },
             onDeclinePendingPartner = { code -> viewModel.declinePendingPartner(code) },
             onSelectRoom = { code -> viewModel.selectCoupleRoom(code) },

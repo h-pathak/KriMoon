@@ -18,6 +18,9 @@ import com.example.data.UserProfile
 import com.example.cloud.BlockPublishOutcome
 import com.example.cloud.CoupleCloudRepository
 import com.example.cloud.CoupleCloudRoom
+import com.example.cloud.InviteJoinUiState
+import com.example.cloud.InviteLookupException
+import com.example.cloud.InviteRateLimitedException
 import com.example.model.CoupleActivitiesDeck
 import com.example.model.CoupleActivityIntent
 import com.example.model.CoupleBlock
@@ -148,6 +151,13 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _isCloudBusy = MutableStateFlow(false)
     val isCloudBusy: StateFlow<Boolean> = _isCloudBusy.asStateFlow()
+
+    private val _inviteJoinState = MutableStateFlow<InviteJoinUiState>(InviteJoinUiState.Idle)
+    val inviteJoinState: StateFlow<InviteJoinUiState> = _inviteJoinState.asStateFlow()
+
+    fun clearInviteJoinState() {
+        _inviteJoinState.value = InviteJoinUiState.Idle
+    }
 
     private var cachedCloudRepo: CoupleCloudRepository? = null
     private var userRoomsJob: Job? = null
@@ -1592,15 +1602,20 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         val cleanName = myName.trim()
         val cleanCode = CoupleTurnCodec.extractCoupleCodeFromText(rawCode)
         if (cleanName.isBlank()) {
-            showFeedback("Please enter your name first 💕")
+            val msg = "Please enter your name first 💕"
+            _inviteJoinState.value = InviteJoinUiState.Error(cleanCode, msg, canRetry = false)
+            showFeedback(msg)
             return
         }
         if (cleanCode.length != 6) {
-            showFeedback("Room code must be 6 digits")
+            val msg = "Room code must be 6 digits"
+            _inviteJoinState.value = InviteJoinUiState.Error(cleanCode, msg, canRetry = false)
+            showFeedback(msg)
             return
         }
         viewModelScope.launch {
             _isCloudBusy.value = true
+            _inviteJoinState.value = InviteJoinUiState.Loading(cleanCode)
             try {
                 val uid = _cloudAuthUid.value
                 val cloudRepo = if (uid != null) getCloudRepoOrNull() else null
@@ -1635,8 +1650,16 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                         partnerPublicKey = localKeyPair.publicKeyB64
                     )
                     if (result.isFailure) {
-                        val msg = result.exceptionOrNull()?.message
-                            ?: "Could not request access to Room #$cleanCode."
+                        val failureState = mapInviteFailureToUiState(
+                            coupleCode = cleanCode,
+                            error = result.exceptionOrNull()
+                        )
+                        _inviteJoinState.value = failureState
+                        val msg = when (failureState) {
+                            is InviteJoinUiState.RateLimited -> failureState.message
+                            is InviteJoinUiState.Error -> failureState.message
+                            else -> "Could not request access to Room #$cleanCode."
+                        }
                         showFeedback(msg)
                         return@launch
                     }
@@ -1753,6 +1776,7 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                 )
                 _activeCoupleCode.value = cleanCode
 
+                _inviteJoinState.value = InviteJoinUiState.Idle
                 when {
                     isOfflinePassAndPlay -> showFeedback("Pass & Play room #$cleanCode ready ♥")
                     approvalStatus == "PENDING_HOST_APPROVAL" -> {
@@ -1764,6 +1788,39 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                 }
             } finally {
                 _isCloudBusy.value = false
+                if (_inviteJoinState.value is InviteJoinUiState.Loading) {
+                    _inviteJoinState.value = InviteJoinUiState.Idle
+                }
+            }
+        }
+    }
+
+    companion object {
+        internal fun mapInviteFailureToUiState(
+            coupleCode: String,
+            error: Throwable?,
+            nowMs: Long = System.currentTimeMillis()
+        ): InviteJoinUiState {
+            return when (error) {
+                is InviteRateLimitedException -> InviteJoinUiState.RateLimited(
+                    coupleCode = coupleCode,
+                    message = error.message?.takeIf { it.isNotBlank() }
+                        ?: "Too many code lookups. Please wait before trying again.",
+                    reason = error.reason,
+                    retryAfterEpochMs = nowMs + error.retryAfterSeconds.coerceAtLeast(1) * 1000L
+                )
+                is InviteLookupException -> InviteJoinUiState.Error(
+                    coupleCode = coupleCode,
+                    message = error.message?.takeIf { it.isNotBlank() }
+                        ?: "Could not verify Room #$coupleCode.",
+                    canRetry = error.isRetryable
+                )
+                else -> InviteJoinUiState.Error(
+                    coupleCode = coupleCode,
+                    message = error?.message?.takeIf { it.isNotBlank() }
+                        ?: "Could not request access to Room #$coupleCode.",
+                    canRetry = error !is SecurityException && error !is IllegalArgumentException
+                )
             }
         }
     }

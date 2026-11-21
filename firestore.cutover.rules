@@ -1,0 +1,409 @@
+rules_version = '2';
+// ============================================================================
+// KRIMOON POST-CUTOVER FIRESTORE RULES (STAGED — DO NOT DEPLOY YET)
+// ============================================================================
+// Apply ONLY AFTER:
+//   1. `functions:lookupCoupleInvite` is deployed and verified on project
+//      `gen-lang-client-0901950391` against named DB
+//      `ai-studio-android-krimoon-379cf576-7e8a-463d-afe3-d9a0cd5f3149`.
+//   2. Android clients using the callable `lookupCoupleInvite` are rolled out.
+// Cutover command (after explicit approval):
+//   cp firestore.cutover.rules firestore.rules
+//   firebase deploy --only firestore:rules --project gen-lang-client-0901950391
+// Rollback command:
+//   git checkout HEAD -- firestore.rules
+//   firebase deploy --only firestore:rules --project gen-lang-client-0901950391
+// ============================================================================
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default-deny safety net (also locks server-only /_rateLimits/* from all clients)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Hardened Global Primitives (Expression-Budget Optimized) ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidCoupleCode(code) {
+      return code is string && code.size() == 6 && code.matches('^[0-9]{6}$');
+    }
+
+    function isValidPublicKey(k) {
+      return k is string && (k.size() == 0 || (k.size() <= 256 && k.matches('^[A-Za-z0-9+/=\\-_]+$')));
+    }
+
+    function isNonEmptyPublicKey(k) {
+      return k is string && k.size() >= 80 && k.size() <= 256 && k.matches('^[A-Za-z0-9+/=\\-_]+$');
+    }
+
+    function isValidHash(h) {
+      return h is string && h.size() >= 8 && h.size() <= 128 && h.matches('^[a-fA-F0-9]+$');
+    }
+
+    function isValidMemberUids(uids) {
+      return uids is list &&
+             uids.size() >= 1 &&
+             uids.size() <= 2 &&
+             uids[0] is string && uids[0].size() >= 1 && uids[0].size() <= 128 &&
+             (uids.size() == 1 || (uids[1] is string && uids[1].size() >= 1 && uids[1].size() <= 128 && uids[1] != uids[0]));
+    }
+
+    // --- Minimal Invite Index Validation (/coupleInvites/{coupleCode}) ---
+    // Exposes ONLY non-sensitive lookup state to the trusted server-side Cloud Function.
+    function isValidCoupleInvite(d, expectedCode) {
+      return d.keys().hasAll(['coupleCode', 'status', 'hostDisplayHint', 'schemaVersion', 'updatedAt']) &&
+             d.keys().hasOnly(['coupleCode', 'status', 'hostDisplayHint', 'schemaVersion', 'updatedAt']) &&
+             d.coupleCode == expectedCode &&
+             d.status in ['WAITING', 'PENDING', 'LOCKED', 'RETIRED'] &&
+             d.hostDisplayHint is string && d.hostDisplayHint.size() <= 16 &&
+             d.schemaVersion is int && d.schemaVersion in [1, 2] &&
+             d.updatedAt is timestamp && d.updatedAt <= request.time;
+    }
+
+    // --- Couple Room Entity Validation ---
+    function isValidCoupleRoomCreate(d, expectedCode) {
+      let sv = d.get('schemaVersion', 1);
+      return d.coupleCode == expectedCode &&
+             d.creatorUid == request.auth.uid &&
+             d.creatorName is string && d.creatorName.size() >= 1 && d.creatorName.size() <= 32 &&
+             isValidPublicKey(d.creatorPublicKey) &&
+             d.partnerUid == '' &&
+             d.partnerName == '' &&
+             d.partnerPublicKey == '' &&
+             d.pendingPartnerUid == '' &&
+             d.pendingPartnerName == '' &&
+             d.pendingPartnerPublicKey == '' &&
+             d.memberUids is list && d.memberUids.size() == 1 && d.memberUids[0] == request.auth.uid &&
+             d.spiceLevel in ['SWEET', 'FLIRTY', 'BOLD'] &&
+             d.status == 'WAITING' &&
+             d.blockCount is int && d.blockCount >= 0 && d.blockCount <= 100000 &&
+             d.latestBlockHash is string && d.latestBlockHash.size() <= 128 &&
+             sv is int && sv in [1, 2] &&
+             d.get('migrationAnchorHash', '') == '' &&
+             d.get('migrationAnchorIndex', 0) == 0 &&
+             d.get('tombstoned', false) == false &&
+             d.createdAt is timestamp && d.createdAt <= request.time &&
+             d.updatedAt is timestamp && d.updatedAt <= request.time &&
+             (sv == 1 || (
+               isNonEmptyPublicKey(d.creatorPublicKey) &&
+               existsAfter(/databases/$(database)/documents/coupleInvites/$(expectedCode)) &&
+               getAfter(/databases/$(database)/documents/coupleInvites/$(expectedCode)).data.status == 'WAITING'
+             ));
+    }
+
+    // --- Couple Block Entity Validation (V1 + V2 Compatible) ---
+    function isValidCoupleBlock(d, expectedCoupleCode) {
+      let sv = d.get('schemaVersion', 1);
+      let prev = d.get('previousHash', '');
+      let ctid = d.get('clientTurnId', '');
+      return d.coupleCode == expectedCoupleCode &&
+             d.senderUid == request.auth.uid &&
+             d.senderName is string && d.senderName.size() >= 1 && d.senderName.size() <= 32 &&
+             isValidMemberUids(d.memberUids) &&
+             request.auth.uid in d.memberUids &&
+             d.blockIndex is int && d.blockIndex >= 0 && d.blockIndex <= 100000 &&
+             d.actionType in [
+               'GENESIS_BOND', 'HANDSHAKE', 'QUIZ', 'WYR', 'DOODLE', 'TTT',
+               'DARE', 'WAVELENGTH', 'WHISPER', 'UNPAIR'
+             ] &&
+             isValidHash(d.blockHash) &&
+             sv is int && sv in [1, 2] &&
+             (sv == 1 || (isValidHash(prev) && ctid is string && ctid.size() >= 8 && ctid.size() <= 64 && ctid.matches('^[a-zA-Z0-9_\\-]+$'))) &&
+             d.encryptedPacket is string &&
+             d.encryptedPacket.size() >= 20 &&
+             d.encryptedPacket.size() <= 65536 &&
+             d.encryptedPacket.matches('^KRIMOON:BCHAIN:[A-Za-z0-9+/=\\-_]+$') &&
+             d.createdAt is timestamp && d.createdAt <= request.time;
+    }
+
+    // --- Room Transition Guards ---
+    function canRequestJoin(ext, inc, changed) {
+      return ext.status == 'WAITING' &&
+             inc.status == 'PENDING_APPROVAL' &&
+             request.auth.uid != ext.creatorUid &&
+             ext.memberUids.size() == 1 &&
+             ext.partnerUid == '' &&
+             ext.pendingPartnerUid == '' &&
+             changed.hasOnly([
+               'pendingPartnerUid', 'pendingPartnerName', 'pendingPartnerPublicKey', 'status', 'updatedAt'
+             ]) &&
+             inc.pendingPartnerUid == request.auth.uid &&
+             inc.pendingPartnerName is string && inc.pendingPartnerName.size() >= 1 && inc.pendingPartnerName.size() <= 32 &&
+             (ext.get('schemaVersion', 1) == 2
+               ? isNonEmptyPublicKey(inc.pendingPartnerPublicKey)
+               : isValidPublicKey(inc.pendingPartnerPublicKey));
+    }
+
+    function canApprovePending(ext, inc, changed) {
+      return ext.status == 'PENDING_APPROVAL' &&
+             inc.status == 'CONNECTED' &&
+             request.auth.uid == ext.creatorUid &&
+             ext.pendingPartnerUid != '' &&
+             ext.pendingPartnerUid != ext.creatorUid &&
+             ext.memberUids.size() == 1 &&
+             changed.hasOnly([
+               'partnerUid', 'partnerName', 'partnerPublicKey', 'memberUids',
+               'pendingPartnerUid', 'pendingPartnerName', 'pendingPartnerPublicKey',
+               'status', 'updatedAt'
+             ]) &&
+             inc.pendingPartnerUid == '' &&
+             inc.pendingPartnerName == '' &&
+             inc.pendingPartnerPublicKey == '' &&
+             inc.partnerUid == ext.pendingPartnerUid &&
+             inc.partnerName == ext.pendingPartnerName &&
+             inc.partnerPublicKey == ext.get('pendingPartnerPublicKey', '') &&
+             inc.memberUids is list && inc.memberUids.size() == 2 &&
+             inc.memberUids[0] == ext.creatorUid &&
+             inc.memberUids[1] == ext.pendingPartnerUid;
+    }
+
+    function canDeclineOrCancel(ext, inc, changed) {
+      return ext.status == 'PENDING_APPROVAL' &&
+             inc.status == 'WAITING' &&
+             (request.auth.uid == ext.creatorUid || request.auth.uid == ext.pendingPartnerUid) &&
+             changed.hasOnly([
+               'pendingPartnerUid', 'pendingPartnerName', 'pendingPartnerPublicKey', 'status', 'updatedAt'
+             ]) &&
+             inc.pendingPartnerUid == '' &&
+             inc.pendingPartnerName == '' &&
+             inc.pendingPartnerPublicKey == '';
+    }
+
+    function canUpdateSpiceOnly(ext, inc, changed) {
+      return changed.hasOnly(['spiceLevel', 'updatedAt']) &&
+             request.auth.uid in ext.memberUids &&
+             inc.spiceLevel in ['SWEET', 'FLIRTY', 'BOLD'];
+    }
+
+    function verifyNewBlockForHeadAdvance(coupleCode, ext, inc, changed) {
+      let extSv = ext.get('schemaVersion', 1);
+      let incSv = inc.get('schemaVersion', 1);
+      let newBlockPath = /databases/$(database)/documents/coupleRooms/$(coupleCode)/blocks/$(inc.latestBlockHash);
+      let newBlock = getAfter(newBlockPath).data;
+
+      return existsAfter(newBlockPath) &&
+             newBlock.blockHash == inc.latestBlockHash &&
+             newBlock.blockIndex == ext.blockCount &&
+             newBlock.senderUid == request.auth.uid &&
+             newBlock.memberUids == ext.memberUids && (
+               (extSv == 2 && incSv == 2 &&
+                changed.hasOnly(['blockCount', 'latestBlockHash', 'updatedAt']) &&
+                newBlock.get('schemaVersion', 1) == 2 &&
+                newBlock.get('previousHash', '') == ext.latestBlockHash) ||
+               (extSv == 1 && incSv == 2 &&
+                changed.hasOnly([
+                  'blockCount', 'latestBlockHash', 'schemaVersion',
+                  'migrationAnchorHash', 'migrationAnchorIndex', 'updatedAt'
+                ]) &&
+                inc.migrationAnchorHash == ext.latestBlockHash &&
+                inc.migrationAnchorIndex == ext.blockCount &&
+                newBlock.get('schemaVersion', 1) == 2 &&
+                newBlock.get('previousHash', '') == ext.latestBlockHash) ||
+               (extSv == 1 && incSv == 1 &&
+                changed.hasOnly(['blockCount', 'latestBlockHash', 'updatedAt']) &&
+                newBlock.get('previousHash', ext.latestBlockHash) == ext.latestBlockHash)
+             );
+    }
+
+    function canAdvanceHeadWithBlock(coupleCode, ext, inc, changed) {
+      return inc.blockCount is int &&
+             inc.blockCount == ext.blockCount + 1 &&
+             inc.blockCount <= 100000 &&
+             request.auth.uid in ext.memberUids &&
+             isValidHash(inc.latestBlockHash) &&
+             verifyNewBlockForHeadAdvance(coupleCode, ext, inc, changed);
+    }
+
+    function canUnpairRoom(ext, inc, changed) {
+      return inc.status == 'UNPAIRED' &&
+             request.auth.uid in ext.memberUids &&
+             changed.hasOnly([
+               'status', 'pendingPartnerUid', 'pendingPartnerName', 'pendingPartnerPublicKey', 'updatedAt'
+             ]) &&
+             inc.pendingPartnerUid == '' &&
+             inc.pendingPartnerName == '' &&
+             inc.pendingPartnerPublicKey == '';
+    }
+
+    function canTombstoneRoom(ext, inc, changed) {
+      return inc.get('tombstoned', false) == true &&
+             !ext.get('tombstoned', false) &&
+             request.auth.uid in ext.memberUids &&
+             inc.status == 'UNPAIRED' &&
+             changed.hasOnly([
+               'status', 'tombstoned', 'creatorName', 'partnerName',
+               'creatorPublicKey', 'partnerPublicKey',
+               'pendingPartnerUid', 'pendingPartnerName', 'pendingPartnerPublicKey',
+               'updatedAt'
+             ]) &&
+             inc.creatorName == '' &&
+             inc.partnerName == '' &&
+             inc.creatorPublicKey == '' &&
+             inc.partnerPublicKey == '' &&
+             inc.pendingPartnerUid == '' &&
+             inc.pendingPartnerName == '' &&
+             inc.pendingPartnerPublicKey == '';
+    }
+
+    function canUpdateRoom(coupleCode) {
+      let ext = resource.data;
+      let inc = request.resource.data;
+      let changed = inc.diff(ext).affectedKeys();
+      let baseOk = isSignedIn() &&
+             isValidCoupleCode(coupleCode) &&
+             inc.updatedAt is timestamp &&
+             inc.updatedAt <= request.time &&
+             !ext.get('tombstoned', false);
+
+      return baseOk && (
+        (inc.get('tombstoned', false) == true && canTombstoneRoom(ext, inc, changed)) ||
+        (ext.status != 'UNPAIRED' && inc.get('tombstoned', false) == false && (
+          canRequestJoin(ext, inc, changed) ||
+          canApprovePending(ext, inc, changed) ||
+          canDeclineOrCancel(ext, inc, changed) ||
+          canUpdateSpiceOnly(ext, inc, changed) ||
+          canAdvanceHeadWithBlock(coupleCode, ext, inc, changed) ||
+          canUnpairRoom(ext, inc, changed)
+        ))
+      );
+    }
+
+    function atomicBlockMatchesRoomTransaction(coupleCode, blockId, blockData) {
+      let roomPath = /databases/$(database)/documents/coupleRooms/$(coupleCode);
+      let roomBefore = get(roomPath).data;
+      let roomAfter = getAfter(roomPath).data;
+      let blockSv = blockData.get('schemaVersion', 1);
+
+      return blockId == blockData.blockHash &&
+             roomBefore != null &&
+             roomAfter != null &&
+             roomBefore.status != 'UNPAIRED' &&
+             !roomBefore.get('tombstoned', false) &&
+             request.auth.uid in roomBefore.memberUids &&
+             blockData.memberUids == roomBefore.memberUids &&
+             blockData.blockIndex == roomBefore.blockCount &&
+             roomAfter.blockCount == roomBefore.blockCount + 1 &&
+             roomAfter.latestBlockHash == blockData.blockHash &&
+             (blockSv == 1 || blockData.previousHash == roomBefore.latestBlockHash);
+    }
+
+    // --- Minimal Invite Index (/coupleInvites/{coupleCode}) ---
+    // CUTOVER HARDENING: Direct client reads are completely disabled.
+    // All 6-digit invite lookups MUST go through the rate-limited Cloud Function `lookupCoupleInvite`
+    // (Firebase Admin SDK bypasses client rules and enforces per-UID sliding-window/daily/miss limits).
+    match /coupleInvites/{coupleCode} {
+      allow get: if false;
+      allow list: if false;
+
+      // Created atomically with /coupleRooms/{coupleCode} by the room creator
+      allow create: if isSignedIn() &&
+                       isValidCoupleCode(coupleCode) &&
+                       isValidCoupleInvite(request.resource.data, coupleCode) &&
+                       request.resource.data.status == 'WAITING' &&
+                       existsAfter(/databases/$(database)/documents/coupleRooms/$(coupleCode)) &&
+                       getAfter(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.creatorUid == request.auth.uid &&
+                       getAfter(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.status == 'WAITING';
+
+      // Updated strictly in lockstep with /coupleRooms/{coupleCode} state transitions
+      allow update: if isSignedIn() &&
+                       isValidCoupleCode(coupleCode) &&
+                       isValidCoupleInvite(request.resource.data, coupleCode) &&
+                       exists(/databases/$(database)/documents/coupleRooms/$(coupleCode)) &&
+                       existsAfter(/databases/$(database)/documents/coupleRooms/$(coupleCode)) &&
+                       request.resource.data.schemaVersion == resource.data.schemaVersion && (
+                         (request.resource.data.status == 'PENDING' &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']) &&
+                          getAfter(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.status == 'PENDING_APPROVAL' &&
+                          getAfter(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.pendingPartnerUid == request.auth.uid) ||
+                         (request.resource.data.status == 'WAITING' &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']) &&
+                          getAfter(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.status == 'WAITING' &&
+                          (get(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.creatorUid == request.auth.uid ||
+                           get(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.pendingPartnerUid == request.auth.uid)) ||
+                         (request.resource.data.status == 'LOCKED' &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']) &&
+                          getAfter(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.status == 'CONNECTED' &&
+                          get(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.creatorUid == request.auth.uid) ||
+                         (request.resource.data.status == 'RETIRED' &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'hostDisplayHint', 'updatedAt']) &&
+                          request.resource.data.hostDisplayHint == '' &&
+                          getAfter(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.status == 'UNPAIRED' &&
+                          request.auth.uid in get(/databases/$(database)/documents/coupleRooms/$(coupleCode)).data.memberUids)
+                       );
+
+      allow delete: if false;
+    }
+
+    // --- Couple Rooms Collection ---
+    match /coupleRooms/{coupleCode} {
+      allow get: if isSignedIn() &&
+                    isValidCoupleCode(coupleCode) && (
+                      resource == null ||
+                      request.auth.uid in resource.data.memberUids ||
+                      request.auth.uid == resource.data.pendingPartnerUid
+                    );
+
+      allow list: if isSignedIn() && (
+        request.auth.uid in resource.data.memberUids ||
+        request.auth.uid == resource.data.pendingPartnerUid
+      );
+
+      allow create: if isSignedIn() &&
+                       isValidCoupleCode(coupleCode) &&
+                       request.resource.data.keys().hasAll([
+                         'coupleCode', 'creatorUid', 'creatorName', 'creatorPublicKey',
+                         'partnerUid', 'partnerName', 'partnerPublicKey',
+                         'pendingPartnerUid', 'pendingPartnerName', 'pendingPartnerPublicKey',
+                         'memberUids', 'spiceLevel', 'status', 'blockCount', 'latestBlockHash',
+                         'createdAt', 'updatedAt'
+                       ]) &&
+                       request.resource.data.keys().hasOnly([
+                         'coupleCode', 'creatorUid', 'creatorName', 'creatorPublicKey',
+                         'partnerUid', 'partnerName', 'partnerPublicKey',
+                         'pendingPartnerUid', 'pendingPartnerName', 'pendingPartnerPublicKey',
+                         'memberUids', 'spiceLevel', 'status', 'blockCount', 'latestBlockHash',
+                         'schemaVersion', 'migrationAnchorHash', 'migrationAnchorIndex', 'tombstoned',
+                         'createdAt', 'updatedAt'
+                       ]) &&
+                       isValidCoupleRoomCreate(request.resource.data, coupleCode);
+
+      allow update: if canUpdateRoom(coupleCode);
+
+      allow delete: if false;
+
+      match /blocks/{blockId} {
+        allow get: if isSignedIn() &&
+                      isValidCoupleCode(coupleCode) &&
+                      isValidId(blockId) &&
+                      request.auth.uid in resource.data.memberUids;
+
+        allow list: if isSignedIn() && request.auth.uid in resource.data.memberUids;
+
+        allow create: if isSignedIn() &&
+                         isValidCoupleCode(coupleCode) &&
+                         isValidId(blockId) &&
+                         request.resource.data.keys().hasAll([
+                           'coupleCode', 'senderUid', 'senderName', 'memberUids',
+                           'blockIndex', 'actionType', 'blockHash', 'encryptedPacket', 'createdAt'
+                         ]) &&
+                         request.resource.data.keys().hasOnly([
+                           'coupleCode', 'senderUid', 'senderName', 'memberUids',
+                           'blockIndex', 'actionType', 'blockHash', 'previousHash',
+                           'schemaVersion', 'clientTurnId', 'encryptedPacket', 'createdAt'
+                         ]) &&
+                         isValidCoupleBlock(request.resource.data, coupleCode) &&
+                         atomicBlockMatchesRoomTransaction(coupleCode, blockId, request.resource.data);
+
+        allow update: if false;
+        allow delete: if false;
+      }
+    }
+  }
+}

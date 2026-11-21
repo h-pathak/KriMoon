@@ -34,7 +34,8 @@ data class CloudJoinResult(
 
 class CoupleCloudRepository(
     private val db: FirebaseFirestore,
-    private val auth: FirebaseAuth = Firebase.auth
+    private val auth: FirebaseAuth = Firebase.auth,
+    private val inviteLookupClient: CoupleInviteLookupClient = FirebaseCallableInviteLookupClient()
 ) {
     constructor(context: Context) : this(
         db = FirebaseFirestore.getInstance(
@@ -166,26 +167,48 @@ class CoupleCloudRepository(
     }
 
     /**
-     * Looks up minimal non-sensitive invite metadata in /coupleInvites/{coupleCode}.
-     * Never exposes creator UID, public keys, or chain hashes.
+     * Looks up minimal non-sensitive invite metadata exclusively via the server-side
+     * rate-limited `lookupCoupleInvite` Firebase Callable Cloud Function.
+     * Never performs direct client Firestore reads on /coupleInvites/{coupleCode}.
      */
     suspend fun lookupCoupleInvite(coupleCode: String): Result<CoupleCloudInvite?> {
         val cleanCode = CoupleTurnCodec.normalizeCode(coupleCode)
-        val path = "coupleInvites/$cleanCode"
         return try {
             requireUserId()
             require(cleanCode.length == 6) { "Room code must be 6 digits." }
-            val snap = invitesCollection().document(cleanCode).get().await()
-            val invite = if (snap.exists()) {
-                snap.toObject(CoupleCloudInvite::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
-            } else {
-                null
+            when (val outcome = inviteLookupClient.lookup(cleanCode)) {
+                is InviteLookupOutcome.Available -> Result.success(outcome.invite)
+                is InviteLookupOutcome.Unavailable -> {
+                    if (outcome.status == "NOT_FOUND") {
+                        Result.success(null)
+                    } else {
+                        Result.success(
+                            CoupleCloudInvite(
+                                id = cleanCode,
+                                coupleCode = cleanCode,
+                                status = outcome.status
+                            )
+                        )
+                    }
+                }
+                is InviteLookupOutcome.RateLimited -> Result.failure(
+                    InviteRateLimitedException(
+                        message = outcome.message,
+                        reason = outcome.reason,
+                        retryAfterSeconds = outcome.retryAfterSeconds
+                    )
+                )
+                is InviteLookupOutcome.Failed -> Result.failure(
+                    InviteLookupException(
+                        message = outcome.message,
+                        isRetryable = outcome.isRetryable,
+                        cause = outcome.cause
+                    )
+                )
             }
-            Result.success(invite)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.GET, path)
             Result.failure(e)
         }
     }
@@ -226,10 +249,8 @@ class CoupleCloudRepository(
 
                 val claimed: Boolean = try {
                     db.runTransaction { tx ->
-                        val inviteSnap = tx.get(inviteRef)
-                        if (inviteSnap.exists()) {
-                            return@runTransaction false
-                        }
+                        // Check /coupleRooms/{candidate} only (allowed when resource == null);
+                        // never perform direct client reads on /coupleInvites/{candidate}.
                         val roomSnap = tx.get(roomRef)
                         if (roomSnap.exists()) {
                             return@runTransaction false
@@ -397,23 +418,57 @@ class CoupleCloudRepository(
                 }
             }
 
-            // 2. Query minimal /coupleInvites/{code} index (non-sensitive availability check)
-            val inviteSnap = inviteRef.get().await()
-            val invite = if (inviteSnap.exists()) {
-                inviteSnap.toObject(CoupleCloudInvite::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
-            } else null
-
-            if (invite != null) {
-                when (invite.status) {
-                    "RETIRED" -> return Result.failure(
-                        IllegalStateException("Room #$cleanCode has permanently ended and cannot be reused.")
+            // 2. Verify room availability via trusted server-side rate-limited callable
+            //    (never reads /coupleInvites/{code} directly from the Android client)
+            val availableInvite: CoupleCloudInvite = when (val lookup = inviteLookupClient.lookup(cleanCode)) {
+                is InviteLookupOutcome.Available -> lookup.invite
+                is InviteLookupOutcome.RateLimited -> return Result.failure(
+                    InviteRateLimitedException(
+                        message = lookup.message,
+                        reason = lookup.reason,
+                        retryAfterSeconds = lookup.retryAfterSeconds
                     )
-                    "LOCKED" -> return Result.failure(
-                        SecurityException("Room #$cleanCode is private and already locked to 2 partners.")
+                )
+                is InviteLookupOutcome.Failed -> return Result.failure(
+                    InviteLookupException(
+                        message = lookup.message,
+                        isRetryable = lookup.isRetryable,
+                        cause = lookup.cause
                     )
-                    "PENDING" -> return Result.failure(
-                        SecurityException("Room #$cleanCode already has a pending request awaiting the Host.")
-                    )
+                )
+                is InviteLookupOutcome.Unavailable -> {
+                    return when (lookup.status) {
+                        "RETIRED" -> Result.failure(
+                            InviteLookupException(
+                                message = "Room #$cleanCode has permanently ended and cannot be reused.",
+                                isRetryable = false
+                            )
+                        )
+                        "LOCKED" -> Result.failure(
+                            InviteLookupException(
+                                message = "Room #$cleanCode is private and already locked to 2 partners.",
+                                isRetryable = false
+                            )
+                        )
+                        "PENDING" -> Result.failure(
+                            InviteLookupException(
+                                message = "Room #$cleanCode already has a pending request awaiting the Host.",
+                                isRetryable = true
+                            )
+                        )
+                        "NOT_FOUND" -> Result.failure(
+                            InviteLookupException(
+                                message = "Room #$cleanCode doesn't exist yet. Ask your partner to create the room first.",
+                                isRetryable = false
+                            )
+                        )
+                        else -> Result.failure(
+                            InviteLookupException(
+                                message = "Room #$cleanCode is not currently open for joining.",
+                                isRetryable = true
+                            )
+                        )
+                    }
                 }
             }
 
@@ -430,7 +485,7 @@ class CoupleCloudRepository(
                         "updatedAt" to FieldValue.serverTimestamp()
                     )
                 )
-                if (invite != null) {
+                if (availableInvite.schemaVersion >= CoupleBlockchain.SCHEMA_VERSION_V2) {
                     batch.update(
                         inviteRef,
                         mapOf(
@@ -443,12 +498,26 @@ class CoupleCloudRepository(
             } catch (e: FirebaseFirestoreException) {
                 return when (e.code) {
                     FirebaseFirestoreException.Code.NOT_FOUND -> Result.failure(
-                        IllegalStateException("Room #$cleanCode doesn't exist yet. Ask your partner to create the room first.")
+                        InviteLookupException(
+                            message = "Room #$cleanCode doesn't exist yet. Ask your partner to create the room first.",
+                            isRetryable = false,
+                            cause = e
+                        )
                     )
                     FirebaseFirestoreException.Code.PERMISSION_DENIED -> Result.failure(
-                        SecurityException("Room #$cleanCode is private, already pending, or belongs to your own account.")
+                        InviteLookupException(
+                            message = "Room #$cleanCode is private, already pending, or belongs to your own account.",
+                            isRetryable = false,
+                            cause = e
+                        )
                     )
-                    else -> Result.failure(e)
+                    else -> Result.failure(
+                        InviteLookupException(
+                            message = "Could not send join request for Room #$cleanCode. Please retry.",
+                            isRetryable = true,
+                            cause = e
+                        )
+                    )
                 }
             }
 
@@ -496,7 +565,6 @@ class CoupleCloudRepository(
 
             val approvedRoom = db.runTransaction { tx ->
                 val roomSnap = tx.get(roomRef)
-                val inviteSnap = tx.get(inviteRef)
                 val existing = roomSnap.toObject(
                     CoupleCloudRoom::class.java,
                     DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
@@ -528,7 +596,7 @@ class CoupleCloudRepository(
                         "updatedAt" to FieldValue.serverTimestamp()
                     )
                 )
-                if (inviteSnap.exists()) {
+                if (existing.schemaVersion >= CoupleBlockchain.SCHEMA_VERSION_V2) {
                     tx.update(
                         inviteRef,
                         mapOf(
@@ -573,7 +641,8 @@ class CoupleCloudRepository(
             val inviteRef = invitesCollection().document(cleanCode)
 
             db.runTransaction { tx ->
-                val inviteSnap = tx.get(inviteRef)
+                val roomSnap = tx.get(roomRef)
+                val schemaVersion = (roomSnap.getLong("schemaVersion") ?: 1L).toInt()
                 tx.update(
                     roomRef,
                     mapOf(
@@ -584,7 +653,7 @@ class CoupleCloudRepository(
                         "updatedAt" to FieldValue.serverTimestamp()
                     )
                 )
-                if (inviteSnap.exists()) {
+                if (schemaVersion >= CoupleBlockchain.SCHEMA_VERSION_V2) {
                     tx.update(
                         inviteRef,
                         mapOf(
@@ -819,7 +888,8 @@ class CoupleCloudRepository(
             val roomRef = roomsCollection().document(cleanCode)
             val inviteRef = invitesCollection().document(cleanCode)
             db.runTransaction { tx ->
-                val inviteSnap = tx.get(inviteRef)
+                val roomSnap = tx.get(roomRef)
+                val schemaVersion = (roomSnap.getLong("schemaVersion") ?: 1L).toInt()
                 tx.update(
                     roomRef,
                     mapOf(
@@ -830,7 +900,7 @@ class CoupleCloudRepository(
                         "updatedAt" to FieldValue.serverTimestamp()
                     )
                 )
-                if (inviteSnap.exists()) {
+                if (schemaVersion >= CoupleBlockchain.SCHEMA_VERSION_V2) {
                     tx.update(
                         inviteRef,
                         mapOf(
@@ -881,7 +951,8 @@ class CoupleCloudRepository(
                 val inviteRef = invitesCollection().document(code)
                 val txRes = runCatching {
                     db.runTransaction { tx ->
-                        val inviteSnap = tx.get(inviteRef)
+                        val roomSnap = tx.get(roomRef)
+                        val schemaVersion = (roomSnap.getLong("schemaVersion") ?: 1L).toInt()
                         tx.update(
                             roomRef,
                             mapOf(
@@ -897,7 +968,7 @@ class CoupleCloudRepository(
                                 "updatedAt" to FieldValue.serverTimestamp()
                             )
                         )
-                        if (inviteSnap.exists()) {
+                        if (schemaVersion >= CoupleBlockchain.SCHEMA_VERSION_V2) {
                             tx.update(
                                 inviteRef,
                                 mapOf(

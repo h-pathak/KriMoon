@@ -29,7 +29,9 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreHoriz
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -72,12 +74,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.credentials.CredentialManager
+import com.example.cloud.InviteJoinUiState
 import com.example.cloud.attemptAutoSignIn
 import com.example.cloud.onGoogleSignInClicked
 import com.example.cloud.signOutGoogle
 import com.example.data.CoupleRoomRecord
 import com.example.model.CoupleTurnCodec
 import com.example.model.SpiceLevel
+import kotlinx.coroutines.delay
 import com.example.ui.components.AestheticHaptics
 import com.example.ui.components.cute3DCard
 import com.example.ui.theme.PhasesPlum
@@ -108,7 +112,8 @@ data class CoupleLoungeUiState(
     val cloudAuthUid: String? = null,
     val cloudSyncStatus: String = "SIGNED_OUT",
     val isCloudBusy: Boolean = false,
-    val pendingTurnCount: Int = 0
+    val pendingTurnCount: Int = 0,
+    val inviteJoinState: InviteJoinUiState = InviteJoinUiState.Idle
 )
 
 @Immutable
@@ -118,6 +123,7 @@ data class CoupleLoungeActions(
     val onRetryCloudSync: () -> Unit = {},
     val onCreateUniqueRoom: (name: String) -> Unit = {},
     val onRequestJoinRoom: (name: String, code: String) -> Unit = { _, _ -> },
+    val onClearInviteJoinState: () -> Unit = {},
     val onApprovePendingPartner: (code: String) -> Unit = {},
     val onDeclinePendingPartner: (code: String) -> Unit = {},
     val onSelectRoom: (code: String) -> Unit = {},
@@ -240,8 +246,10 @@ fun CoupleGamesHub(
             existingRooms = loungeState.coupleRooms,
             isSignedIn = isSignedIn,
             isBusy = loungeState.isCloudBusy,
+            inviteJoinState = loungeState.inviteJoinState,
             onCreateUniqueRoom = actions.onCreateUniqueRoom,
             onRequestJoinRoom = actions.onRequestJoinRoom,
+            onClearInviteJoinState = actions.onClearInviteJoinState,
             onSelectRoom = actions.onSelectRoom,
             modifier = modifier
         )
@@ -1203,8 +1211,10 @@ private fun CouplePairingCard(
     existingRooms: List<CoupleRoomRecord>,
     isSignedIn: Boolean,
     isBusy: Boolean,
+    inviteJoinState: InviteJoinUiState,
     onCreateUniqueRoom: (name: String) -> Unit,
     onRequestJoinRoom: (name: String, code: String) -> Unit,
+    onClearInviteJoinState: () -> Unit,
     onSelectRoom: (code: String) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -1252,18 +1262,28 @@ private fun CouplePairingCard(
 
                 PairingModeToggleBar(
                     isJoinMode = isJoinMode,
-                    onModeChange = { isJoinMode = it }
+                    onModeChange = {
+                        isJoinMode = it
+                        onClearInviteJoinState()
+                    }
                 )
 
                 PairingFormFields(
                     nameInput = nameInput,
                     onNameChange = { nameInput = it },
                     codeInput = codeInput,
-                    onCodeChange = { codeInput = CoupleTurnCodec.normalizeCode(it) },
+                    onCodeChange = {
+                        codeInput = CoupleTurnCodec.normalizeCode(it)
+                        if (inviteJoinState is InviteJoinUiState.Error) {
+                            onClearInviteJoinState()
+                        }
+                    },
                     isJoinMode = isJoinMode,
                     isBusy = isBusy,
+                    inviteJoinState = inviteJoinState,
                     onCreateUniqueRoom = { onCreateUniqueRoom(nameInput) },
-                    onRequestJoinRoom = { onRequestJoinRoom(nameInput, codeInput) }
+                    onRequestJoinRoom = { onRequestJoinRoom(nameInput, codeInput) },
+                    onDismissInviteState = onClearInviteJoinState
                 )
 
                 if (existingRooms.isNotEmpty()) {
@@ -1364,8 +1384,10 @@ private fun PairingFormFields(
     onCodeChange: (String) -> Unit,
     isJoinMode: Boolean,
     isBusy: Boolean,
+    inviteJoinState: InviteJoinUiState,
     onCreateUniqueRoom: () -> Unit,
-    onRequestJoinRoom: () -> Unit
+    onRequestJoinRoom: () -> Unit,
+    onDismissInviteState: () -> Unit
 ) {
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
@@ -1378,6 +1400,30 @@ private fun PairingFormFields(
         unfocusedLabelColor = VelvetTextMuted,
         cursorColor = VelvetRoseGlow
     )
+
+    // Live 1-second cooldown countdown when server-side rate limiting is active
+    var rateLimitSecondsLeft by remember(inviteJoinState) {
+        val initial = if (inviteJoinState is InviteJoinUiState.RateLimited) {
+            ((inviteJoinState.retryAfterEpochMs - System.currentTimeMillis() + 999L) / 1000L)
+                .toInt()
+                .coerceAtLeast(0)
+        } else 0
+        mutableStateOf(initial)
+    }
+    LaunchedEffect(inviteJoinState) {
+        if (inviteJoinState is InviteJoinUiState.RateLimited) {
+            while (true) {
+                val remaining = ((inviteJoinState.retryAfterEpochMs - System.currentTimeMillis() + 999L) / 1000L)
+                    .toInt()
+                    .coerceAtLeast(0)
+                rateLimitSecondsLeft = remaining
+                if (remaining <= 0) break
+                delay(1000L)
+            }
+        } else {
+            rateLimitSecondsLeft = 0
+        }
+    }
 
     OutlinedTextField(
         value = nameInput,
@@ -1393,12 +1439,16 @@ private fun PairingFormFields(
     )
 
     if (isJoinMode) {
+        val isLookingUp = isBusy || inviteJoinState is InviteJoinUiState.Loading
+        val isRateLimitCoolingDown = inviteJoinState is InviteJoinUiState.RateLimited && rateLimitSecondsLeft > 0
+
         OutlinedTextField(
             value = codeInput,
             onValueChange = onCodeChange,
             label = { Text("Partner's 6-Digit Code") },
             placeholder = { Text("482913", color = VelvetTextMuted.copy(alpha = 0.5f)) },
             singleLine = true,
+            enabled = !isLookingUp,
             colors = fieldColors,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             shape = RoundedCornerShape(16.dp),
@@ -1406,6 +1456,147 @@ private fun PairingFormFields(
                 .fillMaxWidth()
                 .testTag("couple_code_input")
         )
+
+        when (inviteJoinState) {
+            is InviteJoinUiState.Loading -> {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = Color.White.copy(alpha = 0.06f),
+                    border = BorderStroke(1.dp, VelvetBorder),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("invite_lookup_loading_banner")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        CircularProgressIndicator(
+                            color = Color(0xFFF472B6),
+                            strokeWidth = 2.dp,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = "Verifying Room #${inviteJoinState.coupleCode} securely…",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = VelvetTextPrimary
+                        )
+                    }
+                }
+            }
+            is InviteJoinUiState.RateLimited -> {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = WaitingAmber.copy(alpha = 0.14f),
+                    border = BorderStroke(1.dp, WaitingAmber.copy(alpha = 0.55f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("invite_rate_limit_banner")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Lock,
+                                contentDescription = "Rate limit active",
+                                tint = WaitingAmber,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = if (rateLimitSecondsLeft > 0) {
+                                    "Rate limit active · Try again in ${rateLimitSecondsLeft}s"
+                                } else {
+                                    "Cooldown ended · Ready to retry"
+                                },
+                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                color = WaitingAmber
+                            )
+                        }
+                        Text(
+                            text = inviteJoinState.message,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = VelvetTextPrimary
+                        )
+                    }
+                }
+            }
+            is InviteJoinUiState.Error -> {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = Color(0xFFE11D48).copy(alpha = 0.16f),
+                    border = BorderStroke(1.dp, Color(0xFFFB7185).copy(alpha = 0.55f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("invite_error_banner")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = "Invite lookup error",
+                                tint = Color(0xFFFDA4AF),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = inviteJoinState.message,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = VelvetTextPrimary,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        if (inviteJoinState.canRetry) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                OutlinedButton(
+                                    onClick = {
+                                        AestheticHaptics.crispClick(context, haptic)
+                                        onRequestJoinRoom()
+                                    },
+                                    enabled = !isLookingUp,
+                                    border = BorderStroke(1.dp, Color(0xFFFDA4AF)),
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier
+                                        .height(48.dp)
+                                        .testTag("invite_retry_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Refresh,
+                                        contentDescription = "Retry verification",
+                                        tint = VelvetTextPrimary,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Retry", color = VelvetTextPrimary, fontWeight = FontWeight.SemiBold)
+                                }
+                                TextButton(
+                                    onClick = onDismissInviteState,
+                                    modifier = Modifier
+                                        .height(48.dp)
+                                        .testTag("invite_dismiss_error_button")
+                                ) {
+                                    Text("Dismiss", color = VelvetTextMuted)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            InviteJoinUiState.Idle -> Unit
+        }
 
         Text(
             text = "The room creator must tap Allow on their phone before you enter.",
@@ -1419,7 +1610,7 @@ private fun PairingFormFields(
                 AestheticHaptics.crispClick(context, haptic)
                 onRequestJoinRoom()
             },
-            enabled = !isBusy,
+            enabled = !isLookingUp && !isRateLimitCoolingDown,
             colors = ButtonDefaults.buttonColors(
                 containerColor = VelvetRoseGlow,
                 contentColor = Color.White
@@ -1430,15 +1621,24 @@ private fun PairingFormFields(
                 .height(50.dp)
                 .testTag("couple_join_button")
         ) {
-            if (isBusy) {
+            if (isLookingUp) {
                 CircularProgressIndicator(
                     color = Color.White,
                     strokeWidth = 2.dp,
                     modifier = Modifier.size(20.dp)
                 )
+            } else if (isRateLimitCoolingDown) {
+                Text(
+                    text = "Wait ${rateLimitSecondsLeft}s…",
+                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
+                )
             } else {
                 Text(
-                    text = "Request to Join ♥",
+                    text = if (inviteJoinState is InviteJoinUiState.RateLimited) {
+                        "Retry Join ♥"
+                    } else {
+                        "Request to Join ♥"
+                    },
                     style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
                 )
             }

@@ -23,8 +23,9 @@
 -keep class androidx.credentials.** { *; }
 -keep class com.google.android.libraries.identity.googleid.** { *; }
 
-# Keep Firebase App Check Play Integrity provider entrypoints
+# Keep Firebase App Check Play Integrity provider & Firebase Functions callable entrypoints
 -keep class com.google.firebase.appcheck.playintegrity.** { *; }
+-keep class com.google.firebase.functions.** { *; }
 
 # Strip verbose/debug/info logs from release builds to prevent metadata leakage
 -assumenosideeffects class android.util.Log {

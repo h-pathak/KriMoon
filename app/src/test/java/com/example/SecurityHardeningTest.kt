@@ -1069,4 +1069,112 @@ class SecurityHardeningTest {
             perms.contains(android.Manifest.permission.POST_NOTIFICATIONS)
         )
     }
+
+    @Test
+    fun `FirebaseCallableInviteLookupClient parses responses, rate limits, and retryable errors accurately`() {
+        // 1. Valid WAITING invite
+        val avail = com.example.cloud.FirebaseCallableInviteLookupClient.parseCallablePayload(
+            coupleCode = "482910",
+            rawData = mapOf(
+                "exists" to true,
+                "coupleCode" to "482910",
+                "status" to "WAITING",
+                "hostDisplayHint" to "Maya",
+                "schemaVersion" to 2
+            )
+        )
+        assertTrue(avail is com.example.cloud.InviteLookupOutcome.Available)
+        val invite = (avail as com.example.cloud.InviteLookupOutcome.Available).invite
+        assertEquals("482910", invite.coupleCode)
+        assertEquals("WAITING", invite.status)
+        assertEquals("Maya", invite.hostDisplayHint)
+        assertEquals(2, invite.schemaVersion)
+
+        // 2. Unavailable states (NOT_FOUND, LOCKED, PENDING, RETIRED)
+        for (status in listOf("NOT_FOUND", "LOCKED", "PENDING", "RETIRED")) {
+            val res = com.example.cloud.FirebaseCallableInviteLookupClient.parseCallablePayload(
+                coupleCode = "482910",
+                rawData = mapOf("exists" to (status != "NOT_FOUND"), "status" to status)
+            )
+            assertTrue("Expected Unavailable for $status", res is com.example.cloud.InviteLookupOutcome.Unavailable)
+            assertEquals(status, (res as com.example.cloud.InviteLookupOutcome.Unavailable).status)
+        }
+
+        // 3. Network IOException -> retryable Failed
+        val netFail = com.example.cloud.FirebaseCallableInviteLookupClient.mapLookupException(
+            coupleCode = "482910",
+            error = java.io.IOException("Connection reset")
+        )
+        assertTrue(netFail is com.example.cloud.InviteLookupOutcome.Failed)
+        assertTrue((netFail as com.example.cloud.InviteLookupOutcome.Failed).isRetryable)
+
+        // 4. Region and function name match deployed Cloud Function contract
+        assertEquals("lookupCoupleInvite", com.example.cloud.FirebaseCallableInviteLookupClient.FUNCTION_NAME)
+        assertEquals("us-central1", com.example.cloud.FirebaseCallableInviteLookupClient.REGION)
+        assertEquals(15L, com.example.cloud.FirebaseCallableInviteLookupClient.CALLABLE_TIMEOUT_SECONDS)
+    }
+
+    @Test
+    fun `PhasesViewModel maps InviteRateLimitedException and InviteLookupException into structured UI states`() {
+        val now = 1_700_000_000_000L
+        val rateLimited = com.example.viewmodel.PhasesViewModel.mapInviteFailureToUiState(
+            coupleCode = "482910",
+            error = com.example.cloud.InviteRateLimitedException(
+                message = "Too many unsuccessful code lookups.",
+                reason = "miss_lockout",
+                retryAfterSeconds = 45
+            ),
+            nowMs = now
+        )
+        assertTrue(rateLimited is com.example.cloud.InviteJoinUiState.RateLimited)
+        val rl = rateLimited as com.example.cloud.InviteJoinUiState.RateLimited
+        assertEquals("482910", rl.coupleCode)
+        assertEquals("miss_lockout", rl.reason)
+        assertEquals(now + 45_000L, rl.retryAfterEpochMs)
+
+        val retryableError = com.example.viewmodel.PhasesViewModel.mapInviteFailureToUiState(
+            coupleCode = "482910",
+            error = com.example.cloud.InviteLookupException("Service temporarily unavailable", isRetryable = true),
+            nowMs = now
+        )
+        assertTrue(retryableError is com.example.cloud.InviteJoinUiState.Error)
+        assertTrue((retryableError as com.example.cloud.InviteJoinUiState.Error).canRetry)
+
+        val terminalError = com.example.viewmodel.PhasesViewModel.mapInviteFailureToUiState(
+            coupleCode = "482910",
+            error = com.example.cloud.InviteLookupException("Room permanently ended", isRetryable = false),
+            nowMs = now
+        )
+        assertTrue(terminalError is com.example.cloud.InviteJoinUiState.Error)
+        assertFalse((terminalError as com.example.cloud.InviteJoinUiState.Error).canRetry)
+    }
+
+    @Test
+    fun `Android client contains zero direct Firestore reads of coupleInvites collection`() {
+        // Locate CoupleCloudRepository.kt relative to project root or module dir
+        val candidates = listOf(
+            File("src/main/java/com/example/cloud/CoupleCloudRepository.kt"),
+            File("app/src/main/java/com/example/cloud/CoupleCloudRepository.kt")
+        )
+        val repoFile = candidates.firstOrNull { it.exists() }
+            ?: error("Could not locate CoupleCloudRepository.kt to verify zero-direct-invite-read invariant")
+        val source = repoFile.readText()
+
+        assertTrue(
+            "CoupleCloudRepository must delegate invite lookup to CoupleInviteLookupClient",
+            source.contains("inviteLookupClient.lookup(")
+        )
+        assertFalse(
+            "CoupleCloudRepository must NEVER call inviteRef.get()",
+            source.contains("inviteRef.get(")
+        )
+        assertFalse(
+            "CoupleCloudRepository must NEVER call tx.get(inviteRef)",
+            source.contains("tx.get(inviteRef)")
+        )
+        assertFalse(
+            "CoupleCloudRepository must NEVER read invitesCollection().document(...).get()",
+            Regex("""invitesCollection\(\)\s*\.document\([^)]*\)\s*\.get\(""").containsMatchIn(source)
+        )
+    }
 }

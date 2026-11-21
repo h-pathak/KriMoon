@@ -527,3 +527,91 @@ test("Account deletion tombstone scrubs PII/public keys, retires invite, and per
     })
   );
 });
+
+test("Staged firestore.cutover.rules disables ALL direct client /coupleInvites reads & /_rateLimits access while preserving full room lifecycle", async () => {
+  const cutoverRules = fs.readFileSync("./firestore.cutover.rules", "utf8");
+  const cutoverEnv = await initializeTestEnvironment({
+    projectId: `${PROJECT_ID}-cutover`,
+    firestore: {
+      rules: cutoverRules,
+      host: emulatorHost,
+      port: emulatorPort,
+    },
+  });
+
+  try {
+    const hariomDb = cutoverEnv.authenticatedContext(HARIOM_UID).firestore();
+    const krishiDb = cutoverEnv.authenticatedContext(KRISHI_UID).firestore();
+    const intruderDb = cutoverEnv.authenticatedContext(INTRUDER_UID).firestore();
+
+    // 1. V2 room + invite atomic create succeeds WITHOUT any client read of /coupleInvites
+    await assertSucceeds(createV2RoomWithInvite(hariomDb));
+
+    // 2. Direct client reads of /coupleInvites/{code} MUST FAIL for ALL users (host, partner, intruder)
+    await assertFails(krishiDb.collection("coupleInvites").doc(ROOM_CODE).get());
+    await assertFails(hariomDb.collection("coupleInvites").doc(ROOM_CODE).get());
+    await assertFails(intruderDb.collection("coupleInvites").doc(ROOM_CODE).get());
+    await assertFails(krishiDb.collection("coupleInvites").get());
+
+    // 3. Server-only /_rateLimits/* collection MUST reject all client reads and writes
+    await assertFails(krishiDb.collection("_rateLimits").doc(`inviteLookup_${KRISHI_UID}`).get());
+    await assertFails(
+      krishiDb.collection("_rateLimits").doc(`inviteLookup_${KRISHI_UID}`).set({ dayCount: 0 })
+    );
+
+    // 4. Full blind join -> host approve -> atomic block -> tombstone lifecycle SUCCEEDS without any /coupleInvites get
+    const joinBatch = krishiDb.batch();
+    joinBatch.update(krishiDb.collection("coupleRooms").doc(ROOM_CODE), {
+      pendingPartnerUid: KRISHI_UID,
+      pendingPartnerName: "Krishi",
+      pendingPartnerPublicKey: PARTNER_PUB_KEY,
+      status: "PENDING_APPROVAL",
+      updatedAt: new Date(Date.now() - 800),
+    });
+    joinBatch.update(krishiDb.collection("coupleInvites").doc(ROOM_CODE), {
+      status: "PENDING",
+      updatedAt: new Date(Date.now() - 800),
+    });
+    await assertSucceeds(joinBatch.commit());
+
+    const approveBatch = hariomDb.batch();
+    approveBatch.update(hariomDb.collection("coupleRooms").doc(ROOM_CODE), {
+      partnerUid: KRISHI_UID,
+      partnerName: "Krishi",
+      partnerPublicKey: PARTNER_PUB_KEY,
+      memberUids: [HARIOM_UID, KRISHI_UID],
+      pendingPartnerUid: "",
+      pendingPartnerName: "",
+      pendingPartnerPublicKey: "",
+      status: "CONNECTED",
+      updatedAt: new Date(Date.now() - 600),
+    });
+    approveBatch.update(hariomDb.collection("coupleInvites").doc(ROOM_CODE), {
+      status: "LOCKED",
+      updatedAt: new Date(Date.now() - 600),
+    });
+    await assertSucceeds(approveBatch.commit());
+
+    const tombBatch = hariomDb.batch();
+    tombBatch.update(hariomDb.collection("coupleRooms").doc(ROOM_CODE), {
+      status: "UNPAIRED",
+      tombstoned: true,
+      creatorName: "",
+      partnerName: "",
+      creatorPublicKey: "",
+      partnerPublicKey: "",
+      pendingPartnerUid: "",
+      pendingPartnerName: "",
+      pendingPartnerPublicKey: "",
+      updatedAt: new Date(Date.now() - 150),
+    });
+    tombBatch.update(hariomDb.collection("coupleInvites").doc(ROOM_CODE), {
+      status: "RETIRED",
+      hostDisplayHint: "",
+      updatedAt: new Date(Date.now() - 150),
+    });
+    await assertSucceeds(tombBatch.commit());
+  } finally {
+    await cutoverEnv.cleanup();
+  }
+});

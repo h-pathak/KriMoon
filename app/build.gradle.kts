@@ -104,8 +104,9 @@ dependencies {
   // implementation(libs.coil.compose)
   // implementation(libs.converter.moshi)
   // implementation(libs.firebase.ai)
-  // Firestore & Firebase Auth + Google Sign-In via Credential Manager:
+  // Firestore, Cloud Functions (rate-limited callable invite lookup) & Firebase Auth + Google Sign-In via Credential Manager:
   implementation(libs.firebase.firestore)
+  implementation(libs.firebase.functions)
   implementation(libs.firebase.auth)
   implementation(libs.androidx.credentials)
   implementation(libs.androidx.credentials.play.services)
