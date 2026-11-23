@@ -119,22 +119,13 @@ fun ThreeDPhaseCard(
     var soundEnabled by remember { mutableStateOf(false) }
     var stressReliefCount by remember { mutableIntStateOf(0) }
 
-    var cardCenterInWindow by remember { mutableStateOf(Offset.Zero) }
-    var cardSize by remember { mutableStateOf(IntSize.Zero) }
-    var interactiveTiltX by remember { mutableFloatStateOf(0f) }
-    var interactiveTiltY by remember { mutableFloatStateOf(0f) }
-    var isCardTouched by remember { mutableStateOf(false) }
-
-    val smoothTouchTiltXState = animateFloatAsState(
-        targetValue = interactiveTiltX,
-        animationSpec = spring(dampingRatio = 0.72f, stiffness = Spring.StiffnessMediumLow),
-        label = "hero_touch_tilt_x"
-    )
-    val smoothTouchTiltYState = animateFloatAsState(
-        targetValue = interactiveTiltY,
-        animationSpec = spring(dampingRatio = 0.72f, stiffness = Spring.StiffnessMediumLow),
-        label = "hero_touch_tilt_y"
-    )
+    val cardCenterHolder = remember { OffsetHolder() }
+    val cardSizeRef = remember { arrayOf(IntSize.Zero) }
+    val cardScope = rememberCoroutineScope()
+    val smoothTouchTiltX = remember { Animatable(0f) }
+    val smoothTouchTiltY = remember { Animatable(0f) }
+    val glareAlphaAnim = remember { Animatable(0.38f) }
+    val tiltSpring = remember { spring<Float>(dampingRatio = 0.72f, stiffness = Spring.StiffnessMediumLow) }
 
     // Zen Breathing state machine
     var currentBreathPhase by remember { mutableStateOf(BreathPhase.INHALE) }
@@ -176,67 +167,93 @@ fun ThreeDPhaseCard(
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .onSizeChanged { cardSize = it }
+            .onSizeChanged { cardSizeRef[0] = it }
             .onGloballyPositioned { coordinates ->
                 val bounds = coordinates.boundsInWindow()
-                cardCenterInWindow = Offset(bounds.left + bounds.width / 2f, bounds.top + bounds.height / 2f)
+                cardCenterHolder.value = Offset(bounds.left + bounds.width / 2f, bounds.top + bounds.height / 2f)
             }
-            // Non-consuming PointerEventPass.Initial 3D tilt: 100% smooth LazyColumn scrolling
+            // Non-consuming PointerEventPass.Initial 3D tilt: 0 recompositions, locked 60/120fps scrolling
             .pointerInput(Unit) {
                 awaitPointerEventScope {
                     var pressOrigin = Offset.Zero
                     var scrolling = false
+                    var tiltActive = false
+                    var tiltJob: Job? = null
+
+                    fun resetTilt() {
+                        tiltJob?.cancel()
+                        tiltJob = cardScope.launch {
+                            launch { smoothTouchTiltX.animateTo(0f, tiltSpring) }
+                            launch { smoothTouchTiltY.animateTo(0f, tiltSpring) }
+                            glareAlphaAnim.animateTo(0.38f, tween(180))
+                        }
+                    }
+
                     while (true) {
                         val event = awaitPointerEvent(PointerEventPass.Initial)
                         val change = event.changes.firstOrNull() ?: continue
                         val pos = change.position
-                        val w = cardSize.width.coerceAtLeast(1).toFloat()
-                        val h = cardSize.height.coerceAtLeast(1).toFloat()
+                        val curSize = cardSizeRef[0]
+                        val w = curSize.width.coerceAtLeast(1).toFloat()
+                        val h = curSize.height.coerceAtLeast(1).toFloat()
                         val hasPressed = event.changes.any { it.pressed }
                         when {
                             event.type == PointerEventType.Press && hasPressed -> {
                                 pressOrigin = pos
                                 scrolling = false
-                                isCardTouched = true
+                                tiltActive = true
                                 val nx = ((pos.x / w) - 0.5f).coerceIn(-0.5f, 0.5f) * 2f
                                 val ny = ((pos.y / h) - 0.5f).coerceIn(-0.5f, 0.5f) * 2f
-                                interactiveTiltX = -ny * 3.6f
-                                interactiveTiltY = nx * 3.6f
+                                tiltJob?.cancel()
+                                tiltJob = cardScope.launch {
+                                    launch { smoothTouchTiltX.animateTo(-ny * 3.6f, tiltSpring) }
+                                    launch { smoothTouchTiltY.animateTo(nx * 3.6f, tiltSpring) }
+                                    glareAlphaAnim.animateTo(0.62f, tween(160))
+                                }
                             }
                             event.type == PointerEventType.Move && hasPressed -> {
                                 val dy = abs(pos.y - pressOrigin.y)
                                 val dx = abs(pos.x - pressOrigin.x)
-                                if (dy > 18f && dy > dx * 1.15f) {
-                                    scrolling = true
-                                    isCardTouched = false
-                                    interactiveTiltX = 0f
-                                    interactiveTiltY = 0f
-                                } else if (!scrolling) {
+                                if (dy > 16f && dy > dx * 1.1f) {
+                                    if (!scrolling) {
+                                        scrolling = true
+                                        tiltActive = false
+                                        resetTilt()
+                                    }
+                                } else if (!scrolling && tiltActive) {
                                     val nx = ((pos.x / w) - 0.5f).coerceIn(-0.5f, 0.5f) * 2f
                                     val ny = ((pos.y / h) - 0.5f).coerceIn(-0.5f, 0.5f) * 2f
-                                    interactiveTiltX = -ny * 3.6f
-                                    interactiveTiltY = nx * 3.6f
+                                    val tx = -ny * 3.6f
+                                    val ty = nx * 3.6f
+                                    if (abs(tx - smoothTouchTiltX.value) > 0.25f || abs(ty - smoothTouchTiltY.value) > 0.25f) {
+                                        tiltJob?.cancel()
+                                        tiltJob = cardScope.launch {
+                                            smoothTouchTiltX.snapTo(tx)
+                                            smoothTouchTiltY.snapTo(ty)
+                                        }
+                                    }
                                 }
                             }
                             !hasPressed || event.type == PointerEventType.Release || event.type == PointerEventType.Exit -> {
-                                isCardTouched = false
-                                interactiveTiltX = 0f
-                                interactiveTiltY = 0f
+                                if (tiltActive) {
+                                    tiltActive = false
+                                    resetTilt()
+                                }
                             }
                         }
                     }
                 }
             }
             .graphicsLayer {
-                rotationX = smoothTouchTiltXState.value.coerceIn(-4.2f, 4.2f)
-                rotationY = smoothTouchTiltYState.value.coerceIn(-4.2f, 4.2f)
+                rotationX = smoothTouchTiltX.value.coerceIn(-4.2f, 4.2f)
+                rotationY = smoothTouchTiltY.value.coerceIn(-4.2f, 4.2f)
                 cameraDistance = 20f * density
             }
     ) {
         Card(
             shape = RoundedCornerShape(28.dp),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            elevation = CardDefaults.cardElevation(defaultElevation = if (isCardTouched) 6.dp else 3.dp),
+            elevation = CardDefaults.cardElevation(defaultElevation = 3.dp),
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(28.dp))
@@ -245,7 +262,7 @@ fun ThreeDPhaseCard(
                         1.dp,
                         Brush.linearGradient(
                             listOf(
-                                phase.accentColor.copy(alpha = if (isCardTouched) 0.65f else 0.45f),
+                                phase.accentColor.copy(alpha = 0.48f),
                                 MaterialTheme.colorScheme.outlineVariant
                             )
                         )
@@ -282,10 +299,10 @@ fun ThreeDPhaseCard(
                 Canvas(
                     modifier = Modifier
                         .matchParentSize()
-                        .graphicsLayer { alpha = if (isCardTouched) 0.62f else 0.38f }
+                        .graphicsLayer { alpha = glareAlphaAnim.value }
                 ) {
-                    val tiltX = smoothTouchTiltXState.value.coerceIn(-4.2f, 4.2f)
-                    val tiltY = smoothTouchTiltYState.value.coerceIn(-4.2f, 4.2f)
+                    val tiltX = smoothTouchTiltX.value.coerceIn(-4.2f, 4.2f)
+                    val tiltY = smoothTouchTiltY.value.coerceIn(-4.2f, 4.2f)
                     val glareCenterX = size.width * (0.5f + (tiltY / 10f) * 0.35f)
                     val glareCenterY = size.height * (0.35f - (tiltX / 10f) * 0.30f)
                     drawCircle(
@@ -334,9 +351,9 @@ fun ThreeDPhaseCard(
                         isBreathingMode = isBreathingMode,
                         soundEnabled = soundEnabled,
                         tactile = tactile,
-                        cardCenterInWindow = cardCenterInWindow,
-                        touchTiltXState = smoothTouchTiltXState,
-                        touchTiltYState = smoothTouchTiltYState,
+                        cardCenterHolder = cardCenterHolder,
+                        touchTiltXState = smoothTouchTiltX.asState(),
+                        touchTiltYState = smoothTouchTiltY.asState(),
                         breathScale = breathScale,
                         breathProgress = breathProgress,
                         onStressReliefIncrement = { stressReliefCount++ }
@@ -465,7 +482,7 @@ private fun PhaseCardInteractiveOrb(
     isBreathingMode: Boolean,
     soundEnabled: Boolean,
     tactile: TactileStressHelper,
-    cardCenterInWindow: Offset,
+    cardCenterHolder: OffsetHolder,
     touchTiltXState: State<Float>,
     touchTiltYState: State<Float>,
     breathScale: Animatable<Float, *>,
@@ -599,8 +616,9 @@ private fun PhaseCardInteractiveOrb(
             )
         }
 
-        val spawnX = spawnOffset?.x ?: cardCenterInWindow.x
-        val spawnY = spawnOffset?.y ?: (cardCenterInWindow.y - 40f)
+        val center = cardCenterHolder.value
+        val spawnX = spawnOffset?.x ?: center.x
+        val spawnY = spawnOffset?.y ?: (center.y - 40f)
         particleController.spawn(
             centerX = spawnX,
             centerY = spawnY,
@@ -703,7 +721,7 @@ private fun PhaseCardInteractiveOrb(
                             if (!isBreathingMode && isMoonPhase) {
                                 triggerMoonSpin(1080f)
                             }
-                            triggerSquishPop(cardCenterInWindow)
+                            triggerSquishPop(cardCenterHolder.value)
                             coroutineScope.launch {
                                 squishScaleX.snapTo(0.82f)
                                 squishScaleY.snapTo(1.18f)

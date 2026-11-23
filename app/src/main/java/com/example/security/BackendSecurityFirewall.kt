@@ -50,24 +50,35 @@ object BackendSecurityFirewall {
     private val neutralizedThreatsCounter = AtomicInteger(0)
     private val rateWindowMap = ConcurrentHashMap<String, MutableList<Long>>()
 
-    private val SQL_XSS_PATTERNS = listOf(
-        "DROP TABLE",
-        "DELETE FROM",
-        "UNION SELECT",
-        "INSERT INTO",
-        "UPDATE user_profile",
-        "ALTER TABLE",
-        "<script",
-        "javascript:",
-        "onerror=",
-        "onload=",
-        "../",
-        "..\\",
-        "\u0000"
+    private val SQL_XSS_REGEXES = listOf(
+        Regex("\\bDROP\\s+TABLE\\b", RegexOption.IGNORE_CASE),
+        Regex("\\bDELETE\\s+FROM\\b", RegexOption.IGNORE_CASE),
+        Regex("\\bUNION\\s+(?:ALL\\s+)?SELECT\\b", RegexOption.IGNORE_CASE),
+        Regex("\\bINSERT\\s+INTO\\b", RegexOption.IGNORE_CASE),
+        Regex("\\bALTER\\s+TABLE\\b", RegexOption.IGNORE_CASE),
+        Regex("\\bUPDATE\\s+[A-Za-z_][A-Za-z0-9_]*\\s+SET\\b", RegexOption.IGNORE_CASE),
+        Regex(";\\s*--"),
+        Regex("/\\*[\\s\\S]*?\\*/"),
+        Regex("<\\s*script\\b", RegexOption.IGNORE_CASE),
+        Regex("</\\s*script\\s*>", RegexOption.IGNORE_CASE),
+        Regex("<\\s*iframe\\b", RegexOption.IGNORE_CASE),
+        Regex("<\\s*svg\\b", RegexOption.IGNORE_CASE),
+        Regex("<\\s*object\\b", RegexOption.IGNORE_CASE),
+        Regex("<\\s*embed\\b", RegexOption.IGNORE_CASE),
+        Regex("javascript\\s*:", RegexOption.IGNORE_CASE),
+        Regex("vbscript\\s*:", RegexOption.IGNORE_CASE),
+        Regex("data\\s*:\\s*text/html", RegexOption.IGNORE_CASE),
+        Regex("\\bon[a-z]{2,20}\\s*=", RegexOption.IGNORE_CASE),
+        Regex("\\.\\.[/\\\\]"),
+        Regex("file\\s*://", RegexOption.IGNORE_CASE),
+        Regex("content\\s*://", RegexOption.IGNORE_CASE)
     )
 
+    private val CONTROL_AND_BIDI_REGEX = Regex("[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F\\u202A-\\u202E\\u2066-\\u2069]")
+    private const val MAX_RATE_BUCKETS = 256
+
     private val ALLOWED_NAV_TARGETS = setOf(
-        "CYCLE", "PERIODS", "SHOPPING", "WATER", "NOTES", "MEDICATIONS"
+        "CYCLE", "PERIODS", "SHOPPING", "WATER", "NOTES", "MEDICATIONS", "PLAY"
     )
 
     private val ALLOWED_RECEIVER_ACTIONS = setOf(
@@ -92,18 +103,21 @@ object BackendSecurityFirewall {
 
     /**
      * Firewall Layer 1: Deep Packet & Field Inspection (DPI) Sanitizer.
-     * Neutralizes SQL injection, XSS, path traversal, and null/control characters before any DB write.
+     * Neutralizes SQL injection, XSS, path traversal, Unicode bidi overrides, and null/control characters
+     * before any DB write or notification render.
      */
     fun sanitizeField(raw: String, maxLength: Int = 1000): String {
         inspectedOpsCounter.incrementAndGet()
-        var cleaned = raw.replace("\u0000", "")
-            .replace(Regex("[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F]"), "")
-            .trim()
+        val stripped = CONTROL_AND_BIDI_REGEX.replace(raw, "")
+        if (stripped.length != raw.length) {
+            neutralizedThreatsCounter.incrementAndGet()
+        }
+        var cleaned = stripped.trim()
 
-        for (pattern in SQL_XSS_PATTERNS) {
-            if (cleaned.contains(pattern, ignoreCase = true)) {
+        for (regex in SQL_XSS_REGEXES) {
+            if (regex.containsMatchIn(cleaned)) {
                 neutralizedThreatsCounter.incrementAndGet()
-                cleaned = cleaned.replace(Regex(Regex.escape(pattern), RegexOption.IGNORE_CASE), "[REDACTED]")
+                cleaned = regex.replace(cleaned, "[REDACTED]")
             }
         }
         return cleaned.take(maxLength)
@@ -153,7 +167,8 @@ object BackendSecurityFirewall {
             waterIntervalHours = profile.waterIntervalHours.coerceIn(1, 12),
             shopViewMode = if (profile.shopViewMode in setOf("COZY", "COMPACT")) profile.shopViewMode else "COZY",
             shopSortMode = if (profile.shopSortMode in setOf("CUSTOM", "STATUS", "PRIORITY", "ALPHA")) profile.shopSortMode else "CUSTOM",
-            activeCoupleCode = cleanCode
+            activeCoupleCode = cleanCode,
+            userGender = if (profile.userGender.equals("MALE", ignoreCase = true)) "MALE" else "FEMALE"
         )
     }
 
@@ -241,18 +256,29 @@ object BackendSecurityFirewall {
             coupleCode = cleanCode,
             myName = sanitizeField(room.myName, maxLength = 32),
             partnerName = sanitizeField(room.partnerName, maxLength = 32),
+            pendingPartnerName = sanitizeField(room.pendingPartnerName, maxLength = 32),
             spiceLevel = if (room.spiceLevel in setOf("SWEET", "FLIRTY", "BOLD")) room.spiceLevel else "FLIRTY",
             doodlePrompt = sanitizeField(room.doodlePrompt, maxLength = 160),
-            lastFirewallEvent = sanitizeField(room.lastFirewallEvent, maxLength = 160)
+            lastFirewallEvent = sanitizeField(room.lastFirewallEvent, maxLength = 160),
+            lastSentCycleSyncFingerprint = sanitizeField(room.lastSentCycleSyncFingerprint, maxLength = 160)
         )
     }
 
     /**
-     * Firewall Layer 4: Sliding-Window Rate Limiter & Flood Shield.
+     * Firewall Layer 4: Sliding-Window Rate Limiter & Flood Shield (bounded memory).
      */
     fun allowRateLimitedOperation(operationKey: String, maxOpsPerWindow: Int = 60, windowMillis: Long = 10_000L): Boolean {
         val now = System.currentTimeMillis()
-        val timestamps = rateWindowMap.getOrPut(operationKey) { mutableListOf() }
+        if (rateWindowMap.size > MAX_RATE_BUCKETS) {
+            rateWindowMap.entries.removeIf { (_, list) ->
+                synchronized(list) {
+                    list.removeAll { now - it > windowMillis }
+                    list.isEmpty()
+                }
+            }
+        }
+        val cleanKey = operationKey.take(96)
+        val timestamps = rateWindowMap.getOrPut(cleanKey) { mutableListOf() }
         synchronized(timestamps) {
             timestamps.removeAll { now - it > windowMillis }
             if (timestamps.size >= maxOpsPerWindow) {

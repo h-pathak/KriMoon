@@ -119,6 +119,18 @@ fun Modifier.cute3DCard(
                 var pressOrigin = Offset.Zero
                 var releasedForScroll = false
                 var tiltActive = false
+                var animJob: kotlinx.coroutines.Job? = null
+
+                fun animateReset() {
+                    animJob?.cancel()
+                    animJob = scope.launch {
+                        launch { rotX.animateTo(0f, tiltSpring) }
+                        launch { rotY.animateTo(0f, tiltSpring) }
+                        launch { pressScale.animateTo(1f, scaleSpring) }
+                        sheenAlpha.animateTo(0f, tween(180, easing = FastOutSlowInEasing))
+                    }
+                }
+
                 while (true) {
                     val event = awaitPointerEvent(PointerEventPass.Initial)
                     val change = event.changes.firstOrNull() ?: continue
@@ -138,39 +150,43 @@ fun Modifier.cute3DCard(
                             val tx = -normY * safeMaxTilt
                             val ty = normX * safeMaxTilt
                             val targetScale = if (onClick != null) 0.968f else 0.988f
-                            scope.launch { rotX.animateTo(tx, tiltSpring) }
-                            scope.launch { rotY.animateTo(ty, tiltSpring) }
-                            scope.launch { pressScale.animateTo(targetScale, scaleSpring) }
-                            scope.launch { sheenAlpha.animateTo(0.20f, tween(180, easing = FastOutSlowInEasing)) }
+                            animJob?.cancel()
+                            animJob = scope.launch {
+                                launch { rotX.animateTo(tx, tiltSpring) }
+                                launch { rotY.animateTo(ty, tiltSpring) }
+                                launch { pressScale.animateTo(targetScale, scaleSpring) }
+                                sheenAlpha.animateTo(0.20f, tween(180, easing = FastOutSlowInEasing))
+                            }
                         }
                         event.type == PointerEventType.Move && hasPressed -> {
                             val dy = abs(pos.y - pressOrigin.y)
                             val dx = abs(pos.x - pressOrigin.x)
                             // Immediately flatten tilt if the user starts scrolling so scrolling stays locked 60/120fps
-                            if (dy > 16f && dy > dx * 1.1f) {
+                            if (dy > 14f && dy > dx * 1.05f) {
                                 if (!releasedForScroll) {
                                     releasedForScroll = true
                                     tiltActive = false
-                                    scope.launch { rotX.animateTo(0f, tiltSpring) }
-                                    scope.launch { rotY.animateTo(0f, tiltSpring) }
-                                    scope.launch { pressScale.animateTo(1f, scaleSpring) }
-                                    scope.launch { sheenAlpha.animateTo(0f, tween(150)) }
+                                    animateReset()
                                 }
                             } else if (!releasedForScroll && tiltActive) {
                                 touchRef.offset = pos
                                 val normX = ((pos.x / w) - 0.5f).coerceIn(-0.5f, 0.5f) * 2f
                                 val normY = ((pos.y / h) - 0.5f).coerceIn(-0.5f, 0.5f) * 2f
-                                scope.launch { rotX.snapTo(-normY * safeMaxTilt) }
-                                scope.launch { rotY.snapTo(normX * safeMaxTilt) }
+                                val tx = -normY * safeMaxTilt
+                                val ty = normX * safeMaxTilt
+                                if (abs(tx - rotX.value) > 0.25f || abs(ty - rotY.value) > 0.25f) {
+                                    animJob?.cancel()
+                                    animJob = scope.launch {
+                                        rotX.snapTo(tx)
+                                        rotY.snapTo(ty)
+                                    }
+                                }
                             }
                         }
                         !hasPressed || event.type == PointerEventType.Release || event.type == PointerEventType.Exit -> {
                             if (tiltActive) {
                                 tiltActive = false
-                                scope.launch { rotX.animateTo(0f, tiltSpring) }
-                                scope.launch { rotY.animateTo(0f, tiltSpring) }
-                                scope.launch { pressScale.animateTo(1f, scaleSpring) }
-                                scope.launch { sheenAlpha.animateTo(0f, tween(200, easing = FastOutSlowInEasing)) }
+                                animateReset()
                             }
                         }
                     }
@@ -737,8 +753,13 @@ fun CuteQuickActionBubble(
         color = MaterialTheme.colorScheme.surface,
         border = BorderStroke(1.2.dp, glowColor.copy(alpha = 0.4f)),
         modifier = modifier
-            .cute3DCard(maxTilt = 3f, cornerRadius = 20.dp, shadowColor = glowColor.copy(alpha = 0.22f))
-            .cuteBouncyClick(accentColor = glowColor, onClick = onClick)
+            .cute3DCard(
+                maxTilt = 3f,
+                cornerRadius = 20.dp,
+                shadowColor = glowColor.copy(alpha = 0.22f),
+                accentColor = glowColor,
+                onClick = onClick
+            )
             .testTag(testTag)
     ) {
         Box(

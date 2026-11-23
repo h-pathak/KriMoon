@@ -247,14 +247,14 @@ fun PeriodsScreen(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Period & Cycle Tracker",
+                        text = "Period & Cycle Tracker 🌙",
                         style = MaterialTheme.typography.headlineSmall.copy(
                             fontWeight = FontWeight.Bold
                         ),
                         color = MaterialTheme.colorScheme.onBackground
                     )
                     Text(
-                        text = "Visual phase calendar with cycle insights.",
+                        text = "Dreamy lunar phase calendar & gentle cycle insights ✨",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -266,11 +266,21 @@ fun PeriodsScreen(
                     onClick = onOpenSettings,
                     modifier = Modifier.testTag("edit_cycle_settings_button")
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Edit,
-                        contentDescription = "Edit Settings",
-                        tint = MaterialTheme.colorScheme.primary
-                    )
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .background(PhasesRose.copy(alpha = 0.12f))
+                            .border(1.dp, PhasesRose.copy(alpha = 0.25f), CircleShape)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Edit,
+                            contentDescription = "Edit Settings",
+                            tint = PhasesPlum,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
                 }
             }
         }

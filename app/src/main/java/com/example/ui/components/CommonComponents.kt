@@ -30,12 +30,16 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.EditNote
 import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.SportsEsports
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.EditNote
 import androidx.compose.material.icons.outlined.FavoriteBorder
+import androidx.compose.material.icons.outlined.Groups
+import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.SportsEsports
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -81,11 +85,20 @@ import androidx.compose.ui.unit.sp
 import com.example.model.CyclePhase
 import com.example.model.CycleStatus
 import com.example.ui.theme.EditorialDisplayFont
+import com.example.ui.theme.MaleBorder
+import com.example.ui.theme.MaleCobalt
+import com.example.ui.theme.MaleInk
+import com.example.ui.theme.MaleInkMuted
+import com.example.ui.theme.MaleObsidian
+import com.example.ui.theme.MaleSky
+import com.example.ui.theme.MaleSurface
+import com.example.ui.theme.MaleSurfaceElevated
 import com.example.ui.theme.PhasesInk
 import com.example.ui.theme.PhasesInkSoft
 import com.example.ui.theme.PhasesLine
 import com.example.ui.theme.PhasesPlum
 import com.example.ui.theme.PhasesRose
+import com.example.viewmodel.MaleNavScreen
 import com.example.viewmodel.NavScreen
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -99,7 +112,20 @@ fun PhasesTopBar(
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Column(modifier = modifier.fillMaxWidth()) {
+    val showLunarCrest = title == "KriMoon"
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(
+                Brush.horizontalGradient(
+                    colors = listOf(
+                        PhasesRose.copy(alpha = 0.08f),
+                        MaterialTheme.colorScheme.background,
+                        PhasesPlum.copy(alpha = 0.07f)
+                    )
+                )
+            )
+    ) {
         TopAppBar(
             title = {
                 Row(
@@ -121,22 +147,23 @@ fun PhasesTopBar(
                             overflow = TextOverflow.Ellipsis,
                             color = MaterialTheme.colorScheme.onBackground
                         )
-                        Spacer(modifier = Modifier.width(5.dp))
-                        Text(
-                            text = "☽",
-                            color = PhasesRose,
-                            fontSize = 14.sp
-                        )
+                        if (showLunarCrest) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "🌙✨",
+                                fontSize = 15.sp
+                            )
+                        }
                     }
                     if (!subtitle.isNullOrBlank()) {
                         Surface(
                             shape = RoundedCornerShape(100.dp),
-                            color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
-                            border = BorderStroke(1.dp, PhasesRose.copy(alpha = 0.22f))
+                            color = PhasesRose.copy(alpha = 0.13f),
+                            border = BorderStroke(1.dp, PhasesRose.copy(alpha = 0.28f))
                         ) {
                             Text(
                                 text = subtitle,
-                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                                 color = MaterialTheme.colorScheme.onSecondaryContainer,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
@@ -156,20 +183,30 @@ fun PhasesTopBar(
                     },
                     modifier = Modifier.testTag("settings_button")
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Settings,
-                        contentDescription = "Settings",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .background(PhasesRose.copy(alpha = 0.12f))
+                            .border(1.dp, PhasesRose.copy(alpha = 0.25f), CircleShape)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Settings,
+                            contentDescription = "Settings",
+                            tint = PhasesPlum,
+                            modifier = Modifier.size(19.dp)
+                        )
+                    }
                 }
             },
             colors = TopAppBarDefaults.topAppBarColors(
-                containerColor = MaterialTheme.colorScheme.background.copy(alpha = 0.96f)
+                containerColor = Color.Transparent
             )
         )
         HorizontalDivider(
-            thickness = 0.5.dp,
-            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.65f)
+            thickness = 0.8.dp,
+            color = PhasesRose.copy(alpha = 0.18f)
         )
     }
 }
@@ -185,8 +222,8 @@ fun PhasesBottomNav(
 
     Column(modifier = modifier.fillMaxWidth()) {
         HorizontalDivider(
-            thickness = 0.5.dp,
-            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)
+            thickness = 0.8.dp,
+            color = PhasesRose.copy(alpha = 0.22f)
         )
         NavigationBar(
             containerColor = MaterialTheme.colorScheme.surface,
@@ -195,19 +232,189 @@ fun PhasesBottomNav(
             NavScreen.entries.forEach { screen ->
                 val isSelected = currentScreen == screen
                 val scale by animateFloatAsState(
-                    targetValue = if (isSelected) 1.08f else 1.0f,
+                    targetValue = if (isSelected) 1.18f else 0.96f,
                     animationSpec = spring(
                         dampingRatio = Spring.DampingRatioMediumBouncy,
                         stiffness = Spring.StiffnessMedium
                     ),
                     label = "nav_scale"
                 )
-                val navIcon = when (screen) {
-                    NavScreen.CYCLE -> if (isSelected) Icons.Filled.AutoAwesome else Icons.Outlined.AutoAwesome
-                    NavScreen.PERIODS -> if (isSelected) Icons.Filled.CalendarMonth else Icons.Outlined.CalendarMonth
-                    NavScreen.CARE -> if (isSelected) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder
-                    NavScreen.NOTES -> if (isSelected) Icons.Filled.EditNote else Icons.Outlined.EditNote
-                    NavScreen.PLAY -> if (isSelected) Icons.Filled.SportsEsports else Icons.Outlined.SportsEsports
+                val wiggleDeg by animateFloatAsState(
+                    targetValue = if (isSelected) -6f else 0f,
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioLowBouncy,
+                        stiffness = Spring.StiffnessMediumLow
+                    ),
+                    label = "nav_wiggle"
+                )
+                val navEmoji = when (screen) {
+                    NavScreen.CYCLE -> if (isSelected) "🌸" else "🌷"
+                    NavScreen.PERIODS -> if (isSelected) "🌙" else "🗓️"
+                    NavScreen.CARE -> if (isSelected) "🫧" else "💧"
+                    NavScreen.NOTES -> if (isSelected) "💌" else "📝"
+                    NavScreen.PLAY -> if (isSelected) "🎀" else "🕹️"
+                }
+
+                NavigationBarItem(
+                    selected = isSelected,
+                    onClick = {
+                        AestheticHaptics.softTick(context, haptic)
+                        onScreenSelected(screen)
+                    },
+                    icon = {
+                        Text(
+                            text = navEmoji,
+                            fontSize = 20.sp,
+                            modifier = Modifier.graphicsLayer {
+                                scaleX = scale
+                                scaleY = scale
+                                rotationZ = wiggleDeg
+                                alpha = if (isSelected) 1f else 0.78f
+                            }
+                        )
+                    },
+                    label = {
+                        Text(
+                            text = screen.label,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontSize = 11.sp,
+                                fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.Medium
+                            )
+                        )
+                    },
+                    colors = NavigationBarItemDefaults.colors(
+                        indicatorColor = PhasesRose.copy(alpha = 0.18f),
+                        selectedIconColor = MaterialTheme.colorScheme.primary,
+                        selectedTextColor = PhasesRose,
+                        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+                    ),
+                    modifier = Modifier.testTag("nav_${screen.name.lowercase()}")
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MaleTopBar(
+    title: String,
+    subtitle: String? = null,
+    onOpenSettings: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(MaleObsidian)
+    ) {
+        TopAppBar(
+            title = {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.titleLarge.copy(
+                            fontWeight = FontWeight.ExtraBold,
+                            letterSpacing = (-0.3).sp
+                        ),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        color = MaleInk,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    if (!subtitle.isNullOrBlank()) {
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaleCobalt.copy(alpha = 0.18f),
+                            border = BorderStroke(1.dp, MaleCobalt.copy(alpha = 0.4f))
+                        ) {
+                            Text(
+                                text = subtitle,
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    letterSpacing = 0.3.sp
+                                ),
+                                color = MaleSky,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                }
+            },
+            actions = {
+                val ctx = LocalContext.current
+                val topHaptic = LocalHapticFeedback.current
+                IconButton(
+                    onClick = {
+                        AestheticHaptics.softTick(ctx, topHaptic)
+                        onOpenSettings()
+                    },
+                    modifier = Modifier
+                        .size(48.dp)
+                        .testTag("settings_button")
+                ) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(MaleSurfaceElevated)
+                            .border(1.dp, MaleBorder, RoundedCornerShape(10.dp))
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Settings,
+                            contentDescription = "Settings",
+                            tint = MaleSky,
+                            modifier = Modifier.size(19.dp)
+                        )
+                    }
+                }
+            },
+            colors = TopAppBarDefaults.topAppBarColors(
+                containerColor = Color.Transparent
+            )
+        )
+        HorizontalDivider(
+            thickness = 1.dp,
+            color = MaleBorder
+        )
+    }
+}
+
+@Composable
+fun MaleBottomNav(
+    currentScreen: MaleNavScreen,
+    onScreenSelected: (MaleNavScreen) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
+
+    Column(modifier = modifier.fillMaxWidth()) {
+        HorizontalDivider(
+            thickness = 1.dp,
+            color = MaleBorder
+        )
+        NavigationBar(
+            containerColor = MaleSurface,
+            tonalElevation = 0.dp
+        ) {
+            MaleNavScreen.entries.forEach { screen ->
+                val isSelected = currentScreen == screen
+                val icon = when (screen) {
+                    MaleNavScreen.PARTNER_CARE -> if (isSelected) Icons.Filled.Shield else Icons.Outlined.Shield
+                    MaleNavScreen.ARCADE -> if (isSelected) Icons.Filled.SportsEsports else Icons.Outlined.SportsEsports
+                    MaleNavScreen.LOUNGE -> if (isSelected) Icons.Filled.Groups else Icons.Outlined.Groups
                 }
 
                 NavigationBarItem(
@@ -218,14 +425,9 @@ fun PhasesBottomNav(
                     },
                     icon = {
                         Icon(
-                            imageVector = navIcon,
+                            imageVector = icon,
                             contentDescription = screen.label,
-                            modifier = Modifier
-                                .size(22.dp)
-                                .graphicsLayer {
-                                    scaleX = scale
-                                    scaleY = scale
-                                }
+                            modifier = Modifier.size(22.dp)
                         )
                     },
                     label = {
@@ -241,13 +443,13 @@ fun PhasesBottomNav(
                         )
                     },
                     colors = NavigationBarItemDefaults.colors(
-                        indicatorColor = MaterialTheme.colorScheme.primaryContainer,
-                        selectedIconColor = MaterialTheme.colorScheme.primary,
-                        selectedTextColor = MaterialTheme.colorScheme.primary,
-                        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+                        indicatorColor = MaleCobalt.copy(alpha = 0.22f),
+                        selectedIconColor = MaleSky,
+                        selectedTextColor = MaleSky,
+                        unselectedIconColor = MaleInkMuted,
+                        unselectedTextColor = MaleInkMuted
                     ),
-                    modifier = Modifier.testTag("nav_${screen.name.lowercase()}")
+                    modifier = Modifier.testTag("male_nav_${screen.name.lowercase()}")
                 )
             }
         }
@@ -442,17 +644,24 @@ fun CycleProgressGauge(
     }
 }
 
+private val friendlyDateFormat = ThreadLocal.withInitial {
+    SimpleDateFormat("MMM d, yyyy", Locale.getDefault())
+}
+private val shortDateFormat = ThreadLocal.withInitial {
+    SimpleDateFormat("MMM d", Locale.getDefault())
+}
+private val dayOfWeekDateFormat = ThreadLocal.withInitial {
+    SimpleDateFormat("EEEE, MMMM d", Locale.getDefault())
+}
+
 fun formatFriendlyDate(millis: Long): String {
-    val sdf = SimpleDateFormat("MMM d, yyyy", Locale.getDefault())
-    return sdf.format(Date(millis))
+    return friendlyDateFormat.get()?.format(Date(millis)) ?: ""
 }
 
 fun formatShortDate(millis: Long): String {
-    val sdf = SimpleDateFormat("MMM d", Locale.getDefault())
-    return sdf.format(Date(millis))
+    return shortDateFormat.get()?.format(Date(millis)) ?: ""
 }
 
 fun formatDayOfWeekDate(millis: Long): String {
-    val sdf = SimpleDateFormat("EEEE, MMMM d", Locale.getDefault())
-    return sdf.format(Date(millis))
+    return dayOfWeekDateFormat.get()?.format(Date(millis)) ?: ""
 }

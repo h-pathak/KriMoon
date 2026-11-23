@@ -86,7 +86,7 @@ import com.example.notifications.NotificationHelper
 import com.example.notifications.SoundHelper
 import com.example.ui.components.CuteAddButton
 import com.example.ui.components.CuteAddFab
-import com.example.ui.components.FloatingPetalsBackground
+import com.example.ui.components.OffsetHolder
 import com.example.ui.components.LocalParticleController
 import com.example.ui.components.cute3DCard
 import com.example.ui.theme.PhasesLavender
@@ -148,8 +148,6 @@ fun MedicationsScreen(
     val progress = if (totalActive > 0) (takenCount.toFloat() / totalActive.toFloat()).coerceIn(0f, 1f) else 0f
 
     Box(modifier = modifier.fillMaxSize()) {
-        FloatingPetalsBackground()
-
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -354,7 +352,7 @@ fun MedicationsScreen(
             } else {
                 items(medications, key = { it.id }) { med ->
                     val isTakenToday = med.lastTakenDate == todayDateStr
-                    var cardCenter by remember { mutableStateOf(Offset.Zero) }
+                    val cardCenterHolder = remember { OffsetHolder() }
 
                     MedicationCard(
                         medication = med,
@@ -365,9 +363,10 @@ fun MedicationsScreen(
                                 SoundHelper.playCelebration(context)
                             }
                             onMarkTaken(med.id)
+                            val center = cardCenterHolder.value
                             particleController.spawn(
-                                centerX = if (cardCenter != Offset.Zero) cardCenter.x else 500f,
-                                centerY = if (cardCenter != Offset.Zero) cardCenter.y else 600f,
+                                centerX = if (center != Offset.Zero) center.x else 500f,
+                                centerY = if (center != Offset.Zero) center.y else 600f,
                                 emojis = listOf(med.categoryEmoji, "✨", "🌸", "💖", "🫧"),
                                 count = 16
                             )
@@ -399,7 +398,7 @@ fun MedicationsScreen(
                         modifier = Modifier
                             .cute3DCard(maxTilt = 2f, cornerRadius = 18.dp)
                             .onGloballyPositioned { coordinates ->
-                                cardCenter = coordinates.positionInRoot()
+                                cardCenterHolder.value = coordinates.positionInRoot()
                             }
                             .testTag("medication_card_${med.id}")
                     )

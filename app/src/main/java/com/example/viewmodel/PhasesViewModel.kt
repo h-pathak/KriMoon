@@ -32,11 +32,13 @@ import com.example.model.CycleCalculator
 import com.example.model.CycleHistoryItem
 import com.example.model.CycleStatus
 import com.example.model.DecodedTurnPacket
+import com.example.model.PartnerCycleSyncSnapshot
 import com.example.model.PeriodAnomalyAnalysis
 import com.example.model.PeriodAnomalyDetector
 import com.example.model.RoundSyncState
 import com.example.model.SpiceLevel
 import com.example.model.TicTacToeSyncState
+import com.example.model.UserGender
 import com.example.notifications.NotificationHelper
 import com.example.security.LocalVaultCrypto
 import com.example.security.LocalVaultUnavailableException
@@ -58,6 +60,7 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -76,6 +79,10 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
 
     val userProfile: StateFlow<UserProfile?> = repository.userProfile
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
+    val isProfileLoaded: StateFlow<Boolean> = repository.userProfile
+        .map { true }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
     val periodLogs: StateFlow<List<PeriodLog>> = repository.periodLogs
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -169,6 +176,8 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
     private val sentBlockHashes: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
     private val processedBlockHashes: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
     private val rebroadcastedCodes: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
+    @Volatile
+    private var lastDispatchedCycleSyncKey: String = ""
 
     private fun getCloudRepoOrNull(): CoupleCloudRepository? {
         cachedCloudRepo?.let { return it }
@@ -177,7 +186,7 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
             ?.also { cachedCloudRepo = it }
     }
 
-    // Derived Cycle Status
+    // Derived Cycle Status (computed strictly off Main thread)
     val cycleStatus: StateFlow<CycleStatus> = combine(
         periodLogs,
         userProfile
@@ -189,25 +198,29 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
             defaultCycleLength = cycleLen,
             defaultPeriodLength = periodLen
         )
-    }.stateIn(
-        viewModelScope,
-        SharingStarted.WhileSubscribed(5000),
-        CycleCalculator.compute(emptyList())
-    )
+    }
+        .flowOn(Dispatchers.Default)
+        .stateIn(
+            viewModelScope,
+            SharingStarted.WhileSubscribed(5000),
+            CycleCalculator.compute(emptyList())
+        )
 
-    // Derived Period History Items with Anomaly Detection
+    // Derived Period History Items with Anomaly Detection (computed strictly off Main thread)
     val historyItems: StateFlow<List<CycleHistoryItem>> = periodLogs
         .combine(userProfile) { periods, profile ->
             val cycleLen = profile?.cycleLength ?: 28
             val periodLen = profile?.periodLength ?: 5
             CycleCalculator.buildHistoryItems(periods, cycleLen, periodLen)
-        }.stateIn(
+        }
+        .flowOn(Dispatchers.Default)
+        .stateIn(
             viewModelScope,
             SharingStarted.WhileSubscribed(5000),
             emptyList()
         )
 
-    // Statistical Anomaly Detection & Prediction Analysis Flow
+    // Statistical Anomaly Detection & Prediction Analysis Flow (computed strictly off Main thread)
     val periodAnomalyAnalysis: StateFlow<PeriodAnomalyAnalysis> = periodLogs
         .combine(userProfile) { periods, profile ->
             val cycleLen = profile?.cycleLength ?: 28
@@ -217,7 +230,9 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                 defaultCycleLength = cycleLen,
                 defaultPeriodLength = periodLen
             )
-        }.stateIn(
+        }
+        .flowOn(Dispatchers.Default)
+        .stateIn(
             viewModelScope,
             SharingStarted.WhileSubscribed(5000),
             PeriodAnomalyDetector.analyze(emptyList())
@@ -225,6 +240,9 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _currentScreen = MutableStateFlow(NavScreen.CYCLE)
     val currentScreen = _currentScreen.asStateFlow()
+
+    private val _currentMaleScreen = MutableStateFlow(MaleNavScreen.PARTNER_CARE)
+    val currentMaleScreen = _currentMaleScreen.asStateFlow()
 
     private val _activeCareTab = MutableStateFlow(CareTab.WATER)
     val activeCareTab = _activeCareTab.asStateFlow()
@@ -249,7 +267,7 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
     val periodsTabName = _periodsTabName.asStateFlow()
 
     init {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             if (LocalVaultCrypto.canSafelyWrite()) {
                 runCatching {
                     repository.checkAndSeedUserProfileIfEmpty()
@@ -260,10 +278,59 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                 }
             }
         }
+
+        // Live E2EE Cycle Sync Broadcaster: whenever a Female user is live-connected in a Couple Room,
+        // automatically push an encrypted HANDSHAKE snapshot whenever her cycle phase/day/status changes
+        // so her Male partner's Page 1 stays live-synced in real time.
+        viewModelScope.launch(Dispatchers.Default) {
+            combine(
+                userProfile,
+                cycleStatus,
+                activeCoupleRoom,
+                cloudAuthUid
+            ) { profile, status, room, uid ->
+                if (profile == null ||
+                    !profile.isOnboarded ||
+                    UserGender.fromStorage(profile.userGender) != UserGender.FEMALE ||
+                    room == null ||
+                    room.isPassAndPlay ||
+                    room.approvalStatus != "CONNECTED" ||
+                    room.ecdhSharedSecretB64.isBlank() ||
+                    uid.isNullOrBlank()
+                ) {
+                    null
+                } else {
+                    val snapshot = PartnerCycleSyncSnapshot.fromCycleStatus(
+                        partnerName = profile.name.ifBlank { room.myName },
+                        status = status
+                    )
+                    Triple(room.coupleCode, snapshot, room.lastSentCycleSyncFingerprint)
+                }
+            }
+                .distinctUntilChanged { a, b ->
+                    a?.first == b?.first &&
+                        a?.second?.fingerprint() == b?.second?.fingerprint() &&
+                        a?.third == b?.third
+                }
+                .collectLatest { payload ->
+                    if (payload == null) return@collectLatest
+                    val (code, snapshot, savedFp) = payload
+                    val fp = snapshot.fingerprint()
+                    val dispatchKey = "$code|$fp"
+                    if (fp == savedFp || dispatchKey == lastDispatchedCycleSyncKey) return@collectLatest
+                    // Brief debounce so rapid edits (e.g., logging & editing period) coalesce into 1 encrypted block
+                    delay(450L)
+                    pushEncryptedCycleSyncToPartner(code, snapshot)
+                }
+        }
     }
 
     fun setScreen(screen: NavScreen) {
         _currentScreen.value = screen
+    }
+
+    fun setMaleScreen(screen: MaleNavScreen) {
+        _currentMaleScreen.value = screen
     }
 
     fun setCareTab(tab: CareTab) {
@@ -298,33 +365,132 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         _periodsTabName.value = tab
     }
 
-    fun completeOnboarding(name: String, lastPeriodStartMillis: Long, cycleLength: Int, periodLength: Int) {
+    fun completeOnboarding(
+        name: String,
+        gender: String = UserGender.FEMALE.storageValue,
+        lastPeriodStartMillis: Long = System.currentTimeMillis(),
+        cycleLength: Int = 28,
+        periodLength: Int = 5
+    ) {
         viewModelScope.launch {
+            val normalizedGender = UserGender.fromStorage(gender)
+            val isMale = normalizedGender == UserGender.MALE
             val profile = UserProfile(
                 id = 1,
                 name = name.trim(),
-                cycleLength = cycleLength,
-                periodLength = periodLength,
-                waterRemindersEnabled = true,
-                cycleRemindersEnabled = true,
-                fertileRemindersEnabled = true,
-                checkinRemindersEnabled = true,
-                shopRemindersEnabled = true,
-                isOnboarded = true
+                cycleLength = cycleLength.coerceIn(18, 60),
+                periodLength = periodLength.coerceIn(2, 14),
+                waterRemindersEnabled = !isMale,
+                cycleRemindersEnabled = !isMale,
+                fertileRemindersEnabled = !isMale,
+                checkinRemindersEnabled = !isMale,
+                shopRemindersEnabled = !isMale,
+                isOnboarded = true,
+                userGender = normalizedGender.storageValue
             )
             repository.saveProfile(profile)
-            repository.logPeriod(startDateMillis = lastPeriodStartMillis, notes = "Initial period")
-            
-            // Schedule notifications
             com.example.notifications.NotificationHelper.createNotificationChannels(getApplication())
-            com.example.notifications.NotificationHelper.scheduleAllReminders(
-                getApplication(),
-                profile,
-                cycleStatus.value,
-                medications.value
-            )
 
-            showFeedback("Welcome to KriMoon, ${name.ifBlank { "dear" }}! 🌸")
+            if (isMale) {
+                _currentMaleScreen.value = MaleNavScreen.PARTNER_CARE
+                showFeedback("Welcome, ${name.ifBlank { "there" }}.")
+            } else {
+                repository.logPeriod(startDateMillis = lastPeriodStartMillis, notes = "Initial period")
+                com.example.notifications.NotificationHelper.scheduleAllReminders(
+                    getApplication(),
+                    profile,
+                    cycleStatus.value,
+                    medications.value
+                )
+                _currentScreen.value = NavScreen.CYCLE
+                showFeedback("Welcome to KriMoon, ${name.ifBlank { "dear" }}! 🌸")
+            }
+        }
+    }
+
+    fun setUserGender(gender: String) {
+        viewModelScope.launch {
+            val normalized = UserGender.fromStorage(gender)
+            val current = userProfile.value ?: UserProfile(id = 1, isOnboarded = true)
+            if (UserGender.fromStorage(current.userGender) == normalized) return@launch
+            val updated = current.copy(
+                userGender = normalized.storageValue,
+                isOnboarded = true
+            )
+            repository.saveProfile(updated)
+            if (normalized == UserGender.MALE) {
+                _currentMaleScreen.value = MaleNavScreen.PARTNER_CARE
+                showFeedback("Switched to Male interface")
+            } else {
+                _currentScreen.value = NavScreen.CYCLE
+                lastDispatchedCycleSyncKey = ""
+                showFeedback("Switched to Female Cycle interface 🌸")
+            }
+        }
+    }
+
+    private suspend fun pushEncryptedCycleSyncToPartner(
+        coupleCode: String,
+        snapshot: PartnerCycleSyncSnapshot
+    ) {
+        if (!LocalVaultCrypto.canSafelyWrite()) return
+        val freshRoom = repository.getCoupleRoom(coupleCode) ?: return
+        if (freshRoom.isPassAndPlay ||
+            freshRoom.approvalStatus != "CONNECTED" ||
+            freshRoom.ecdhSharedSecretB64.isBlank()
+        ) {
+            return
+        }
+        val fp = snapshot.fingerprint()
+        val dispatchKey = "$coupleCode|$fp"
+        lastDispatchedCycleSyncKey = dispatchKey
+        val spice = runCatching { SpiceLevel.valueOf(freshRoom.spiceLevel) }.getOrDefault(SpiceLevel.FLIRTY)
+        val prevHash = freshRoom.lastBlockHash.ifBlank {
+            CoupleBlockchain.createDeterministicGenesisBlock(coupleCode).blockHash
+        }
+        val (packet, _) = withContext(Dispatchers.Default) {
+            CoupleTurnCodec.encodeBondHandshakeWithBlock(
+                coupleCode = coupleCode,
+                senderName = freshRoom.myName.ifBlank { snapshot.partnerName },
+                spiceLevel = spice,
+                previousHash = prevHash,
+                blockIndex = freshRoom.blockHeight.coerceAtLeast(1),
+                ecdhSharedSecretB64 = freshRoom.ecdhSharedSecretB64,
+                cycleSync = snapshot
+            )
+        }
+        CoupleTurnCodec.extractActivityIntent(
+            rawPacket = packet,
+            coupleCode = coupleCode,
+            ecdhSharedSecretB64 = freshRoom.ecdhSharedSecretB64
+        ).onSuccess { intent ->
+            coupleRoomMutex.withLock {
+                repository.getCoupleRoom(coupleCode)?.let { cur ->
+                    repository.saveCoupleRoom(cur.copy(lastSentCycleSyncFingerprint = fp))
+                }
+            }
+            enqueueAndDrainTurnIntent(coupleCode, intent, triggerCloudDrain = true)
+        }
+    }
+
+    fun forceSyncPartnerCycle() {
+        val room = activeCoupleRoom.value
+        val profile = userProfile.value
+        retryCloudSync()
+        if (room != null &&
+            !room.isPassAndPlay &&
+            room.approvalStatus == "CONNECTED" &&
+            room.ecdhSharedSecretB64.isNotBlank() &&
+            UserGender.fromStorage(profile?.userGender) == UserGender.FEMALE
+        ) {
+            viewModelScope.launch(Dispatchers.Default) {
+                lastDispatchedCycleSyncKey = ""
+                val snapshot = PartnerCycleSyncSnapshot.fromCycleStatus(
+                    partnerName = profile?.name?.ifBlank { room.myName } ?: room.myName,
+                    status = cycleStatus.value
+                )
+                pushEncryptedCycleSyncToPartner(room.coupleCode, snapshot)
+            }
         }
     }
 
@@ -1014,12 +1180,17 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
 
-        // 2. Coordinate real-time room & encrypted block listeners for whichever room is active
+        // 2. Coordinate real-time room & encrypted block listeners for whichever room is active.
+        // Includes ECDH key readiness so block decryption re-attaches immediately once shared secret derives.
         roomWatcherCoordinatorJob = viewModelScope.launch {
             activeCoupleRoom
                 .map { room ->
                     if (room == null || room.isPassAndPlay) null
-                    else Pair(room.coupleCode, room.approvalStatus == "PENDING_HOST_APPROVAL")
+                    else Triple(
+                        room.coupleCode,
+                        room.approvalStatus == "PENDING_HOST_APPROVAL",
+                        room.ecdhSharedSecretB64.isNotBlank()
+                    )
                 }
                 .distinctUntilChanged()
                 .collectLatest { state ->
@@ -1232,27 +1403,54 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                             attempt = 0
                             for (blk in blocks) {
                                 val hash = blk.blockHash
-                                if (hash.isBlank() || hash in processedBlockHashes || hash in sentBlockHashes) continue
+                                if (hash.isBlank() || hash in processedBlockHashes) continue
                                 val localRoom = repository.getCoupleRoom(coupleCode) ?: continue
                                 val existingLedger = CoupleBlockchain.ledgerFromJson(localRoom.blockchainLedgerJson)
                                 if (existingLedger.any { it.blockHash == hash }) {
                                     processedBlockHashes.add(hash)
                                     continue
                                 }
-                                // Ignore blocks originating from this exact authenticated UID
-                                // (V2 rules strictly prohibit self-join with duplicate UID, so senderUid == uid is authoritative even if display name changes)
-                                val isOwnBlock = blk.senderUid == uid
+                                // Keep local chain head aligned when our own previously sent cloud block replays (e.g. after reinstall/restart)
+                                val isOwnBlock = blk.senderUid == uid || hash in sentBlockHashes
                                 if (isOwnBlock) {
                                     processedBlockHashes.add(hash)
+                                    val blkIdx = blk.blockIndex.toInt()
+                                    if (blkIdx >= localRoom.blockHeight || blkIdx > localRoom.lastConfirmedCloudIndex) {
+                                        coupleRoomMutex.withLock {
+                                            repository.getCoupleRoom(coupleCode)?.let { fresh ->
+                                                val seenIds = CoupleTurnCodec.stringSetFromJson(fresh.seenClientTurnIdsJson).apply {
+                                                    if (blk.clientTurnId.isNotBlank()) add(blk.clientTurnId)
+                                                }
+                                                val seenH = CoupleTurnCodec.stringSetFromJson(fresh.seenReplayHashesJson).apply {
+                                                    add(hash)
+                                                }
+                                                repository.saveCoupleRoom(
+                                                    fresh.copy(
+                                                        lastBlockHash = if (blkIdx >= fresh.blockHeight) hash else fresh.lastBlockHash,
+                                                        blockHeight = maxOf(fresh.blockHeight, blkIdx + 1),
+                                                        lastConfirmedCloudIndex = maxOf(fresh.lastConfirmedCloudIndex, blkIdx),
+                                                        seenClientTurnIdsJson = CoupleTurnCodec.stringSetToJson(seenIds, maxSize = 512),
+                                                        seenReplayHashesJson = CoupleTurnCodec.stringSetToJson(seenH, maxSize = CoupleBlockchain.MAX_LOCAL_LEDGER_BLOCKS)
+                                                    )
+                                                )
+                                            }
+                                        }
+                                    }
                                     continue
                                 }
-                                processedBlockHashes.add(hash)
-                                applyTurnPacketToRoom(
+                                // Wait until ECDH shared secret finishes deriving before consuming partner v3 blocks
+                                if (localRoom.approvalStatus == "CONNECTED" && localRoom.ecdhSharedSecretB64.isBlank()) {
+                                    continue
+                                }
+                                val applied = applyTurnPacketToRoom(
                                     room = localRoom,
                                     rawPacket = blk.encryptedPacket,
                                     isAutoSync = true,
                                     fromCloudLive = true
                                 )
+                                if (applied) {
+                                    processedBlockHashes.add(hash)
+                                }
                             }
                         }
                     if (!failed) break
@@ -2351,9 +2549,9 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
         rawPacket: String,
         isAutoSync: Boolean,
         fromCloudLive: Boolean = false
-    ) {
-        coupleRoomMutex.withLock {
-            if (!LocalVaultCrypto.canSafelyWrite()) return@withLock
+    ): Boolean {
+        return coupleRoomMutex.withLock {
+            if (!LocalVaultCrypto.canSafelyWrite()) return@withLock false
             val freshRoom = repository.getCoupleRoom(room.coupleCode) ?: room
             val existingLedger = CoupleBlockchain.ledgerFromJson(freshRoom.blockchainLedgerJson)
                 .ifEmpty { listOf(CoupleBlockchain.createDeterministicGenesisBlock(freshRoom.coupleCode)) }
@@ -2368,7 +2566,7 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                     peekedHash in seenHashes ||
                     existingLedger.any { it.blockHash == peekedHash }
                 ) {
-                    return@withLock
+                    return@withLock true
                 }
             }
 
@@ -2377,7 +2575,10 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                 freshRoom.minProtocolVersion,
                 if (freshRoom.ecdhSharedSecretB64.isNotBlank()) CoupleTurnCodec.PROTOCOL_VERSION_ECDH_V3 else CoupleTurnCodec.PROTOCOL_VERSION_LEGACY_V2
             )
-            val minAcceptedIndex = if (fromCloudLive && freshRoom.lastConfirmedCloudIndex > 0) {
+            // For live cloud blocks, replay is prevented strictly by immutable Firestore block IDs + seenClientTurnIds + seenReplayHashes.
+            // Using minAcceptedIndex=0 for live cloud delivery prevents dropping a valid concurrent partner block (#N)
+            // when our own rebased outgoing block already advanced lastConfirmedCloudIndex to #(N+1).
+            val minAcceptedIndex = if (!fromCloudLive && freshRoom.lastConfirmedCloudIndex > 0) {
                 freshRoom.lastConfirmedCloudIndex + 1
             } else {
                 0
@@ -2398,6 +2599,7 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                 )
             }
 
+            var appliedSuccessfully = false
             decoded.onFailure { err ->
                 // Always silently record blocked threats in firewall audit counters
                 val reason = err.message ?: "Blocked invalid packet"
@@ -2411,12 +2613,17 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                     showFeedback("Could not verify partner move")
                 }
             }.onSuccess { packet ->
-                // Never apply our own outgoing block as our partner's turn
-                if ((isAutoSync || fromCloudLive) && packet.senderName.equals(freshRoom.myName.trim(), ignoreCase = true)) {
+                appliedSuccessfully = true
+                // For manual clipboard imports only, ignore our own pasted packet by name.
+                // For live cloud blocks, senderUid == uid was already checked authoritatively above,
+                // so partners who happen to share the same first name never drop each other's moves.
+                if (!fromCloudLive && isAutoSync && packet.senderName.equals(freshRoom.myName.trim(), ignoreCase = true)) {
                     return@onSuccess
                 }
 
-                val combined = (existingLedger + packet.block).distinctBy { it.blockHash }
+                val combined = (existingLedger + packet.block)
+                    .distinctBy { it.blockHash }
+                    .sortedBy { it.index }
                 val pruned = CoupleBlockchain.pruneLedgerWindow(
                     blocks = combined,
                     existingPrunedCount = freshRoom.prunedBlockCount,
@@ -2452,15 +2659,25 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
 
                 when (packet) {
                     is DecodedTurnPacket.BondHandshake -> {
+                        val incomingCycleJson = packet.partnerCycleSync?.toJsonString()
+                        val updatedCycleJson = incomingCycleJson ?: freshRoom.partnerCycleSyncJson
+                        val hadPreviousCycle = freshRoom.partnerCycleSyncJson.length > 4
                         repository.saveCoupleRoom(
                             baseUpdatedRoom.copy(
                                 partnerName = packet.senderName,
                                 partnerLocked = true,
                                 isBonded = true,
-                                spiceLevel = packet.spiceLevel.name
+                                spiceLevel = packet.spiceLevel.name,
+                                partnerCycleSyncJson = updatedCycleJson
                             )
                         )
-                        showFeedback("Connected live with ${packet.senderName} ♥")
+                        if (incomingCycleJson != null) {
+                            if (!hadPreviousCycle) {
+                                showFeedback("Partner cycle synced live with ${packet.senderName}")
+                            }
+                        } else {
+                            showFeedback("Connected live with ${packet.senderName} ♥")
+                        }
                     }
                     is DecodedTurnPacket.UnpairNotice -> {
                         repository.deleteCoupleRoom(freshRoom.coupleCode)
@@ -2610,12 +2827,10 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                         } else {
                             current.partnerLikedIds
                         }
-                        val isNewDateMatch = packet.likedDateId.isNotBlank() &&
-                            packet.likedDateId in current.myLikedIds &&
-                            packet.likedDateId !in current.partnerLikedIds
                         val incomingNote = packet.whisperNote
-                        val updatedWhispers = if (incomingNote != null && current.whispers.none { it.id == incomingNote.id }) {
-                            (current.whispers + incomingNote.copy(isRevealed = false)).takeLast(24)
+                        val isNewIncomingPulse = incomingNote != null && current.whispers.none { it.id == incomingNote.id }
+                        val updatedWhispers = if (isNewIncomingPulse) {
+                            (current.whispers + incomingNote.copy(isRevealed = true)).takeLast(24)
                         } else {
                             current.whispers
                         }
@@ -2629,18 +2844,28 @@ class PhasesViewModel(application: Application) : AndroidViewModel(application) 
                                 partnerLocked = true,
                                 isBonded = true,
                                 whisperStateJson = CoupleActivitiesDeck.dateWhisperStateToJson(merged),
-                                matchCount = freshRoom.matchCount + if (isNewDateMatch) 1 else 0,
-                                streakCount = freshRoom.streakCount + if (isNewDateMatch) 1 else 0
+                                matchCount = freshRoom.matchCount + if (isNewIncomingPulse) 1 else 0,
+                                streakCount = freshRoom.streakCount + if (isNewIncomingPulse) 1 else 0
                             )
                         )
-                        when {
-                            isNewDateMatch -> showFeedback("It's a Date Night Match with ${packet.senderName} 💞")
-                            incomingNote != null -> showFeedback("New Secret Whisper from ${packet.senderName} 💌")
-                            else -> showFeedback("${packet.senderName} voted on a Date Night ✨")
+                        if (isNewIncomingPulse) {
+                            showFeedback("${packet.senderName} ${incomingNote.text}")
+                            val ageMs = System.currentTimeMillis() - incomingNote.timestamp
+                            val isFreshPulse = incomingNote.timestamp <= 0L || ageMs in -60_000L..(12 * 60 * 60 * 1000L)
+                            if (isFreshPulse) {
+                                NotificationHelper.showCoupleLovePulseNotification(
+                                    context = getApplication(),
+                                    senderName = packet.senderName,
+                                    pulseText = incomingNote.text
+                                )
+                            }
+                        } else {
+                            showFeedback("${packet.senderName} is thinking of you 🫂🩷")
                         }
                     }
                 }
             }
+            appliedSuccessfully
         }
     }
 
@@ -2656,6 +2881,12 @@ enum class NavScreen(val label: String, val emoji: String) {
     CARE("Care", "🌿"),
     NOTES("Journal", "📝"),
     PLAY("Play", "🎮")
+}
+
+enum class MaleNavScreen(val label: String) {
+    PARTNER_CARE("Partner"),
+    ARCADE("Arcade"),
+    LOUNGE("Lounge")
 }
 
 enum class CareTab(val label: String, val emoji: String) {

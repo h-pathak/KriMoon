@@ -98,8 +98,8 @@ import com.example.model.CycleStatus
 import com.example.notifications.SoundHelper
 import com.example.ui.components.CuteAddButton
 import com.example.ui.components.CuteEmptyStateCard
-import com.example.ui.components.FloatingPetalsBackground
 import com.example.ui.components.LocalParticleController
+import com.example.ui.components.OffsetHolder
 import com.example.ui.components.cute3DCard
 import com.example.ui.theme.PhasesLavender
 import com.example.ui.theme.PhasesPeach
@@ -204,8 +204,6 @@ fun ShoppingScreen(
     )
 
     Box(modifier = modifier.fillMaxSize()) {
-        FloatingPetalsBackground()
-
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -769,11 +767,12 @@ fun CozyShopItemCard(
 ) {
     val particleController = LocalParticleController.current
     val haptic = LocalHapticFeedback.current
-    var rowCenter by remember { mutableStateOf(Offset.Zero) }
+    val rowCenterHolder = remember { OffsetHolder() }
 
     fun handleToggle() {
         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
         if (!item.isDone) {
+            val rowCenter = rowCenterHolder.value
             particleController.spawn(
                 centerX = if (rowCenter != Offset.Zero) rowCenter.x else 300f,
                 centerY = if (rowCenter != Offset.Zero) rowCenter.y else 400f,
@@ -801,7 +800,7 @@ fun CozyShopItemCard(
             .fillMaxWidth()
             .onGloballyPositioned { coordinates ->
                 val bounds = coordinates.boundsInWindow()
-                rowCenter = Offset(bounds.left + bounds.width / 2f, bounds.top + bounds.height / 2f)
+                rowCenterHolder.value = Offset(bounds.left + bounds.width / 2f, bounds.top + bounds.height / 2f)
             }
             .clickable { handleToggle() }
             .testTag("shop_item_${item.id}")

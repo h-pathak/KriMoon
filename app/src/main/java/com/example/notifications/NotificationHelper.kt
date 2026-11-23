@@ -61,6 +61,7 @@ object NotificationHelper {
     const val TARGET_WATER = "WATER"
     const val TARGET_NOTES = "NOTES"
     const val TARGET_MEDICATIONS = "MEDICATIONS"
+    const val TARGET_PLAY = "PLAY"
 
     const val NOTIFICATION_ID_WATER = 1001
     const val NOTIFICATION_ID_CYCLE = 1002
@@ -69,6 +70,7 @@ object NotificationHelper {
     const val NOTIFICATION_ID_MEDICINE_BASE = 2000
     const val NOTIFICATION_ID_NOTE_BASE = 5000
     const val NOTIFICATION_ID_DAILY_NOTE = 5999
+    const val NOTIFICATION_ID_COUPLE_PULSE = 6100
     const val NOTIFICATION_ID_TEST = 1099
 
     enum class TimeOfDay(val greeting: String, val emoji: String, val titlePrefix: String) {
@@ -842,6 +844,70 @@ object NotificationHelper {
 
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
         notificationManager?.cancel(requestCode)
+    }
+
+    /**
+     * Posts a warm, privacy-safe notification when a paired partner sends a "Thinking of You" or
+     * "Warm Hug" love pulse, inviting the user to open KriMoon.
+     */
+    fun showCoupleLovePulseNotification(
+        context: Context,
+        senderName: String,
+        pulseText: String
+    ) {
+        if (!hasNotificationPermission(context)) return
+        createNotificationChannels(context)
+
+        val openIntent = Intent(context, MainActivity::class.java).apply {
+            setPackage(context.packageName)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(EXTRA_TARGET_SCREEN, TARGET_PLAY)
+        }
+        val openPending = PendingIntent.getActivity(
+            context,
+            NOTIFICATION_ID_COUPLE_PULSE,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val cleanSender = com.example.security.BackendSecurityFirewall.sanitizeField(senderName, maxLength = 32)
+            .ifBlank { "Your partner" }
+        val cleanPulse = com.example.security.BackendSecurityFirewall.sanitizeField(pulseText, maxLength = 160)
+            .ifBlank { "is thinking about you right now 💭✨" }
+        val soundUri = getNotificationSoundUri(context)
+
+        val publicVersion = NotificationCompat.Builder(context, CHANNEL_CHECKIN)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("KriMoon 🌙✨")
+            .setContentText("Someone is thinking about you — tap to open KriMoon 🩷")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .build()
+
+        val builder = NotificationCompat.Builder(context, CHANNEL_CHECKIN)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("Open KriMoon · $cleanSender 🩷")
+            .setContentText("$cleanSender $cleanPulse")
+            .setStyle(
+                NotificationCompat.BigTextStyle()
+                    .bigText("$cleanSender $cleanPulse\nTap to open KriMoon and send a warm hug back 🫂✨")
+            )
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(publicVersion)
+            .setSound(soundUri)
+            .setVibrate(longArrayOf(0, 180, 120, 220))
+            .setDefaults(NotificationCompat.DEFAULT_LIGHTS)
+            .setContentIntent(openPending)
+            .setAutoCancel(true)
+
+        try {
+            NotificationManagerCompat.from(context).notify(
+                NOTIFICATION_ID_COUPLE_PULSE,
+                builder.build()
+            )
+        } catch (_: SecurityException) {
+        }
     }
 }
 

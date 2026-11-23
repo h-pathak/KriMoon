@@ -35,7 +35,9 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteForever
+import androidx.compose.material.icons.filled.Female
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Male
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
@@ -81,8 +83,13 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.UserProfile
+import com.example.model.UserGender
 import com.example.notifications.NotificationHelper
 import com.example.notifications.SoundHelper
+import com.example.ui.theme.MaleBorder
+import com.example.ui.theme.MaleCobalt
+import com.example.ui.theme.MaleEmerald
+import com.example.ui.theme.MaleSky
 import com.example.ui.theme.PhasesPlum
 import com.example.ui.theme.PhasesRose
 import com.example.ui.theme.PhasesSage
@@ -105,6 +112,7 @@ fun SettingsSheet(
         reminderHour: Int
     ) -> Unit,
     onSendTestNotification: (type: String) -> Unit = {},
+    onSwitchGender: (gender: String) -> Unit = {},
     onClearAllData: () -> Unit,
     isSignedIn: Boolean = false,
     onDeleteAccount: () -> Unit = {},
@@ -114,6 +122,11 @@ fun SettingsSheet(
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val currentGender = UserGender.fromStorage(userProfile?.userGender)
+    val isMale = currentGender == UserGender.MALE
+    val accentPrimary = if (isMale) MaleCobalt else PhasesPlum
+    val accentSecondary = if (isMale) MaleSky else PhasesRose
+    val privacyAccent = if (isMale) MaleEmerald else PhasesSage
 
     var hasPermission by remember {
         mutableStateOf(NotificationHelper.hasNotificationPermission(context))
@@ -162,7 +175,7 @@ fun SettingsSheet(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Settings & Soundscape",
+                    text = if (isMale) "Settings" else "Settings & Soundscape 🎀✨",
                     style = MaterialTheme.typography.titleLarge.copy(
                         fontWeight = FontWeight.Bold
                     ),
@@ -174,13 +187,80 @@ fun SettingsSheet(
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // Gender Switcher (Switches immediately between Female Cycle UI and Male 3-Page UI)
+            Card(
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
+                ),
+                border = BorderStroke(1.dp, if (isMale) MaleBorder else MaterialTheme.colorScheme.outlineVariant),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("settings_gender_card")
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            text = "Gender & Interface",
+                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = "Switching updates your layout immediately while keeping your encrypted data safe.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        SettingsGenderChip(
+                            label = "Female",
+                            icon = Icons.Default.Female,
+                            selected = currentGender == UserGender.FEMALE,
+                            accent = PhasesPlum,
+                            onClick = {
+                                if (currentGender != UserGender.FEMALE) {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    onSwitchGender(UserGender.FEMALE.storageValue)
+                                }
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("settings_gender_female")
+                        )
+                        SettingsGenderChip(
+                            label = "Male",
+                            icon = Icons.Default.Male,
+                            selected = currentGender == UserGender.MALE,
+                            accent = MaleCobalt,
+                            onClick = {
+                                if (currentGender != UserGender.MALE) {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    onSwitchGender(UserGender.MALE.storageValue)
+                                }
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("settings_gender_male")
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
 
             // Notification Permission Banner
             Card(
                 shape = RoundedCornerShape(18.dp),
                 colors = CardDefaults.cardColors(
-                    containerColor = if (hasPermission) PhasesSage.copy(alpha = 0.14f) else MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.4f)
+                    containerColor = if (hasPermission) privacyAccent.copy(alpha = 0.14f) else MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.4f)
                 ),
                 modifier = Modifier
                     .fillMaxWidth()
@@ -200,7 +280,7 @@ fun SettingsSheet(
                         Icon(
                             imageVector = if (hasPermission) Icons.Default.CheckCircle else Icons.Default.NotificationsOff,
                             contentDescription = null,
-                            tint = if (hasPermission) PhasesSage else MaterialTheme.colorScheme.error,
+                            tint = if (hasPermission) privacyAccent else MaterialTheme.colorScheme.error,
                             modifier = Modifier.size(24.dp)
                         )
                         Spacer(modifier = Modifier.width(10.dp))
@@ -211,7 +291,12 @@ fun SettingsSheet(
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                             Text(
-                                text = if (hasPermission) "Reminders will alert you locally on schedule." else "Enable to receive cycle, water & supply reminders.",
+                                text = when {
+                                    hasPermission && isMale -> "Partner alerts will notify you live."
+                                    hasPermission -> "Reminders will alert you locally on schedule."
+                                    isMale -> "Enable to receive live partner alerts."
+                                    else -> "Enable to receive cycle, water & supply reminders."
+                                },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -232,7 +317,7 @@ fun SettingsSheet(
                                 }
                             },
                             shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = PhasesPlum),
+                            colors = ButtonDefaults.buttonColors(containerColor = accentPrimary),
                             modifier = Modifier.testTag("request_permission_button")
                         ) {
                             Text("Enable", fontSize = 12.sp)
@@ -243,9 +328,9 @@ fun SettingsSheet(
 
             Spacer(modifier = Modifier.height(18.dp))
 
-            // Section 1: Cycle Profile
+            // Section 1: Profile
             Text(
-                text = "Cycle & Health Profile",
+                text = if (isMale) "Profile" else "Cycle & Health Profile",
                 style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                 color = MaterialTheme.colorScheme.onSurface
             )
@@ -264,6 +349,7 @@ fun SettingsSheet(
 
             Spacer(modifier = Modifier.height(12.dp))
 
+            if (!isMale) {
             Card(
                 shape = RoundedCornerShape(18.dp),
                 colors = CardDefaults.cardColors(
@@ -561,10 +647,11 @@ fun SettingsSheet(
                     }
                 }
             }
+            } // end if (!isMale)
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // Calm Soundscape Card (Selective Sound Controls)
+            // Soundscape Card
             Card(
                 shape = RoundedCornerShape(18.dp),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
@@ -580,19 +667,23 @@ fun SettingsSheet(
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.VolumeUp,
                             contentDescription = null,
-                            tint = PhasesRose,
+                            tint = accentSecondary,
                             modifier = Modifier.size(18.dp)
                         )
                         Text(
-                            text = "Calm Soundscape",
+                            text = if (isMale) "Audio Feedback" else "Calm Soundscape",
                             style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
                             color = MaterialTheme.colorScheme.onSurface
                         )
                     }
                     Spacer(modifier = Modifier.height(10.dp))
                     ReminderSwitchRow(
-                        title = "Soft Milestone Chimes",
-                        description = "Play a gentle chime only on milestones like 100% hydration or all meds complete. Routine taps stay silently haptic; medication alarms always alert.",
+                        title = if (isMale) "Milestone Chimes" else "Soft Milestone Chimes",
+                        description = if (isMale) {
+                            "Play a subtle sound on game milestones and partner alerts."
+                        } else {
+                            "Play a gentle chime only on milestones like 100% hydration or all meds complete. Routine taps stay silently haptic; medication alarms always alert."
+                        },
                         checked = celebrationSoundsEnabled,
                         onCheckedChange = { enabled ->
                             celebrationSoundsEnabled = enabled
@@ -601,6 +692,7 @@ fun SettingsSheet(
                                 SoundHelper.playCelebration(context)
                             }
                         },
+                        checkedTrackColor = accentPrimary,
                         testTag = "switch_celebration_sounds"
                     )
                 }
@@ -614,7 +706,7 @@ fun SettingsSheet(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .border(1.dp, PhasesSage.copy(alpha = 0.35f), RoundedCornerShape(16.dp))
+                    .border(1.dp, privacyAccent.copy(alpha = 0.35f), RoundedCornerShape(16.dp))
                     .testTag("backend_security_firewall_card")
             ) {
                 Row(
@@ -626,13 +718,13 @@ fun SettingsSheet(
                     Box(
                         modifier = Modifier
                             .size(34.dp)
-                            .background(PhasesSage.copy(alpha = 0.16f), CircleShape),
+                            .background(privacyAccent.copy(alpha = 0.16f), CircleShape),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
                             imageVector = Icons.Default.Lock,
                             contentDescription = "Always-on privacy protection",
-                            tint = PhasesSage,
+                            tint = privacyAccent,
                             modifier = Modifier.size(17.dp)
                         )
                     }
@@ -673,7 +765,7 @@ fun SettingsSheet(
                 },
                 shape = RoundedCornerShape(16.dp),
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = PhasesPlum,
+                    containerColor = accentPrimary,
                     contentColor = Color.White
                 ),
                 modifier = Modifier
@@ -681,7 +773,7 @@ fun SettingsSheet(
                     .height(50.dp)
                     .testTag("save_settings_button")
             ) {
-                Text("Save Changes 🌸", fontWeight = FontWeight.Bold)
+                Text(if (isMale) "Save Changes" else "Save Changes 🌸", fontWeight = FontWeight.Bold)
             }
 
             Spacer(modifier = Modifier.height(10.dp))
@@ -788,11 +880,54 @@ fun SettingsSheet(
 }
 
 @Composable
+private fun SettingsGenderChip(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    selected: Boolean,
+    accent: Color,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = if (selected) accent else MaterialTheme.colorScheme.surface,
+        border = BorderStroke(
+            width = if (selected) 1.5.dp else 1.dp,
+            color = if (selected) accent else MaterialTheme.colorScheme.outlineVariant
+        ),
+        modifier = modifier
+            .height(48.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 12.dp)
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = label,
+                tint = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(18.dp)
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                color = if (selected) Color.White else MaterialTheme.colorScheme.onSurface
+            )
+        }
+    }
+}
+
+@Composable
 private fun ReminderSwitchRow(
     title: String,
     description: String,
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
+    checkedTrackColor: Color = PhasesPlum,
     testTag: String
 ) {
     val haptic = LocalHapticFeedback.current
@@ -824,7 +959,7 @@ private fun ReminderSwitchRow(
             },
             colors = SwitchDefaults.colors(
                 checkedThumbColor = Color.White,
-                checkedTrackColor = PhasesPlum
+                checkedTrackColor = checkedTrackColor
             ),
             modifier = Modifier.testTag(testTag)
         )

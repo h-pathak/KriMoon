@@ -401,8 +401,8 @@ object LocalVaultCrypto {
         cipher.updateAAD("KRIMOON_VAULT_V2:$aadContext".toByteArray(StandardCharsets.UTF_8))
 
         val cipherBytes = cipher.doFinal(normalizedPlain.toByteArray(StandardCharsets.UTF_8))
-        val ivB64 = Base64.encodeToString(iv, Base64.NO_WRAP)
-        val ctB64 = Base64.encodeToString(cipherBytes, Base64.NO_WRAP)
+        val ivB64 = SafeBase64.encodeNoWrap(iv)
+        val ctB64 = SafeBase64.encodeNoWrap(cipherBytes)
         return "$VAULT_PREFIX_V2$ivB64:$ctB64"
     }
 
@@ -437,8 +437,8 @@ object LocalVaultCrypto {
                 BackendSecurityFirewall.recordNeutralizedThreat()
                 return Result.failure(SecurityException("Malformed V2 vault ciphertext."))
             }
-            val iv = Base64.decode(payload.substring(0, colonIdx), Base64.NO_WRAP)
-            val ct = Base64.decode(payload.substring(colonIdx + 1), Base64.NO_WRAP)
+            val iv = SafeBase64.decode(payload.substring(0, colonIdx))
+            val ct = SafeBase64.decode(payload.substring(colonIdx + 1))
             if (iv.size != GCM_IV_BYTES) {
                 BackendSecurityFirewall.recordNeutralizedThreat()
                 return Result.failure(SecurityException("Invalid V2 AES-GCM IV length."))
@@ -465,8 +465,8 @@ object LocalVaultCrypto {
                 BackendSecurityFirewall.recordNeutralizedThreat()
                 return Result.failure(SecurityException("Malformed V1 vault ciphertext."))
             }
-            val iv = Base64.decode(payload.substring(0, colonIdx), Base64.NO_WRAP)
-            val ct = Base64.decode(payload.substring(colonIdx + 1), Base64.NO_WRAP)
+            val iv = SafeBase64.decode(payload.substring(0, colonIdx))
+            val ct = SafeBase64.decode(payload.substring(colonIdx + 1))
             if (iv.size != GCM_IV_BYTES) {
                 BackendSecurityFirewall.recordNeutralizedThreat()
                 return Result.failure(SecurityException("Invalid V1 AES-GCM IV length."))
@@ -560,8 +560,8 @@ object LocalVaultCrypto {
                 BackendSecurityFirewall.recordNeutralizedThreat()
                 return Result.failure(SecurityException("Malformed legacy vault ciphertext."))
             }
-            val iv = Base64.decode(parts[0], Base64.NO_WRAP)
-            val ct = Base64.decode(parts[1], Base64.NO_WRAP)
+            val iv = SafeBase64.decode(parts[0])
+            val ct = SafeBase64.decode(parts[1])
             val salt = "KriMoon_AtRest_Salt_v2_KriMoonLocalVault_v2".toByteArray(StandardCharsets.UTF_8)
             val factory = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
             val spec = javax.crypto.spec.PBEKeySpec("KriMoonLocalVault_v2".toCharArray(), salt, 4096, 256)
@@ -573,6 +573,28 @@ object LocalVaultCrypto {
         } catch (e: Throwable) {
             BackendSecurityFirewall.recordNeutralizedThreat()
             Result.failure(SecurityException("Legacy static vault decryption failed.", e))
+        }
+    }
+}
+
+/**
+ * Delegates to Android's Base64 at runtime (API 24+) and falls back to java.util.Base64
+ * only when android.util.Base64 throws "not mocked" inside pure-JVM unit tests.
+ */
+internal object SafeBase64 {
+    fun encodeNoWrap(bytes: ByteArray): String {
+        return try {
+            Base64.encodeToString(bytes, Base64.NO_WRAP)
+        } catch (_: RuntimeException) {
+            java.util.Base64.getEncoder().encodeToString(bytes)
+        }
+    }
+
+    fun decode(encoded: String): ByteArray {
+        return try {
+            Base64.decode(encoded, Base64.NO_WRAP)
+        } catch (_: RuntimeException) {
+            java.util.Base64.getMimeDecoder().decode(encoded)
         }
     }
 }

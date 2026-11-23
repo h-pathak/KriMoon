@@ -12,6 +12,7 @@ import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -41,9 +42,14 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.cloud.authStateFlow
 import com.example.data.UserProfile
 import com.example.model.CycleStatus
+import com.example.model.PartnerCycleSyncSnapshot
+import com.example.model.UserGender
 import com.example.notifications.NotificationHelper
 import com.example.security.VaultState
+import com.example.ui.components.FloatingPetalsBackground
 import com.example.ui.components.LocalParticleController
+import com.example.ui.components.MaleBottomNav
+import com.example.ui.components.MaleTopBar
 import com.example.ui.components.ParticleBurstOverlay
 import com.example.ui.components.ParticleController
 import com.example.ui.components.PhasesBottomNav
@@ -52,15 +58,18 @@ import com.example.ui.games.CoupleLoungeActions
 import com.example.ui.games.CoupleLoungeUiState
 import com.example.ui.screens.CareHubScreen
 import com.example.ui.screens.CycleScreen
+import com.example.ui.screens.MalePartnerCycleScreen
 import com.example.ui.screens.NotesScreen
 import com.example.ui.screens.OnboardingScreen
 import com.example.ui.screens.PeriodsScreen
 import com.example.ui.screens.PeriodsViewTab
 import com.example.ui.screens.PlayGameSaveActions
 import com.example.ui.screens.PlayScreen
+import com.example.ui.screens.PlaySection
 import com.example.ui.screens.SettingsSheet
 import com.example.ui.theme.MyApplicationTheme
 import com.example.viewmodel.CareTab
+import com.example.viewmodel.MaleNavScreen
 import com.example.viewmodel.NavScreen
 import com.example.viewmodel.PhasesViewModel
 import com.google.firebase.Firebase
@@ -90,9 +99,7 @@ class MainActivity : ComponentActivity() {
         handleIntentDestination(intent)
 
         setContent {
-            MyApplicationTheme {
-                PhasesApp(viewModel = viewModel)
-            }
+            PhasesApp(viewModel = viewModel)
         }
     }
 
@@ -121,6 +128,10 @@ class MainActivity : ComponentActivity() {
                 viewModel.setScreen(NavScreen.CARE)
             }
             NotificationHelper.TARGET_NOTES -> viewModel.setScreen(NavScreen.NOTES)
+            NotificationHelper.TARGET_PLAY -> {
+                viewModel.setScreen(NavScreen.PLAY)
+                viewModel.setMaleScreen(MaleNavScreen.LOUNGE)
+            }
         }
     }
 }
@@ -129,8 +140,11 @@ class MainActivity : ComponentActivity() {
 fun PhasesApp(viewModel: PhasesViewModel) {
     // Only collect shell-level flows here; each tab collects its own flows to isolate recompositions and shrink JIT lambdas
     val userProfile by viewModel.userProfile.collectAsStateWithLifecycle()
+    val isProfileLoaded by viewModel.isProfileLoaded.collectAsStateWithLifecycle()
     val cycleStatus by viewModel.cycleStatus.collectAsStateWithLifecycle()
     val currentScreen by viewModel.currentScreen.collectAsStateWithLifecycle()
+    val currentMaleScreen by viewModel.currentMaleScreen.collectAsStateWithLifecycle()
+    val activeCoupleRoom by viewModel.activeCoupleRoom.collectAsStateWithLifecycle()
     val showSettingsSheet by viewModel.showSettingsSheet.collectAsStateWithLifecycle()
     val feedbackMessage by viewModel.feedbackMessage.collectAsStateWithLifecycle()
     val vaultState by viewModel.vaultState.collectAsStateWithLifecycle()
@@ -164,61 +178,88 @@ fun PhasesApp(viewModel: PhasesViewModel) {
     }
 
     val isOnboarded = userProfile?.isOnboarded == true
+    val isMaleUi = isOnboarded && UserGender.fromStorage(userProfile?.userGender) == UserGender.MALE
+    val maleHeaderSubtitle = remember(activeCoupleRoom?.partnerCycleSyncJson, activeCoupleRoom?.approvalStatus) {
+        val snap = PartnerCycleSyncSnapshot.fromJsonString(activeCoupleRoom?.partnerCycleSyncJson)?.projectToTime()
+        when {
+            snap != null -> snap.currentPhase.shortName
+            activeCoupleRoom?.approvalStatus == "CONNECTED" -> "Connected"
+            else -> null
+        }
+    }
 
+    MyApplicationTheme(isMasculine = isMaleUi) {
     CompositionLocalProvider(LocalParticleController provides particleController) {
         Box(modifier = Modifier.fillMaxSize()) {
-            if (!isOnboarded) {
+            if (!isProfileLoaded) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(MaterialTheme.colorScheme.background)
+                )
+            } else if (!isOnboarded) {
                 OnboardingScreen(
-                    onComplete = { name, lastPeriodMillis, cycleLength, periodLength ->
+                    onComplete = { name, gender, lastPeriodMillis, cycleLength, periodLength ->
                         viewModel.completeOnboarding(
                             name = name,
+                            gender = gender,
                             lastPeriodStartMillis = lastPeriodMillis,
                             cycleLength = cycleLength,
                             periodLength = periodLength
                         )
                     }
                 )
-            } else {
+            } else if (isMaleUi) {
                 Scaffold(
                     topBar = {
-                        PhasesTopBar(
-                            title = when (currentScreen) {
-                                NavScreen.CYCLE -> "KriMoon"
-                                NavScreen.PERIODS -> "Cycle Calendar"
-                                NavScreen.CARE -> "Self-Care"
-                                NavScreen.NOTES -> "Journal"
-                                NavScreen.PLAY -> "Play & Lounge"
+                        MaleTopBar(
+                            title = when (currentMaleScreen) {
+                                MaleNavScreen.PARTNER_CARE -> "Partner Brief"
+                                MaleNavScreen.ARCADE -> "Offline Arcade"
+                                MaleNavScreen.LOUNGE -> "Couple Lounge"
                             },
-                            subtitle = "${cycleStatus.currentPhase.emoji} ${cycleStatus.currentPhase.shortName}",
+                            subtitle = maleHeaderSubtitle,
                             onOpenSettings = { viewModel.setShowSettings(true) },
                             modifier = Modifier.testTag("app_top_bar")
                         )
                     },
                     bottomBar = {
-                        PhasesBottomNav(
-                            currentScreen = currentScreen,
-                            onScreenSelected = { viewModel.setScreen(it) },
-                            modifier = Modifier.testTag("bottom_nav_bar")
+                        MaleBottomNav(
+                            currentScreen = currentMaleScreen,
+                            onScreenSelected = { viewModel.setMaleScreen(it) },
+                            modifier = Modifier.testTag("male_bottom_nav_bar")
                         )
                     },
                     snackbarHost = { SnackbarHost(snackbarHostState) },
                     containerColor = MaterialTheme.colorScheme.background,
                     modifier = Modifier.fillMaxSize()
                 ) { innerPadding ->
-                    AnimatedContent(
-                        targetState = currentScreen,
-                        transitionSpec = { fadeIn() togetherWith fadeOut() },
-                        label = "screen_transition",
+                    Box(
                         modifier = Modifier
                             .fillMaxSize()
                             .padding(innerPadding)
-                    ) { screen ->
-                        when (screen) {
-                            NavScreen.CYCLE -> CycleTabHost(viewModel, userProfile, cycleStatus)
-                            NavScreen.PERIODS -> PeriodsTabHost(viewModel, userProfile, cycleStatus)
-                            NavScreen.CARE -> CareTabHost(viewModel, userProfile, cycleStatus)
-                            NavScreen.NOTES -> NotesTabHost(viewModel)
-                            NavScreen.PLAY -> PlayTabHost(viewModel, userProfile)
+                    ) {
+                        AnimatedContent(
+                            targetState = currentMaleScreen,
+                            transitionSpec = { fadeIn() togetherWith fadeOut() },
+                            label = "male_screen_transition",
+                            modifier = Modifier.fillMaxSize()
+                        ) { screen ->
+                            when (screen) {
+                                MaleNavScreen.PARTNER_CARE -> MalePartnerCycleTabHost(viewModel)
+                                MaleNavScreen.ARCADE -> PlayTabHost(
+                                    viewModel = viewModel,
+                                    userProfile = userProfile,
+                                    lockedSection = PlaySection.ARCADE,
+                                    isMasculine = true
+                                )
+                                MaleNavScreen.LOUNGE -> PlayTabHost(
+                                    viewModel = viewModel,
+                                    userProfile = userProfile,
+                                    lockedSection = PlaySection.COUPLE,
+                                    isMasculine = true
+                                )
+                            }
                         }
                     }
 
@@ -240,6 +281,83 @@ fun PhasesApp(viewModel: PhasesViewModel) {
                                 )
                             },
                             onSendTestNotification = { type -> viewModel.sendTestNotification(type) },
+                            onSwitchGender = { gender -> viewModel.setUserGender(gender) },
+                            onClearAllData = { viewModel.clearAllData() },
+                            isSignedIn = !cloudAuthUid.isNullOrBlank(),
+                            onDeleteAccount = { viewModel.deleteAccountAndEraseData() },
+                            onDismiss = { viewModel.setShowSettings(false) }
+                        )
+                    }
+                }
+            } else {
+                Scaffold(
+                    topBar = {
+                        PhasesTopBar(
+                            title = when (currentScreen) {
+                                NavScreen.CYCLE -> "KriMoon"
+                                NavScreen.PERIODS -> "Cycle Calendar 🌸"
+                                NavScreen.CARE -> "Self-Care 🫧"
+                                NavScreen.NOTES -> "Sweet Journal 💌"
+                                NavScreen.PLAY -> "Play & Lounge 🎀"
+                            },
+                            subtitle = "${cycleStatus.currentPhase.emoji} ${cycleStatus.currentPhase.shortName}",
+                            onOpenSettings = { viewModel.setShowSettings(true) },
+                            modifier = Modifier.testTag("app_top_bar")
+                        )
+                    },
+                    bottomBar = {
+                        PhasesBottomNav(
+                            currentScreen = currentScreen,
+                            onScreenSelected = { viewModel.setScreen(it) },
+                            modifier = Modifier.testTag("bottom_nav_bar")
+                        )
+                    },
+                    snackbarHost = { SnackbarHost(snackbarHostState) },
+                    containerColor = MaterialTheme.colorScheme.background,
+                    modifier = Modifier.fillMaxSize()
+                ) { innerPadding ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(innerPadding)
+                    ) {
+                        FloatingPetalsBackground()
+
+                        AnimatedContent(
+                            targetState = currentScreen,
+                            transitionSpec = { fadeIn() togetherWith fadeOut() },
+                            label = "screen_transition",
+                            modifier = Modifier.fillMaxSize()
+                        ) { screen ->
+                            when (screen) {
+                                NavScreen.CYCLE -> CycleTabHost(viewModel, userProfile, cycleStatus)
+                                NavScreen.PERIODS -> PeriodsTabHost(viewModel, userProfile, cycleStatus)
+                                NavScreen.CARE -> CareTabHost(viewModel, userProfile, cycleStatus)
+                                NavScreen.NOTES -> NotesTabHost(viewModel)
+                                NavScreen.PLAY -> PlayTabHost(viewModel, userProfile)
+                            }
+                        }
+                    }
+
+                    if (showSettingsSheet) {
+                        SettingsSheet(
+                            userProfile = userProfile,
+                            onSaveSettings = { name, cycleLen, periodLen, waterGoal, waterReminders, cycleReminders, fertileReminders, checkinReminders, shopReminders, reminderHour ->
+                                viewModel.updateSettings(
+                                    name = name,
+                                    cycleLength = cycleLen,
+                                    periodLength = periodLen,
+                                    waterGoal = waterGoal,
+                                    waterReminders = waterReminders,
+                                    cycleReminders = cycleReminders,
+                                    fertileReminders = fertileReminders,
+                                    checkinReminders = checkinReminders,
+                                    shopReminders = shopReminders,
+                                    reminderHour = reminderHour
+                                )
+                            },
+                            onSendTestNotification = { type -> viewModel.sendTestNotification(type) },
+                            onSwitchGender = { gender -> viewModel.setUserGender(gender) },
                             onClearAllData = { viewModel.clearAllData() },
                             isSignedIn = !cloudAuthUid.isNullOrBlank(),
                             onDeleteAccount = { viewModel.deleteAccountAndEraseData() },
@@ -292,6 +410,7 @@ fun PhasesApp(viewModel: PhasesViewModel) {
 
             ParticleBurstOverlay(controller = particleController)
         }
+    }
     }
 }
 
@@ -528,9 +647,26 @@ private fun NotesTabHost(viewModel: PhasesViewModel) {
 }
 
 @Composable
+private fun MalePartnerCycleTabHost(viewModel: PhasesViewModel) {
+    val activeCoupleRoom by viewModel.activeCoupleRoom.collectAsStateWithLifecycle()
+    val cloudSyncStatus by viewModel.cloudSyncStatus.collectAsStateWithLifecycle()
+    val isCloudBusy by viewModel.isCloudBusy.collectAsStateWithLifecycle()
+
+    MalePartnerCycleScreen(
+        activeRoom = activeCoupleRoom,
+        cloudSyncStatus = cloudSyncStatus,
+        isCloudBusy = isCloudBusy,
+        onSyncNow = { viewModel.forceSyncPartnerCycle() },
+        onOpenCoupleLounge = { viewModel.setMaleScreen(MaleNavScreen.LOUNGE) }
+    )
+}
+
+@Composable
 private fun PlayTabHost(
     viewModel: PhasesViewModel,
-    userProfile: UserProfile?
+    userProfile: UserProfile?,
+    lockedSection: PlaySection? = null,
+    isMasculine: Boolean = false
 ) {
     val gameScores by viewModel.gameScores.collectAsStateWithLifecycle()
     val coupleRooms by viewModel.coupleRooms.collectAsStateWithLifecycle()
@@ -588,7 +724,9 @@ private fun PlayTabHost(
         gameScores = gameScores,
         loungeState = loungeState,
         loungeActions = loungeActions,
-        gameSaveActions = saveActions
+        gameSaveActions = saveActions,
+        lockedSection = lockedSection,
+        isMasculine = isMasculine
     )
 }
 

@@ -43,6 +43,7 @@ import com.example.data.TaskCategory
 import com.example.data.UserProfile
 import com.example.data.WaterLog
 import com.example.model.CycleStatus
+import androidx.compose.runtime.remember
 import com.example.ui.components.cuteBouncyClick
 import com.example.ui.theme.PhasesPlum
 import com.example.ui.theme.PhasesRose
@@ -92,13 +93,13 @@ fun CareHubScreen(
     modifier: Modifier = Modifier
 ) {
     val haptic = LocalHapticFeedback.current
-    val todayDateStr = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+    val todayDateStr = remember { SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date()) }
 
     val waterCount = waterLog?.glassesCount ?: 0
     val waterGoal = userProfile?.waterGoal ?: 8
-    val activeMeds = medications.count { it.isEnabled }
-    val takenMeds = medications.count { it.lastTakenDate == todayDateStr }
-    val pendingItems = shopItems.count { !it.isDone }
+    val activeMeds = remember(medications) { medications.count { it.isEnabled } }
+    val takenMeds = remember(medications, todayDateStr) { medications.count { it.lastTakenDate == todayDateStr } }
+    val pendingItems = remember(shopItems) { shopItems.count { !it.isDone } }
 
     Box(
         modifier = modifier.fillMaxSize(),
@@ -123,7 +124,7 @@ fun CareHubScreen(
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     CareMetricCard(
-                        emoji = "💧",
+                        emoji = if (activeTab == CareTab.WATER) "🫧" else "💧",
                         label = "Hydration",
                         value = "$waterCount / $waterGoal",
                         accentColor = PhasesWaterBlue,
@@ -138,7 +139,7 @@ fun CareHubScreen(
                         testTag = "care_tab_water"
                     )
                     CareMetricCard(
-                        emoji = "💊",
+                        emoji = if (activeTab == CareTab.MEDS) "💊" else "🩷",
                         label = "Meds",
                         value = if (activeMeds == 0) "0 set" else "$takenMeds / $activeMeds",
                         accentColor = PhasesRose,
@@ -153,7 +154,7 @@ fun CareHubScreen(
                         testTag = "care_tab_meds"
                     )
                     CareMetricCard(
-                        emoji = "🛍️",
+                        emoji = if (activeTab == CareTab.CHECKLIST) "🎀" else "🛍️",
                         label = "Wishlist",
                         value = "$pendingItems left",
                         accentColor = PhasesSage,

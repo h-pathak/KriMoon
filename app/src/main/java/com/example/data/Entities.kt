@@ -24,7 +24,8 @@ data class UserProfile(
     val shopHideCompleted: Boolean = false,
     val shopViewMode: String = "COZY", // "COZY" or "COMPACT"
     val shopSortMode: String = "CUSTOM", // "CUSTOM", "STATUS", "PRIORITY", "ALPHA"
-    val activeCoupleCode: String = "" // Persisted permanent Couple Code bond
+    val activeCoupleCode: String = "", // Persisted permanent Couple Code bond
+    val userGender: String = "FEMALE" // "FEMALE" or "MALE"
 )
 
 @Entity(tableName = "period_logs")
@@ -168,7 +169,9 @@ data class CoupleRoomRecord(
     val prunedAnchorHash: String = "",
     val lastConfirmedCloudIndex: Int = 0,
     val seenClientTurnIdsJson: String = "[]",
-    val seenReplayHashesJson: String = "[]"
+    val seenReplayHashesJson: String = "[]",
+    val partnerCycleSyncJson: String = "{}",
+    val lastSentCycleSyncFingerprint: String = ""
 )
 
 @Entity(

@@ -61,10 +61,10 @@ import com.example.ui.games.BlockAnd2048Game
 import com.example.ui.games.ColorPopChainGame
 import com.example.ui.games.CosmicBrickBreakerGame
 import com.example.ui.games.CoupleActivityRowItem
-import com.example.ui.games.CoupleDateWhispersGame
 import com.example.ui.games.CoupleDoodleGame
 import com.example.ui.games.CoupleGameType
 import com.example.ui.games.CoupleGamesHub
+import com.example.ui.games.CoupleLovePulseScreen
 import com.example.ui.games.CoupleLoungeActions
 import com.example.ui.games.CoupleLoungeUiState
 import com.example.ui.games.CoupleQuizGame
@@ -77,6 +77,12 @@ import com.example.ui.games.MoonMergeGame
 import com.example.ui.games.MoonlightSnakeGame
 import com.example.ui.games.NeonBeatReflexGame
 import com.example.ui.games.StarlightMemoryGame
+import com.example.ui.theme.MaleBorder
+import com.example.ui.theme.MaleCobalt
+import com.example.ui.theme.MaleInk
+import com.example.ui.theme.MaleInkMuted
+import com.example.ui.theme.MaleSky
+import com.example.ui.theme.MaleSurface
 import com.example.ui.theme.PhasesLavender
 import com.example.ui.theme.PhasesPlum
 import com.example.ui.theme.PhasesRose
@@ -95,7 +101,7 @@ data class PlayGameSaveActions(
     val onSendLiveCoupleBlock: (packet: String, block: CoupleBlock) -> Unit
 )
 
-private enum class PlaySection(val title: String, val emoji: String) {
+enum class PlaySection(val title: String, val emoji: String) {
     ARCADE("Arcade", "🕹️"),
     COUPLE("Couple Lounge", "💌")
 }
@@ -128,11 +134,14 @@ fun PlayScreen(
     loungeState: CoupleLoungeUiState,
     loungeActions: CoupleLoungeActions,
     gameSaveActions: PlayGameSaveActions,
+    lockedSection: PlaySection? = null,
+    isMasculine: Boolean = false,
     modifier: Modifier = Modifier
 ) {
-    var activeSection by remember { mutableStateOf(PlaySection.ARCADE) }
+    var activeSection by remember { mutableStateOf(lockedSection ?: PlaySection.ARCADE) }
     var activeDestination by remember { mutableStateOf<ActivePlayDestination?>(null) }
     var soundEnabled by remember { mutableStateOf(false) }
+    val effectiveSection = lockedSection ?: activeSection
 
     BackHandler(enabled = activeDestination != null) {
         activeDestination = null
@@ -162,26 +171,33 @@ fun PlayScreen(
             (isCloudSignedIn && activeCoupleRoom.approvalStatus != "PENDING_HOST_APPROVAL")
         )
 
-    LazyColumn(
-        modifier = modifier.fillMaxSize(),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-        item(key = "play_hub_switcher") {
-            PlayHubSwitcherBar(
-                activeSection = activeSection,
-                soundEnabled = soundEnabled,
-                onSelectSection = { activeSection = it },
-                onToggleSound = { soundEnabled = !soundEnabled },
-                modifier = Modifier.widthIn(max = 620.dp)
-            )
+    Box(modifier = modifier.fillMaxSize()) {
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+        if (lockedSection == null) {
+            item(key = "play_hub_switcher") {
+                PlayHubSwitcherBar(
+                    activeSection = effectiveSection,
+                    soundEnabled = soundEnabled,
+                    onSelectSection = { activeSection = it },
+                    onToggleSound = { soundEnabled = !soundEnabled },
+                    modifier = Modifier.widthIn(max = 620.dp)
+                )
+            }
         }
 
-        if (activeSection == PlaySection.ARCADE) {
+        if (effectiveSection == PlaySection.ARCADE) {
             item(key = "arcade_header") {
                 ArcadeHeaderBanner(
                     gameScores = gameScores,
+                    isMasculine = isMasculine,
+                    showSoundToggle = lockedSection != null,
+                    soundEnabled = soundEnabled,
+                    onToggleSound = { soundEnabled = !soundEnabled },
                     modifier = Modifier.widthIn(max = 620.dp)
                 )
             }
@@ -223,6 +239,7 @@ fun PlayScreen(
 
         item(key = "play_bottom_spacer") {
             Spacer(modifier = Modifier.height(16.dp))
+        }
         }
     }
 }
@@ -290,7 +307,7 @@ private fun ActivePlayStage(
                 Icon(
                     imageVector = if (soundEnabled) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff,
                     contentDescription = if (soundEnabled) "Mute game sounds" else "Enable game sounds",
-                    tint = if (soundEnabled) PhasesPlum else MaterialTheme.colorScheme.onSurfaceVariant
+                    tint = if (soundEnabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
         }
@@ -436,7 +453,7 @@ private fun ActiveCoupleGameStage(
             onSaveState = saveActions.onSaveCoupleWavelengthState,
             onSendLiveBlock = saveActions.onSendLiveCoupleBlock
         )
-        CoupleGameType.DATE_WHISPERS -> CoupleDateWhispersGame(
+        CoupleGameType.HEART_TAP -> CoupleLovePulseScreen(
             room = room,
             soundEnabled = soundEnabled,
             isLiveConnected = isLive,
@@ -514,9 +531,68 @@ private fun PlayHubSwitcherBar(
 @Composable
 private fun ArcadeHeaderBanner(
     gameScores: Map<String, GameScoreRecord>,
+    isMasculine: Boolean = false,
+    showSoundToggle: Boolean = false,
+    soundEnabled: Boolean = false,
+    onToggleSound: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val totalPlays = remember(gameScores) { gameScores.values.sumOf { it.gamesPlayed } }
+    val haptic = LocalHapticFeedback.current
+    if (isMasculine) {
+        Card(
+            shape = RoundedCornerShape(18.dp),
+            colors = CardDefaults.cardColors(containerColor = MaleSurface),
+            border = BorderStroke(1.dp, MaleBorder),
+            modifier = modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(
+                        Brush.horizontalGradient(
+                            listOf(MaleCobalt.copy(alpha = 0.16f), Color.Transparent)
+                        )
+                    )
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Offline Arcade",
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            fontWeight = FontWeight.ExtraBold
+                        ),
+                        color = MaleInk
+                    )
+                    Text(
+                        text = "8 instant offline games · $totalPlays runs logged",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaleInkMuted
+                    )
+                }
+                if (showSoundToggle) {
+                    IconButton(
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onToggleSound()
+                        },
+                        modifier = Modifier
+                            .size(48.dp)
+                            .testTag("hub_sound_toggle")
+                    ) {
+                        Icon(
+                            imageVector = if (soundEnabled) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff,
+                            contentDescription = if (soundEnabled) "Sound on" else "Sound muted",
+                            tint = if (soundEnabled) MaleSky else MaleInkMuted
+                        )
+                    }
+                }
+            }
+        }
+        return
+    }
     Card(
         shape = RoundedCornerShape(22.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -539,21 +615,21 @@ private fun ArcadeHeaderBanner(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "🕹️ Cozy Arcade",
+                    text = "🕹️ Cozy Arcade ✨",
                     style = MaterialTheme.typography.titleMedium.copy(
                         fontWeight = FontWeight.Bold,
                         fontFamily = FontFamily.Serif
                     )
                 )
                 Text(
-                    text = "8 tactile mini-games · instant play anytime",
+                    text = "8 tactile mini-games · instant cozy play anytime 🌸",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
-            Surface(shape = RoundedCornerShape(100.dp), color = PhasesPlum.copy(alpha = 0.14f)) {
+            Surface(shape = RoundedCornerShape(100.dp), color = PhasesRose.copy(alpha = 0.15f)) {
                 Text(
-                    text = "$totalPlays runs",
+                    text = "✨ $totalPlays runs",
                     style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
                     color = PhasesPlum,
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)

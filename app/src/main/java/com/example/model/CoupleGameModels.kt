@@ -157,7 +157,8 @@ sealed class DecodedTurnPacket {
         override val coupleCode: String,
         override val senderName: String,
         val spiceLevel: SpiceLevel,
-        override val block: CoupleBlock
+        override val block: CoupleBlock,
+        val partnerCycleSync: PartnerCycleSyncSnapshot? = null
     ) : DecodedTurnPacket()
 
     data class QuizTurn(
@@ -248,8 +249,8 @@ object CoupleEcdhEngine {
         val kpg = KeyPairGenerator.getInstance("EC")
         kpg.initialize(ECGenParameterSpec(CURVE_NAME), SecureRandom())
         val kp = kpg.generateKeyPair()
-        val pubB64 = Base64.encodeToString(kp.public.encoded, Base64.NO_WRAP)
-        val privB64 = Base64.encodeToString(kp.private.encoded, Base64.NO_WRAP)
+        val pubB64 = com.example.security.SafeBase64.encodeNoWrap(kp.public.encoded)
+        val privB64 = com.example.security.SafeBase64.encodeNoWrap(kp.private.encoded)
         return CoupleEcdhKeyPair(publicKeyB64 = pubB64, privateKeyB64 = privB64)
     }
 
@@ -281,7 +282,7 @@ object CoupleEcdhEngine {
     fun isValidPublicKeyB64(publicKeyB64: String): Boolean {
         if (publicKeyB64.length !in 80..256) return false
         return try {
-            val bytes = Base64.decode(publicKeyB64, Base64.NO_WRAP)
+            val bytes = com.example.security.SafeBase64.decode(publicKeyB64)
             val pub = KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(bytes))
             validateNistP256PublicKey(pub) != null
         } catch (_: Throwable) {
@@ -304,10 +305,10 @@ object CoupleEcdhEngine {
         return try {
             val keyFactory = KeyFactory.getInstance("EC")
             val privKey = keyFactory.generatePrivate(
-                PKCS8EncodedKeySpec(Base64.decode(myPrivateKeyB64, Base64.NO_WRAP))
+                PKCS8EncodedKeySpec(com.example.security.SafeBase64.decode(myPrivateKeyB64))
             )
             val rawPeerPub = keyFactory.generatePublic(
-                X509EncodedKeySpec(Base64.decode(peerPublicKeyB64, Base64.NO_WRAP))
+                X509EncodedKeySpec(com.example.security.SafeBase64.decode(peerPublicKeyB64))
             )
             val peerPub = validateNistP256PublicKey(rawPeerPub) ?: return null
 
@@ -334,7 +335,8 @@ object CoupleEcdhEngine {
                 length = 32
             )
             rawSecret.fill(0)
-            Base64.encodeToString(masterSecret, Base64.NO_WRAP)
+            prk.fill(0)
+            com.example.security.SafeBase64.encodeNoWrap(masterSecret)
         } catch (_: Throwable) {
             null
         }
@@ -400,12 +402,13 @@ object CoupleCryptoEngine {
     fun deriveAesKey(coupleCode: String, ecdhSharedSecretB64: String = ""): SecretKeySpec {
         val normalized = CoupleTurnCodec.normalizeCode(coupleCode)
         if (ecdhSharedSecretB64.isNotBlank()) {
-            val master = Base64.decode(ecdhSharedSecretB64, Base64.NO_WRAP)
+            val master = com.example.security.SafeBase64.decode(ecdhSharedSecretB64)
             val aesBytes = CoupleEcdhEngine.hkdfExpand(
                 prk = master,
                 info = "KriMoon_AES256GCM_v3|$normalized".toByteArray(StandardCharsets.UTF_8),
                 length = 32
             )
+            master.fill(0)
             return SecretKeySpec(aesBytes, "AES")
         }
         val salt = "KriMoon_AES256_Vault_Salt_v2_$normalized".toByteArray(StandardCharsets.UTF_8)
@@ -427,12 +430,14 @@ object CoupleCryptoEngine {
     fun deriveHmacKey(coupleCode: String, ecdhSharedSecretB64: String = ""): ByteArray {
         val normalized = CoupleTurnCodec.normalizeCode(coupleCode)
         if (ecdhSharedSecretB64.isNotBlank()) {
-            val master = Base64.decode(ecdhSharedSecretB64, Base64.NO_WRAP)
-            return CoupleEcdhEngine.hkdfExpand(
+            val master = com.example.security.SafeBase64.decode(ecdhSharedSecretB64)
+            val hmacKey = CoupleEcdhEngine.hkdfExpand(
                 prk = master,
                 info = "KriMoon_HMACSHA256_v3|$normalized".toByteArray(StandardCharsets.UTF_8),
                 length = 32
             )
+            master.fill(0)
+            return hmacKey
         }
         val salt = "KriMoon_HMAC256_Sign_Salt_v2_$normalized".toByteArray(StandardCharsets.UTF_8)
         return try {
@@ -483,8 +488,8 @@ object CoupleCryptoEngine {
         cipher.updateAAD(aad.toByteArray(StandardCharsets.UTF_8))
 
         val cipherBytes = cipher.doFinal(plainJson.toByteArray(StandardCharsets.UTF_8))
-        val ivB64 = Base64.encodeToString(iv, Base64.NO_WRAP)
-        val cipherB64 = Base64.encodeToString(cipherBytes, Base64.NO_WRAP)
+        val ivB64 = com.example.security.SafeBase64.encodeNoWrap(iv)
+        val cipherB64 = com.example.security.SafeBase64.encodeNoWrap(cipherBytes)
         val hmacHex = computeHmacHex(coupleCode, "$ivB64.$cipherB64.$aad", ecdhSharedSecretB64)
 
         return EncryptedEnvelope(
@@ -514,11 +519,11 @@ object CoupleCryptoEngine {
                     SecurityException("FIREWALL BLOCKED: HMAC-SHA256 signature mismatch (wrong key or tampered packet).")
                 )
             }
-            val iv = Base64.decode(ivBase64, Base64.NO_WRAP)
+            val iv = com.example.security.SafeBase64.decode(ivBase64)
             if (iv.size != GCM_IV_BYTES) {
                 return Result.failure(SecurityException("FIREWALL BLOCKED: Invalid AES-GCM IV length."))
             }
-            val cipherBytes = Base64.decode(cipherBase64, Base64.NO_WRAP)
+            val cipherBytes = com.example.security.SafeBase64.decode(cipherBase64)
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             val keySpec = deriveAesKey(coupleCode, ecdhSharedSecretB64)
             cipher.init(Cipher.DECRYPT_MODE, keySpec, GCMParameterSpec(GCM_TAG_BITS, iv))
@@ -990,10 +995,21 @@ object CoupleBlockchain {
  */
 object CoupleFirewall {
     private const val MAX_PACKET_BYTES = 65_536
-    private val FORBIDDEN_PATTERNS = listOf(
-        "<script", "javascript:", "vbscript:", "data:text/html",
-        "DROP TABLE", "UNION SELECT", "DELETE FROM", "INSERT INTO",
-        "../", "..\\", "content://", "file://"
+    private val FORBIDDEN_REGEXES = listOf(
+        Regex("<\\s*script\\b", RegexOption.IGNORE_CASE),
+        Regex("<\\s*iframe\\b", RegexOption.IGNORE_CASE),
+        Regex("<\\s*svg\\b", RegexOption.IGNORE_CASE),
+        Regex("javascript\\s*:", RegexOption.IGNORE_CASE),
+        Regex("vbscript\\s*:", RegexOption.IGNORE_CASE),
+        Regex("data\\s*:\\s*text/html", RegexOption.IGNORE_CASE),
+        Regex("\\bon[a-z]{2,20}\\s*=", RegexOption.IGNORE_CASE),
+        Regex("\\bDROP\\s+TABLE\\b", RegexOption.IGNORE_CASE),
+        Regex("\\bUNION\\s+(?:ALL\\s+)?SELECT\\b", RegexOption.IGNORE_CASE),
+        Regex("\\bDELETE\\s+FROM\\b", RegexOption.IGNORE_CASE),
+        Regex("\\bINSERT\\s+INTO\\b", RegexOption.IGNORE_CASE),
+        Regex("\\.\\.[/\\\\]"),
+        Regex("content\\s*://", RegexOption.IGNORE_CASE),
+        Regex("file\\s*://", RegexOption.IGNORE_CASE)
     )
 
     fun sanitizeName(raw: String): String {
@@ -1026,8 +1042,9 @@ object CoupleFirewall {
         if (trimmed.length > MAX_PACKET_BYTES) {
             return Result.failure(IllegalArgumentException("FIREWALL BLOCKED: Packet exceeds 64KB security limit."))
         }
-        for (pattern in FORBIDDEN_PATTERNS) {
-            if (trimmed.contains(pattern, ignoreCase = true)) {
+        for (regex in FORBIDDEN_REGEXES) {
+            if (regex.containsMatchIn(trimmed)) {
+                com.example.security.BackendSecurityFirewall.recordNeutralizedThreat()
                 return Result.failure(SecurityException("FIREWALL BLOCKED: Malicious injection pattern detected."))
             }
         }
@@ -1156,7 +1173,7 @@ object CoupleTurnCodec {
             val idx = rawInput.indexOf(BCHAIN_PREFIX)
             if (idx < 0) return null
             val token = rawInput.substring(idx + BCHAIN_PREFIX.length).trim().split(Regex("\\s+")).first()
-            val outer = JSONObject(String(Base64.decode(token, Base64.DEFAULT), StandardCharsets.UTF_8))
+            val outer = JSONObject(String(com.example.security.SafeBase64.decode(token), StandardCharsets.UTF_8))
             outer.optString("iv", "").takeIf { it.isNotBlank() }
         } catch (_: Exception) {
             null
@@ -1180,7 +1197,7 @@ object CoupleTurnCodec {
                 return Result.failure(IllegalArgumentException("Missing KRIMOON:BCHAIN header"))
             }
             val token = rawPacket.substring(bchainIdx + BCHAIN_PREFIX.length).trim().split(Regex("\\s+")).first()
-            val outer = JSONObject(String(Base64.decode(token, Base64.DEFAULT), StandardCharsets.UTF_8))
+            val outer = JSONObject(String(com.example.security.SafeBase64.decode(token), StandardCharsets.UTF_8))
             val pv = if (outer.has("pv")) outer.optInt("pv", 2) else outer.optInt("v", 2)
             val ctid = outer.optString("ctid", "").ifBlank { UUID.randomUUID().toString() }
             val blkObj = outer.optJSONObject("blk")
@@ -1297,7 +1314,7 @@ object CoupleTurnCodec {
             put("ct", envelope.cipherBase64)
             put("sig", envelope.hmacHex)
         }
-        val b64 = Base64.encodeToString(outer.toString().toByteArray(StandardCharsets.UTF_8), Base64.NO_WRAP)
+        val b64 = com.example.security.SafeBase64.encodeNoWrap(outer.toString().toByteArray(StandardCharsets.UTF_8))
         return "$BCHAIN_PREFIX$b64" to finalBlock
     }
 
@@ -1307,12 +1324,16 @@ object CoupleTurnCodec {
         spiceLevel: SpiceLevel = SpiceLevel.FLIRTY,
         previousHash: String = CoupleBlockchain.genesisHash(coupleCode),
         blockIndex: Int = 1,
-        ecdhSharedSecretB64: String = ""
+        ecdhSharedSecretB64: String = "",
+        cycleSync: PartnerCycleSyncSnapshot? = null
     ): Pair<String, CoupleBlock> {
         val payload = JSONObject().apply {
             put("t", "HANDSHAKE")
             put("sender", CoupleFirewall.sanitizeName(senderName))
             put("spice", spiceLevel.name)
+            if (cycleSync != null) {
+                put("cs", cycleSync.toJsonString())
+            }
         }
         return sealBlockchainPacket(coupleCode, senderName, "HANDSHAKE", payload, previousHash, blockIndex, ecdhSharedSecretB64)
     }
@@ -1323,8 +1344,9 @@ object CoupleTurnCodec {
         spiceLevel: SpiceLevel = SpiceLevel.FLIRTY,
         previousHash: String = CoupleBlockchain.genesisHash(coupleCode),
         blockIndex: Int = 1,
-        ecdhSharedSecretB64: String = ""
-    ): String = encodeBondHandshakeWithBlock(coupleCode, senderName, spiceLevel, previousHash, blockIndex, ecdhSharedSecretB64).first
+        ecdhSharedSecretB64: String = "",
+        cycleSync: PartnerCycleSyncSnapshot? = null
+    ): String = encodeBondHandshakeWithBlock(coupleCode, senderName, spiceLevel, previousHash, blockIndex, ecdhSharedSecretB64, cycleSync).first
 
     fun encodeUnpairNoticeWithBlock(
         coupleCode: String,
@@ -1558,7 +1580,7 @@ object CoupleTurnCodec {
             }
 
             val token = rawInput.substring(bchainIdx + BCHAIN_PREFIX.length).trim().split(Regex("\\s+")).first()
-            val outerJsonStr = String(Base64.decode(token, Base64.DEFAULT), StandardCharsets.UTF_8)
+            val outerJsonStr = String(com.example.security.SafeBase64.decode(token), StandardCharsets.UTF_8)
             val outer = JSONObject(outerJsonStr)
             val packetVersion = if (outer.has("pv")) outer.optInt("pv", 2) else outer.optInt("v", 2)
             val outerClientTurnId = outer.optString("ctid", "")
@@ -1687,18 +1709,38 @@ object CoupleTurnCodec {
             }
 
             val obj = JSONObject(decryptedJson)
+            val innerType = obj.optString("t", "").trim()
+            if (innerType.isBlank() || innerType != block.actionType) {
+                com.example.security.BackendSecurityFirewall.recordNeutralizedThreat()
+                return Result.failure(
+                    SecurityException("FIREWALL BLOCKED: Packet actionType mismatch (header=${block.actionType}, payload=$innerType).")
+                )
+            }
             val sender = CoupleFirewall.sanitizeName(obj.optString("sender", senderFromBlock))
+            if (lockedPartnerName.isNotBlank() &&
+                !sender.equals(lockedPartnerName.trim(), ignoreCase = true) &&
+                (myName.isBlank() || !sender.equals(myName.trim(), ignoreCase = true))
+            ) {
+                com.example.security.BackendSecurityFirewall.recordNeutralizedThreat()
+                return Result.failure(
+                    SecurityException("FIREWALL BLOCKED: Decrypted sender '$sender' violates partner lock ($lockedPartnerName).")
+                )
+            }
 
-            when (obj.optString("t")) {
+            when (innerType) {
                 "HANDSHAKE" -> {
                     val spice = runCatching { SpiceLevel.valueOf(obj.optString("spice", "FLIRTY")) }
                         .getOrDefault(SpiceLevel.FLIRTY)
+                    val cycleSync = obj.optString("cs", "").takeIf { it.isNotBlank() }?.let {
+                        PartnerCycleSyncSnapshot.fromJsonString(it)
+                    }
                     Result.success(
                         DecodedTurnPacket.BondHandshake(
                             coupleCode = cleanCode,
                             senderName = sender,
                             spiceLevel = spice,
-                            block = block
+                            block = block,
+                            partnerCycleSync = cycleSync
                         )
                     )
                 }
@@ -1746,7 +1788,10 @@ object CoupleTurnCodec {
                     )
                 }
                 "DOODLE" -> {
-                    val prompt = obj.optString("prompt", "").take(140)
+                    val prompt = com.example.security.BackendSecurityFirewall.sanitizeField(
+                        obj.optString("prompt", ""),
+                        maxLength = 140
+                    )
                     val strokes = strokesFromJsonArray(obj.optJSONArray("strokes") ?: JSONArray())
                     Result.success(
                         DecodedTurnPacket.DoodleTurn(
@@ -1792,11 +1837,21 @@ object CoupleTurnCodec {
                     )
                 }
                 "WHISPER" -> {
-                    val likedDateId = obj.optString("likedDateId", "").take(32)
-                    val wText = obj.optString("wtext", "").take(260)
+                    val likedDateId = com.example.security.BackendSecurityFirewall.sanitizeField(
+                        obj.optString("likedDateId", ""),
+                        maxLength = 32
+                    )
+                    val wText = com.example.security.BackendSecurityFirewall.sanitizeField(
+                        obj.optString("wtext", ""),
+                        maxLength = 260
+                    )
+                    val noteId = com.example.security.BackendSecurityFirewall.sanitizeField(
+                        obj.optString("wid", "w_${block.blockHash.take(8)}"),
+                        maxLength = 48
+                    ).ifBlank { "w_${block.blockHash.take(8)}" }
                     val note = if (wText.isNotBlank()) {
                         SecretWhisperNote(
-                            id = obj.optString("wid", "w_${block.blockHash.take(8)}"),
+                            id = noteId,
                             senderName = sender,
                             text = wText,
                             timestamp = obj.optLong("wts", System.currentTimeMillis()),
@@ -1829,7 +1884,7 @@ object CoupleTurnCodec {
             val idx = rawInput.indexOf(BCHAIN_PREFIX)
             if (idx < 0) return null
             val token = rawInput.substring(idx + BCHAIN_PREFIX.length).trim().split(Regex("\\s+")).first()
-            val outer = JSONObject(String(Base64.decode(token, Base64.DEFAULT), StandardCharsets.UTF_8))
+            val outer = JSONObject(String(com.example.security.SafeBase64.decode(token), StandardCharsets.UTF_8))
             outer.optJSONObject("blk")?.optString("bh")?.takeIf { it.isNotBlank() }
         } catch (_: Exception) {
             null

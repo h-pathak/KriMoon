@@ -68,7 +68,6 @@ import com.example.model.CycleStatus
 import com.example.ui.components.AestheticHaptics
 import com.example.ui.components.CuteAddButton
 import com.example.ui.components.CutePulseButton
-import com.example.ui.components.FloatingPetalsBackground
 import com.example.ui.components.LocalParticleController
 import com.example.ui.components.MedicineManagerDialog
 import com.example.ui.components.ThreeDPhaseCard
@@ -198,9 +197,6 @@ fun CycleScreen(
         modifier = modifier.fillMaxSize(),
         contentAlignment = Alignment.TopCenter
     ) {
-        // Subtle editorial watercolor atmosphere
-        FloatingPetalsBackground()
-
         LazyColumn(
             modifier = Modifier
                 .widthIn(max = 620.dp)
@@ -238,12 +234,12 @@ fun CycleScreen(
 
                         Surface(
                             shape = RoundedCornerShape(100.dp),
-                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.85f),
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                            color = PhasesRose.copy(alpha = 0.13f),
+                            border = BorderStroke(1.dp, PhasesRose.copy(alpha = 0.28f)),
                             modifier = Modifier.testTag("cycle_header_status_chip")
                         ) {
                             Text(
-                                text = "${cycleStatus.currentPhase.emoji} Day ${cycleStatus.dayInCycle}",
+                                text = "${cycleStatus.currentPhase.emoji} Day ${cycleStatus.dayInCycle} ✨",
                                 style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                                 color = MaterialTheme.colorScheme.onSurface,
                                 maxLines = 1,
@@ -253,7 +249,8 @@ fun CycleScreen(
 
                         Surface(
                             shape = RoundedCornerShape(100.dp),
-                            color = PhasesSage.copy(alpha = 0.14f)
+                            color = PhasesSage.copy(alpha = 0.15f),
+                            border = BorderStroke(1.dp, PhasesSage.copy(alpha = 0.28f))
                         ) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
@@ -267,7 +264,7 @@ fun CycleScreen(
                                     modifier = Modifier.size(11.dp)
                                 )
                                 Text(
-                                    text = "Private",
+                                    text = "Private 🌿",
                                     style = MaterialTheme.typography.labelSmall.copy(
                                         fontWeight = FontWeight.SemiBold,
                                         fontSize = 10.sp
@@ -330,12 +327,12 @@ fun CycleScreen(
                                 AestheticHaptics.warmConfirm(context, haptic)
                                 particleController.showToast(
                                     coroutineScope = coroutineScope,
-                                    message = "Flow complete — moving into renewal",
+                                    message = "Flow complete — moving into gentle renewal 🌸",
                                     icon = "🌸"
                                 )
                                 onEndPeriodToday()
                             },
-                            text = "End Active Period",
+                            text = "End Active Period ✨",
                             icon = "🌸",
                             badgeText = "Day ${cycleStatus.activePeriodDays}",
                             gradientColors = listOf(PhasesSage, Color(0xFF428460), PhasesPlum),
@@ -361,7 +358,7 @@ fun CycleScreen(
                             ) {
                                 Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(14.dp))
                                 Spacer(modifier = Modifier.width(5.dp))
-                                Text("Edit Start", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                                Text("Edit Start 🗓️", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
                             }
 
                             OutlinedButton(
@@ -393,7 +390,7 @@ fun CycleScreen(
                             modifier = Modifier.testTag("log_period_today_button")
                         ) {
                             Text(
-                                text = "Re-log today as Day 1",
+                                text = "Re-log today as Day 1 🌙",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -404,7 +401,7 @@ fun CycleScreen(
                                 AestheticHaptics.warmConfirm(context, haptic)
                                 particleController.showToast(
                                     coroutineScope = coroutineScope,
-                                    message = "Period logged — take it gentle today",
+                                    message = "Period logged — be extra gentle with yourself today 🩷",
                                     icon = "🩸"
                                 )
                                 onLogPeriodToday()
@@ -437,7 +434,7 @@ fun CycleScreen(
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "Log Past Period Dates",
+                                text = "Log Past Period Dates 🗓️✨",
                                 style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
                                 color = PhasesRose
                             )
@@ -474,9 +471,9 @@ fun CycleScreen(
                             headline = nextDateStr,
                             detail = countdownLabel,
                             footerChip = if (cycleStatus.currentPhase == CyclePhase.FERTILE || cycleStatus.currentPhase == CyclePhase.OVULATION) {
-                                "Fertile Window"
+                                "Fertile Window ✨"
                             } else {
-                                "Calendar →"
+                                "Calendar 🌸 →"
                             },
                             accentColor = PhasesRose,
                             onClick = onNavigateToPeriods,
@@ -491,7 +488,7 @@ fun CycleScreen(
                             title = "Cycle Insights",
                             headline = "${cycleStatus.averageCycleLength.toInt()}d Avg",
                             detail = "±${String.format(Locale.US, "%.1f", cycleStatus.sigmaVarianceDays)}d var · ${userProfile?.periodLength ?: 5}d flow",
-                            footerChip = "6-Mo Trends →",
+                            footerChip = "6-Mo Trends 📈 →",
                             accentColor = PhasesPlum,
                             onClick = onNavigateToTrends,
                             modifier = Modifier
@@ -508,11 +505,11 @@ fun CycleScreen(
                         horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
                         CycleBentoTile(
-                            emoji = "💧",
+                            emoji = "🫧",
                             title = "Self-Care",
                             headline = "$todayWaterCount/$waterGoal cups",
-                            detail = if (activeMedsCount > 0) "Meds $takenMedsCount/$activeMedsCount taken" else "Hydration & daily care",
-                            footerChip = "Open Care →",
+                            detail = if (activeMedsCount > 0) "Meds $takenMedsCount/$activeMedsCount taken 💊" else "Hydration & daily rituals 💧",
+                            footerChip = "Open Care 🫧 →",
                             accentColor = PhasesWaterBlue,
                             onClick = { onNavigateToCare(CareTab.WATER) },
                             modifier = Modifier
@@ -608,14 +605,14 @@ fun CycleScreen(
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        text = "Daily Medicines",
+                                        text = "Daily Medicines ✨",
                                         style = MaterialTheme.typography.titleMedium,
                                         color = MaterialTheme.colorScheme.onSurface,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
                                     Text(
-                                        text = "Scheduled alerts with custom chimes",
+                                        text = "Gentle alerts with cute chimes 🔔",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         maxLines = 1,
@@ -643,14 +640,14 @@ fun CycleScreen(
                                 verticalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
                                 Text(
-                                    text = "No vitamin or medicine reminders scheduled yet.",
+                                    text = "No vitamin or medicine reminders scheduled yet 🌸",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                                 CuteAddButton(
                                     text = "Set Reminder",
                                     icon = "💊",
-                                    sparkleEmoji = "",
+                                    sparkleEmoji = "✨",
                                     onClick = { showMedicineDialog = true },
                                     modifier = Modifier.fillMaxWidth(),
                                     testTag = "home_empty_set_med_reminder_button"
@@ -726,7 +723,7 @@ fun CycleScreen(
                                                         )
                                                         Spacer(modifier = Modifier.width(4.dp))
                                                         Text(
-                                                            text = "Taken",
+                                                            text = "Taken 🌸",
                                                             fontSize = 11.sp,
                                                             fontWeight = FontWeight.Bold,
                                                             color = PhasesSage
@@ -740,7 +737,7 @@ fun CycleScreen(
                                                         onMarkMedicineTaken(med.id)
                                                         particleController.showToast(
                                                             coroutineScope = coroutineScope,
-                                                            message = "${med.name} marked taken",
+                                                            message = "${med.name} taken — proud of you! 💊",
                                                             icon = "💊"
                                                         )
                                                     },
@@ -749,7 +746,7 @@ fun CycleScreen(
                                                     colors = ButtonDefaults.buttonColors(containerColor = PhasesPlum),
                                                     modifier = Modifier.testTag("mark_taken_med_${med.id}")
                                                 ) {
-                                                    Text("Take", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                                    Text("Take ✨", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                                                 }
                                             }
                                         }
@@ -766,7 +763,7 @@ fun CycleScreen(
                 item {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(
-                            text = "Recent Periods",
+                            text = "Recent Periods 🌙",
                             style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
                             color = MaterialTheme.colorScheme.onBackground
                         )
@@ -775,7 +772,7 @@ fun CycleScreen(
                             Card(
                                 shape = RoundedCornerShape(16.dp),
                                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                border = BorderStroke(1.dp, PhasesRose.copy(alpha = 0.22f)),
                                 modifier = Modifier.fillMaxWidth()
                             ) {
                                 Row(
@@ -802,10 +799,10 @@ fun CycleScreen(
                                     Spacer(modifier = Modifier.width(8.dp))
                                     Surface(
                                         shape = RoundedCornerShape(100.dp),
-                                        color = MaterialTheme.colorScheme.surfaceVariant
+                                        color = PhasesRose.copy(alpha = 0.10f)
                                     ) {
                                         Text(
-                                            text = period.notes.ifBlank { "Logged" },
+                                            text = period.notes.ifBlank { "Logged 🌸" },
                                             style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                                             maxLines = 1,
@@ -833,9 +830,9 @@ private fun getGreeting(name: String): String {
     val cal = Calendar.getInstance()
     val hour = cal.get(Calendar.HOUR_OF_DAY)
     return when {
-        hour < 12 -> "Good morning, $name"
-        hour < 17 -> "Good afternoon, $name"
-        else -> "Good evening, $name"
+        hour < 12 -> "Good morning, $name ☀️🌸"
+        hour < 17 -> "Good afternoon, $name 🌷✨"
+        else -> "Good evening, $name 🌙💫"
     }
 }
 

@@ -79,6 +79,7 @@ import com.example.cloud.attemptAutoSignIn
 import com.example.cloud.onGoogleSignInClicked
 import com.example.cloud.signOutGoogle
 import com.example.data.CoupleRoomRecord
+import com.example.model.CoupleActivitiesDeck
 import com.example.model.CoupleTurnCodec
 import com.example.model.SpiceLevel
 import kotlinx.coroutines.delay
@@ -145,7 +146,7 @@ enum class CoupleGameType(
     TIC_TAC_TOE("Tic-Tac-Toe+", "⚡", "Classic & 3-piece Bolt showdown", PhasesSage),
     TRUTH_OR_DARE("Truth or Dare", "🎲", "Velvet prompts matched to your vibe", Color(0xFFEC4899)),
     WAVELENGTH("Heart Wavelength", "🌊", "Tune the dial to read each other's mind", Color(0xFFA855F7)),
-    DATE_WHISPERS("Date & Whispers", "💌", "Match date ideas & unlock sealed notes", Color(0xFFF43F5E))
+    HEART_TAP("Thinking of You", "🫂", "Tap to send a warm hug or thinking-of-you nudge ✨", Color(0xFFF43F5E))
 }
 
 @Composable
@@ -317,6 +318,74 @@ fun CoupleGamesHub(
                     actions.onDeclinePendingPartner(activeRoom.coupleCode)
                 }
             )
+        }
+
+        val latestPartnerPulse = remember(activeRoom.whisperStateJson, activeRoom.myName) {
+            val myTrimmed = activeRoom.myName.trim()
+            CoupleActivitiesDeck.dateWhisperStateFromJson(activeRoom.whisperStateJson)
+                .whispers
+                .lastOrNull { !it.senderName.equals(myTrimmed, ignoreCase = true) }
+        }
+        if (latestPartnerPulse != null) {
+            Surface(
+                shape = RoundedCornerShape(22.dp),
+                color = VelvetSurface,
+                border = BorderStroke(1.2.dp, Color(0xFFF472B6).copy(alpha = 0.65f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(22.dp))
+                    .clickable {
+                        AestheticHaptics.softTick(context, haptic)
+                        onLaunchCoupleGame(CoupleGameType.HEART_TAP)
+                    }
+                    .testTag("couple_hub_partner_pulse_banner")
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(
+                            Brush.horizontalGradient(
+                                listOf(
+                                    VelvetRoseGlow.copy(alpha = 0.24f),
+                                    Color(0xFFA855F7).copy(alpha = 0.18f)
+                                )
+                            )
+                        )
+                        .padding(horizontal = 16.dp, vertical = 13.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(text = "🫂", fontSize = 24.sp)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "${latestPartnerPulse.senderName} sent you a pulse 🩷",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = Color(0xFFF9A8D4)
+                        )
+                        Text(
+                            text = latestPartnerPulse.text,
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                fontFamily = FontFamily.Serif
+                            ),
+                            color = VelvetTextPrimary,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(100.dp),
+                        color = VelvetRoseGlow.copy(alpha = 0.28f)
+                    ) {
+                        Text(
+                            text = "Open ✨",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = Color.White,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                        )
+                    }
+                }
+            }
         }
 
         if (showActivityGrid) {

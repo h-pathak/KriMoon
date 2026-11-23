@@ -279,7 +279,8 @@ class PhasesRepository(private val database: AppDatabase) {
             whisperStateJson = LocalVaultCrypto.encryptField(guarded.whisperStateJson, "couple_rooms:$code:whisperStateJson"),
             blockchainLedgerJson = LocalVaultCrypto.encryptField(guarded.blockchainLedgerJson, "couple_rooms:$code:blockchainLedgerJson"),
             ecdhPrivateKeyB64 = LocalVaultCrypto.encryptField(guarded.ecdhPrivateKeyB64, "couple_rooms:$code:ecdhPrivateKeyB64"),
-            ecdhSharedSecretB64 = LocalVaultCrypto.encryptField(guarded.ecdhSharedSecretB64, "couple_rooms:$code:ecdhSharedSecretB64")
+            ecdhSharedSecretB64 = LocalVaultCrypto.encryptField(guarded.ecdhSharedSecretB64, "couple_rooms:$code:ecdhSharedSecretB64"),
+            partnerCycleSyncJson = LocalVaultCrypto.encryptField(guarded.partnerCycleSyncJson, "couple_rooms:$code:partnerCycleSyncJson")
         )
     }
 
@@ -299,7 +300,8 @@ class PhasesRepository(private val database: AppDatabase) {
             whisperStateJson = decryptFieldTracked(whisperStateJson, "couple_rooms:$code:whisperStateJson", "couple_rooms", code, "whisperStateJson", errorFallback = "{}").ifBlank { "{}" },
             blockchainLedgerJson = decryptFieldTracked(blockchainLedgerJson, "couple_rooms:$code:blockchainLedgerJson", "couple_rooms", code, "blockchainLedgerJson", errorFallback = "[]").ifBlank { "[]" },
             ecdhPrivateKeyB64 = decryptFieldTracked(ecdhPrivateKeyB64, "couple_rooms:$code:ecdhPrivateKeyB64", "couple_rooms", code, "ecdhPrivateKeyB64", errorFallback = ""),
-            ecdhSharedSecretB64 = decryptFieldTracked(ecdhSharedSecretB64, "couple_rooms:$code:ecdhSharedSecretB64", "couple_rooms", code, "ecdhSharedSecretB64", errorFallback = "")
+            ecdhSharedSecretB64 = decryptFieldTracked(ecdhSharedSecretB64, "couple_rooms:$code:ecdhSharedSecretB64", "couple_rooms", code, "ecdhSharedSecretB64", errorFallback = ""),
+            partnerCycleSyncJson = decryptFieldTracked(partnerCycleSyncJson, "couple_rooms:$code:partnerCycleSyncJson", "couple_rooms", code, "partnerCycleSyncJson", errorFallback = "{}").ifBlank { "{}" }
         )
     }
 
@@ -400,7 +402,8 @@ class PhasesRepository(private val database: AppDatabase) {
                     raw.whisperStateJson to "couple_rooms:$code:whisperStateJson",
                     raw.blockchainLedgerJson to "couple_rooms:$code:blockchainLedgerJson",
                     raw.ecdhPrivateKeyB64 to "couple_rooms:$code:ecdhPrivateKeyB64",
-                    raw.ecdhSharedSecretB64 to "couple_rooms:$code:ecdhSharedSecretB64"
+                    raw.ecdhSharedSecretB64 to "couple_rooms:$code:ecdhSharedSecretB64",
+                    raw.partnerCycleSyncJson to "couple_rooms:$code:partnerCycleSyncJson"
                 )
                 val needsEnc = encryptedColumns.any { (v, _) -> v.isNotEmpty() && !LocalVaultCrypto.isLatestFormat(v) }
                 if (needsEnc) {
@@ -421,7 +424,8 @@ class PhasesRepository(private val database: AppDatabase) {
                                 whisperStateJson = decrypted[10].getOrThrow().ifBlank { "{}" },
                                 blockchainLedgerJson = decrypted[11].getOrThrow().ifBlank { "[]" },
                                 ecdhPrivateKeyB64 = decrypted[12].getOrThrow(),
-                                ecdhSharedSecretB64 = decrypted[13].getOrThrow()
+                                ecdhSharedSecretB64 = decrypted[13].getOrThrow(),
+                                partnerCycleSyncJson = decrypted[14].getOrThrow().ifBlank { "{}" }
                             ).encryptForVault()
                         )
                     }
@@ -858,38 +862,13 @@ class PhasesRepository(private val database: AppDatabase) {
         database.userNoteDao().deleteById(id)
     }
 
+    /**
+     * Intentionally preserves an empty user_profile table on first launch so first-time users
+     * always see the Male / Female onboarding screen rather than auto-skipping with a hardcoded profile.
+     * Existing onboarded users keep their persisted profile untouched.
+     */
     suspend fun checkAndSeedUserProfileIfEmpty() {
-        val existing = database.userProfileDao().getProfileOnce()
-        if (existing == null) {
-            val defaultProfile = UserProfile(
-                id = 1,
-                name = "Krishi",
-                cycleLength = 28,
-                periodLength = 5,
-                waterGoal = 8,
-                waterRemindersEnabled = true,
-                cycleRemindersEnabled = true,
-                fertileRemindersEnabled = true,
-                checkinRemindersEnabled = true,
-                shopRemindersEnabled = true,
-                reminderHour = 20,
-                isOnboarded = true
-            )
-            database.userProfileDao().insertOrUpdate(defaultProfile.encryptForVault())
-
-            val periodCount = database.periodLogDao().count()
-            if (periodCount == 0) {
-                val cal = java.util.Calendar.getInstance().apply {
-                    add(java.util.Calendar.DAY_OF_MONTH, -14)
-                }
-                logPeriod(
-                    startDateMillis = cal.timeInMillis,
-                    notes = "Regular cycle start",
-                    durationDays = 5,
-                    endDateMillis = cal.timeInMillis + (4L * 24 * 60 * 60 * 1000)
-                )
-            }
-        }
+        // No-op on fresh install: OnboardingScreen collects gender (Male/Female) and creates UserProfile.
     }
 
     // Arcade & Couple Lounge persistence

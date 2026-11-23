@@ -81,7 +81,7 @@ object CoupleActivitiesDeck {
         DarePrompt("st6", false, "When did you feel most proud to call me yours?", SpiceLevel.SWEET),
         // SWEET DARES
         DarePrompt("sd1", true, "Send a 10-second voice note describing your favorite thing about my smile.", SpiceLevel.SWEET),
-        DarePrompt("sd2", true, "Write a 3-line mini poem about us right now and send it as a Secret Whisper.", SpiceLevel.SWEET),
+        DarePrompt("sd2", true, "Write a 3-line mini poem about us right now and send it to me with a warm hug.", SpiceLevel.SWEET),
         DarePrompt("sd3", true, "Give me a brand-new sweet nickname we have to use for the next 24 hours.", SpiceLevel.SWEET),
         DarePrompt("sd4", true, "Plan our next cozy coffee or dessert date down to the exact treat we'll share.", SpiceLevel.SWEET),
         DarePrompt("sd5", true, "Send a selfie making the exact face you make when you see my name pop up.", SpiceLevel.SWEET),
@@ -110,7 +110,7 @@ object CoupleActivitiesDeck {
         DarePrompt("bt5", false, "What's the quickest way I can make you blush without even touching you?", SpiceLevel.BOLD),
         DarePrompt("bt6", false, "Slow, lingering tension or spontaneous breathless energy—which wins tonight?", SpiceLevel.BOLD),
         // AFTER-DARK DARES
-        DarePrompt("bd1", true, "Send a Secret Whisper telling me exactly what you'd whisper if I were inches away.", SpiceLevel.BOLD),
+        DarePrompt("bd1", true, "Tell me in one sweet message exactly what you'd whisper if I were inches away.", SpiceLevel.BOLD),
         DarePrompt("bd2", true, "Give me a 2-word teaser for our next private night in—no extra context allowed.", SpiceLevel.BOLD),
         DarePrompt("bd3", true, "Create a VIP coupon for me with no expiration date and name what it unlocks.", SpiceLevel.BOLD),
         DarePrompt("bd4", true, "Confess the exact moment today you wished I was right next to you.", SpiceLevel.BOLD),

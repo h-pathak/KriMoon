@@ -138,16 +138,22 @@ fun NotesScreen(
         "question" to "❓ Question"
     )
 
-    val activeRemindersCount = notes.count {
-        it.reminderTimeMillis != null && it.reminderTimeMillis > System.currentTimeMillis() && !it.reminderFired
+    val activeRemindersCount = remember(notes) {
+        val now = System.currentTimeMillis()
+        notes.count {
+            it.reminderTimeMillis != null && it.reminderTimeMillis > now && !it.reminderFired
+        }
     }
 
-    val filteredNotes = when (filterTag) {
-        "all" -> notes
-        "reminders" -> notes.filter {
-            it.reminderTimeMillis != null && it.reminderTimeMillis > System.currentTimeMillis() && !it.reminderFired
+    val filteredNotes = remember(notes, filterTag) {
+        val now = System.currentTimeMillis()
+        when (filterTag) {
+            "all" -> notes
+            "reminders" -> notes.filter {
+                it.reminderTimeMillis != null && it.reminderTimeMillis > now && !it.reminderFired
+            }
+            else -> notes.filter { it.tag == filterTag }
         }
-        else -> notes.filter { it.tag == filterTag }
     }
 
     Box(
@@ -174,7 +180,7 @@ fun NotesScreen(
                     modifier = Modifier.weight(1f)
                 ) {
                     Text(
-                        text = "Private Journal",
+                        text = "Private Journal 💌",
                         style = MaterialTheme.typography.headlineSmall.copy(
                             fontWeight = FontWeight.Bold
                         ),
@@ -217,7 +223,7 @@ fun NotesScreen(
                 }
             }
             Text(
-                text = "Safe space for reflections, questions, symptoms, and customizable reminder notifications.",
+                text = "Cozy encrypted space for reflections, symptoms, sweet thoughts & custom reminder chimes ✨",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -231,7 +237,7 @@ fun NotesScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .cute3DCard(maxTilt = 3f, cornerRadius = 22.dp)
-                    .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(22.dp))
+                    .border(1.dp, PhasesRose.copy(alpha = 0.28f), RoundedCornerShape(22.dp))
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Row(
@@ -251,7 +257,7 @@ fun NotesScreen(
                             color = PhasesRose.copy(alpha = 0.15f)
                         ) {
                             Text(
-                                text = "🔒 Private",
+                                text = "🔒 Private ✨",
                                 style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                                 color = PhasesRose,
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
@@ -264,7 +270,7 @@ fun NotesScreen(
                         value = noteText,
                         onValueChange = { noteText = it },
                         placeholder = {
-                            Text("A fleeting thought, symptom, doctor question, or reminder...")
+                            Text("A fleeting thought, symptom, doctor question, or sweet reminder... 🌸")
                         },
                         minLines = 3,
                         maxLines = 6,
@@ -278,7 +284,7 @@ fun NotesScreen(
 
                     // Tag Selector Row with Haptic Feedback
                     Text(
-                        text = "Category tag",
+                        text = "Category tag 🎀",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

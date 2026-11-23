@@ -35,7 +35,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -95,11 +96,12 @@ fun InteractiveWaterTumbler3D(
     val tactile = remember(context, haptic) { TactileHydrationHelper(context, haptic) }
 
     val progress = (count.toFloat() / goal.toFloat()).coerceIn(0f, 1f)
-    val animatedProgress by animateFloatAsState(
+    val animatedProgressState = animateFloatAsState(
         targetValue = progress,
         animationSpec = spring(dampingRatio = 0.62f, stiffness = 130f),
         label = "water_fill_level"
     )
+    val useLightText by remember { derivedStateOf { animatedProgressState.value > 0.45f } }
 
     // Dynamic slosh physics state
     val sloshTiltZ = remember { Animatable(0f) }
@@ -107,38 +109,52 @@ fun InteractiveWaterTumbler3D(
     val sloshWaveSurge = remember { Animatable(0f) }
     val scaleRecoil = remember { Animatable(1f) }
 
-    var tumblerCenter by remember { mutableStateOf(Offset.Zero) }
+    val tumblerCenterHolder = remember { OffsetHolder() }
     var lastSloshTick by remember { mutableFloatStateOf(0f) }
 
-    // Wave animation loops
-    val infiniteTransition = rememberInfiniteTransition(label = "water_waves")
-    val wavePhase1 by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = (2 * PI).toFloat(),
-        animationSpec = infiniteRepeatable(
-            animation = tween(2800, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "wave1"
-    )
-    val wavePhase2 by infiniteTransition.animateFloat(
-        initialValue = (2 * PI).toFloat(),
-        targetValue = 0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(3600, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "wave2"
-    )
-    val bubbleFloatOffset by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(4000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "bubbles"
-    )
+    // Reusable native Paths so Canvas draws zero native Path allocations per frame
+    val backWavePath = remember { Path() }
+    val frontWavePath = remember { Path() }
+
+    // Wave animation loops — only run when liquid is actually visible in the tumbler
+    val hasLiquid = count > 0
+    val wavePhase1State: State<Float>
+    val wavePhase2State: State<Float>
+    val bubbleFloatState: State<Float>
+    if (hasLiquid) {
+        val infiniteTransition = rememberInfiniteTransition(label = "water_waves")
+        wavePhase1State = infiniteTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = (2 * PI).toFloat(),
+            animationSpec = infiniteRepeatable(
+                animation = tween(2800, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "wave1"
+        )
+        wavePhase2State = infiniteTransition.animateFloat(
+            initialValue = (2 * PI).toFloat(),
+            targetValue = 0f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(3600, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "wave2"
+        )
+        bubbleFloatState = infiniteTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(4000, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "bubbles"
+        )
+    } else {
+        wavePhase1State = remember { mutableFloatStateOf(0f) }
+        wavePhase2State = remember { mutableFloatStateOf(0f) }
+        bubbleFloatState = remember { mutableFloatStateOf(0f) }
+    }
 
     val isGoalReached = count >= goal
 
@@ -146,13 +162,13 @@ fun InteractiveWaterTumbler3D(
         shape = RoundedCornerShape(26.dp),
         color = MaterialTheme.colorScheme.surface,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-        shadowElevation = 8.dp,
+        shadowElevation = 6.dp,
         modifier = modifier
             .fillMaxWidth()
             .testTag("interactive_water_tumbler")
             .onGloballyPositioned { coordinates ->
                 val bounds = coordinates.boundsInWindow()
-                tumblerCenter = Offset(bounds.left + bounds.width / 2f, bounds.top + bounds.height / 2f)
+                tumblerCenterHolder.value = Offset(bounds.left + bounds.width / 2f, bounds.top + bounds.height / 2f)
             }
     ) {
         Column(
@@ -230,9 +246,10 @@ fun InteractiveWaterTumbler3D(
                                     sloshWaveSurge.animateTo(0f, spring(dampingRatio = 0.60f, stiffness = 100f))
                                 }
 
+                                val center = tumblerCenterHolder.value
                                 particleController.spawn(
-                                    centerX = tumblerCenter.x,
-                                    centerY = tumblerCenter.y - 40f,
+                                    centerX = center.x,
+                                    centerY = center.y - 40f,
                                     emojis = listOf("💧", "🫧", "✨", "🌊", "💙"),
                                     count = 10
                                 )
@@ -294,45 +311,52 @@ fun InteractiveWaterTumbler3D(
                         cornerRadius = CornerRadius(32.dp.toPx(), 32.dp.toPx())
                     )
 
-                    // 2. Liquid Waves Simulation
+                    // 2. Liquid Waves Simulation (reused Paths, coarser 12px step for 3x fewer trig calls)
+                    val animatedProgress = animatedProgressState.value
                     if (animatedProgress > 0.01f) {
+                        val wavePhase1 = wavePhase1State.value
+                        val wavePhase2 = wavePhase2State.value
+                        val bubbleFloatOffset = bubbleFloatState.value
                         val baseWaterLevelY = h * (1f - animatedProgress)
                         val surge = sloshWaveSurge.value.dp.toPx()
                         val amp1 = (6.dp.toPx() + surge).coerceIn(4f, 26f)
                         val amp2 = (4.dp.toPx() + surge * 0.7f).coerceIn(3f, 20f)
                         val wavelength = w * 0.9f
+                        val twoPiOverWave = (2.0 * PI / wavelength)
+                        val stepPx = 12f
 
                         // Layer 1: Back Wave (darker azure)
-                        val backWavePath = Path().apply {
-                            moveTo(0f, h)
-                            lineTo(0f, (baseWaterLevelY - 4.dp.toPx()).coerceAtLeast(0f))
-                            var x = 0f
-                            while (x <= w) {
-                                val y = (baseWaterLevelY - 4.dp.toPx()) + amp2 * sin((x / wavelength * 2 * PI + wavePhase2).toDouble()).toFloat()
-                                lineTo(x, y.coerceAtLeast(0f))
-                                x += 4f
-                            }
-                            lineTo(w, h)
-                            close()
+                        backWavePath.reset()
+                        backWavePath.moveTo(0f, h)
+                        val backBaseY = baseWaterLevelY - 4.dp.toPx()
+                        backWavePath.lineTo(0f, backBaseY.coerceAtLeast(0f))
+                        var x = 0f
+                        while (x < w) {
+                            val y = backBaseY + amp2 * sin(x * twoPiOverWave + wavePhase2).toFloat()
+                            backWavePath.lineTo(x, y.coerceAtLeast(0f))
+                            x += stepPx
                         }
+                        backWavePath.lineTo(w, (backBaseY + amp2 * sin(w * twoPiOverWave + wavePhase2).toFloat()).coerceAtLeast(0f))
+                        backWavePath.lineTo(w, h)
+                        backWavePath.close()
                         drawPath(
                             path = backWavePath,
                             color = Color(0xFF2563EB).copy(alpha = 0.45f)
                         )
 
                         // Layer 2: Front Wave (vibrant gradient water)
-                        val frontWavePath = Path().apply {
-                            moveTo(0f, h)
-                            lineTo(0f, baseWaterLevelY.coerceAtLeast(0f))
-                            var x = 0f
-                            while (x <= w) {
-                                val y = baseWaterLevelY + amp1 * sin((x / wavelength * 2 * PI + wavePhase1).toDouble()).toFloat()
-                                lineTo(x, y.coerceAtLeast(0f))
-                                x += 4f
-                            }
-                            lineTo(w, h)
-                            close()
+                        frontWavePath.reset()
+                        frontWavePath.moveTo(0f, h)
+                        frontWavePath.lineTo(0f, baseWaterLevelY.coerceAtLeast(0f))
+                        x = 0f
+                        while (x < w) {
+                            val y = baseWaterLevelY + amp1 * sin(x * twoPiOverWave + wavePhase1).toFloat()
+                            frontWavePath.lineTo(x, y.coerceAtLeast(0f))
+                            x += stepPx
                         }
+                        frontWavePath.lineTo(w, (baseWaterLevelY + amp1 * sin(w * twoPiOverWave + wavePhase1).toFloat()).coerceAtLeast(0f))
+                        frontWavePath.lineTo(w, h)
+                        frontWavePath.close()
                         drawPath(
                             path = frontWavePath,
                             brush = Brush.verticalGradient(
@@ -410,17 +434,17 @@ fun InteractiveWaterTumbler3D(
                             fontWeight = FontWeight.Bold,
                             fontFamily = FontFamily.Serif
                         ),
-                        color = if (animatedProgress > 0.45f) Color.White else MaterialTheme.colorScheme.onSurface
+                        color = if (useLightText) Color.White else MaterialTheme.colorScheme.onSurface
                     )
                     Text(
                         text = "of $goal glasses",
                         style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                        color = if (animatedProgress > 0.45f) Color.White.copy(alpha = 0.9f) else MaterialTheme.colorScheme.onSurfaceVariant
+                        color = if (useLightText) Color.White.copy(alpha = 0.9f) else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Surface(
                         shape = RoundedCornerShape(100.dp),
-                        color = if (animatedProgress > 0.45f) Color.Black.copy(alpha = 0.25f) else PhasesWaterBlue.copy(alpha = 0.12f),
+                        color = if (useLightText) Color.Black.copy(alpha = 0.25f) else PhasesWaterBlue.copy(alpha = 0.12f),
                         modifier = Modifier.padding(top = 2.dp)
                     ) {
                         Text(
@@ -429,7 +453,7 @@ fun InteractiveWaterTumbler3D(
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 11.sp
                             ),
-                            color = if (animatedProgress > 0.45f) Color.White else PhasesWaterBlue,
+                            color = if (useLightText) Color.White else PhasesWaterBlue,
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
                         )
                     }

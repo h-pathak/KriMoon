@@ -24,7 +24,7 @@ import kotlinx.coroutines.launch
         CoupleRoomRecord::class,
         PendingCoupleTurn::class
     ],
-    version = 15,
+    version = 16,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -96,6 +96,7 @@ abstract class AppDatabase : RoomDatabase() {
                     "`shopViewMode` TEXT NOT NULL, " +
                     "`shopSortMode` TEXT NOT NULL, " +
                     "`activeCoupleCode` TEXT NOT NULL DEFAULT '', " +
+                    "`userGender` TEXT NOT NULL DEFAULT 'FEMALE', " +
                     "PRIMARY KEY(`id`))"
             )
             addColumnIfNotExists(db, "user_profile", "shopHideCompleted", "INTEGER NOT NULL DEFAULT 0")
@@ -103,6 +104,7 @@ abstract class AppDatabase : RoomDatabase() {
             addColumnIfNotExists(db, "user_profile", "shopSortMode", "TEXT NOT NULL DEFAULT 'CUSTOM'")
             addColumnIfNotExists(db, "user_profile", "waterIntervalHours", "INTEGER NOT NULL DEFAULT 3")
             addColumnIfNotExists(db, "user_profile", "activeCoupleCode", "TEXT NOT NULL DEFAULT ''")
+            addColumnIfNotExists(db, "user_profile", "userGender", "TEXT NOT NULL DEFAULT 'FEMALE'")
 
             // Period logs table & columns
             db.execSQL(
@@ -267,6 +269,8 @@ abstract class AppDatabase : RoomDatabase() {
                     "`lastConfirmedCloudIndex` INTEGER NOT NULL DEFAULT 0, " +
                     "`seenClientTurnIdsJson` TEXT NOT NULL DEFAULT '[]', " +
                     "`seenReplayHashesJson` TEXT NOT NULL DEFAULT '[]', " +
+                    "`partnerCycleSyncJson` TEXT NOT NULL DEFAULT '{}', " +
+                    "`lastSentCycleSyncFingerprint` TEXT NOT NULL DEFAULT '', " +
                     "PRIMARY KEY(`coupleCode`))"
             )
             addColumnIfNotExists(db, "couple_rooms", "isBonded", "INTEGER NOT NULL DEFAULT 1")
@@ -297,6 +301,8 @@ abstract class AppDatabase : RoomDatabase() {
             addColumnIfNotExists(db, "couple_rooms", "lastConfirmedCloudIndex", "INTEGER NOT NULL DEFAULT 0")
             addColumnIfNotExists(db, "couple_rooms", "seenClientTurnIdsJson", "TEXT NOT NULL DEFAULT '[]'")
             addColumnIfNotExists(db, "couple_rooms", "seenReplayHashesJson", "TEXT NOT NULL DEFAULT '[]'")
+            addColumnIfNotExists(db, "couple_rooms", "partnerCycleSyncJson", "TEXT NOT NULL DEFAULT '{}'")
+            addColumnIfNotExists(db, "couple_rooms", "lastSentCycleSyncFingerprint", "TEXT NOT NULL DEFAULT ''")
 
             // Preserve ECDH protocol v3 floor for any migrated room that already established an ECDH secret
             try {
@@ -385,6 +391,13 @@ abstract class AppDatabase : RoomDatabase() {
         private val MIGRATION_11_15 = object : Migration(11, 15) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
         private val MIGRATION_10_15 = object : Migration(10, 15) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
         private val MIGRATION_1_15 = object : Migration(1, 15) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        internal val MIGRATION_15_16 = object : Migration(15, 16) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_14_16 = object : Migration(14, 16) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_13_16 = object : Migration(13, 16) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_12_16 = object : Migration(12, 16) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_11_16 = object : Migration(11, 16) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_10_16 = object : Migration(10, 16) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
+        private val MIGRATION_1_16 = object : Migration(1, 16) { override fun migrate(db: SupportSQLiteDatabase) = ensureTablesAndColumns(db) }
 
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
@@ -449,7 +462,14 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_12_15,
                     MIGRATION_11_15,
                     MIGRATION_10_15,
-                    MIGRATION_1_15
+                    MIGRATION_1_15,
+                    MIGRATION_15_16,
+                    MIGRATION_14_16,
+                    MIGRATION_13_16,
+                    MIGRATION_12_16,
+                    MIGRATION_11_16,
+                    MIGRATION_10_16,
+                    MIGRATION_1_16
                 )
                 .addCallback(object : Callback() {
                     override fun onOpen(db: SupportSQLiteDatabase) {
@@ -493,22 +513,37 @@ abstract class AppDatabase : RoomDatabase() {
                                 ShopItem(text = "Comfort snacks & soothing soup", phaseCategory = "luteal", orderIndex = 13),
                                 ShopItem(text = "Epsom bath salts", phaseCategory = "luteal", orderIndex = 14)
                             )
-                            INSTANCE?.shopItemDao()?.insertAll(defaultItems)
-                            
-                            val defaultMedicines = listOf(
-                                Medication(
-                                    name = "Daily Multivitamin / Iron",
-                                    dosage = "1 capsule with water",
-                                    hour = 9,
-                                    minute = 0,
-                                    isEnabled = true,
-                                    categoryEmoji = "🌸",
-                                    customSound = "cute_chime",
-                                    customReminderMessage = "Good morning queen! Time for your glow vitamins 🌸 Drink plenty of water and have a lovely day!",
-                                    instructions = "Take after breakfast with water"
-                                )
-                            )
-                            INSTANCE?.medicationDao()?.insertAll(defaultMedicines)
+                            if (com.example.security.LocalVaultCrypto.canSafelyWrite()) {
+                                val encryptedItems = defaultItems.map { item ->
+                                    item.copy(
+                                        text = com.example.security.LocalVaultCrypto.encryptField(item.text, "shop_items:text"),
+                                        notes = com.example.security.LocalVaultCrypto.encryptField(item.notes, "shop_items:notes")
+                                    )
+                                }
+                                INSTANCE?.shopItemDao()?.insertAll(encryptedItems)
+
+                                val defaultMedicines = listOf(
+                                    Medication(
+                                        name = "Daily Multivitamin / Iron",
+                                        dosage = "1 capsule with water",
+                                        hour = 9,
+                                        minute = 0,
+                                        isEnabled = true,
+                                        categoryEmoji = "🌸",
+                                        customSound = "cute_chime",
+                                        customReminderMessage = "Good morning queen! Time for your glow vitamins 🌸 Drink plenty of water and have a lovely day!",
+                                        instructions = "Take after breakfast with water"
+                                    )
+                                ).map { med ->
+                                    med.copy(
+                                        name = com.example.security.LocalVaultCrypto.encryptField(med.name, "medications:name"),
+                                        dosage = com.example.security.LocalVaultCrypto.encryptField(med.dosage, "medications:dosage"),
+                                        customReminderMessage = com.example.security.LocalVaultCrypto.encryptField(med.customReminderMessage, "medications:customReminderMessage"),
+                                        instructions = com.example.security.LocalVaultCrypto.encryptField(med.instructions, "medications:instructions")
+                                    )
+                                }
+                                INSTANCE?.medicationDao()?.insertAll(defaultMedicines)
+                            }
                         }
                     }
                 }).build()
