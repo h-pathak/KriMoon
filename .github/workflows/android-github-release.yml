@@ -1,0 +1,101 @@
+name: Android GitHub Release APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag name (e.g., v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Verify signing secrets are configured
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$STORE_PASSWORD" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "::error::Missing required GitHub Actions secrets: KEYSTORE_BASE64, STORE_PASSWORD, KEY_PASSWORD."
+            exit 1
+          fi
+
+      - name: Decode upload keystore into runner temp directory
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "${{ runner.temp }}/my-upload-key.jks"
+          chmod 600 "${{ runner.temp }}/my-upload-key.jks"
+
+      - name: Build signed R8 release APK
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/my-upload-key.jks
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: gradle :app:assembleRelease --no-daemon
+
+      - name: Prepare release APK and SHA-256 checksum
+        id: package
+        run: |
+          TAG_NAME="${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}"
+          APK_SRC="app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$APK_SRC" ]; then
+            echo "::error::Signed release APK not found at $APK_SRC"
+            exit 1
+          fi
+          OUT_DIR="${{ runner.temp }}/release-dist"
+          mkdir -p "$OUT_DIR"
+          APK_NAME="KriMoon-${TAG_NAME}.apk"
+          cp "$APK_SRC" "${OUT_DIR}/${APK_NAME}"
+          (cd "$OUT_DIR" && sha256sum "$APK_NAME" > SHA256SUMS.txt)
+          cat "${OUT_DIR}/SHA256SUMS.txt"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "apk_path=${OUT_DIR}/${APK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "checksum_path=${OUT_DIR}/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Clean up temporary keystore
+        if: always()
+        run: rm -f "${{ runner.temp }}/my-upload-key.jks"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KriMoon-${{ steps.package.outputs.tag_name }}-apk
+          path: |
+            ${{ steps.package.outputs.apk_path }}
+            ${{ steps.package.outputs.checksum_path }}
+
+      - name: Create or update GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.package.outputs.tag_name }}
+          name: KriMoon ${{ steps.package.outputs.tag_name }}
+          generate_release_notes: true
+          files: |
+            ${{ steps.package.outputs.apk_path }}
+            ${{ steps.package.outputs.checksum_path }}
